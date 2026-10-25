@@ -1,5 +1,5 @@
 name: "Tracekit Box"
-description: "Run an AI agent (Claude Code, Codex or a command) in a Firecracker micro-VM whose every door is decided and signed by Tracekit, apply its changes and keep a verified .tkb bundle."
+description: "Run an AI agent (Claude Code, Codex or a command) in a Firecracker micro-VM whose doors are decided and signed by a Tracekit dev signer, apply its changes and keep a verified .tkb bundle."
 branding:
   icon: box
   color: orange
@@ -21,11 +21,11 @@ inputs:
     required: false
     default: ""
   allow:
-    description: "Extra allowlist entries, comma-separated (presets github, pypi, npm, anthropic, openai, apt-ubuntu, go-proxy, or hosts). The agent's model API and npm are added for claude-code and codex. In CI nobody answers approvals, so a host that is not allowed is refused after 2 minutes."
+    description: "Extra allowlist entries, comma-separated: presets (github, pypi, npm, anthropic, openai, claude-code, apt-ubuntu, debian, go-proxy) or hosts. The agent's model API and npm are added for claude-code and codex. In CI nobody answers approvals, so a host that is not allowed is refused after 2 minutes."
     required: false
     default: ""
   timeout:
-    description: "Time limit for the box and the agent run, as a duration (30m, 1h)"
+    description: "Time limit for the agent run, as a duration (30m, 1h). The box itself gets 15 minutes more, for installing the agent and taking its changes."
     required: false
     default: "30m"
   workspace:
@@ -33,7 +33,7 @@ inputs:
     required: false
     default: "."
   apply:
-    description: "Apply the box's changes to the workspace (each file decided by the signer) when the agent exits 0"
+    description: "Apply the box's changes to the workspace when the agent exits 0. Only if the signer allows every file; otherwise nothing is applied and the action fails."
     required: false
     default: "true"
   upload-bundle:
@@ -41,11 +41,11 @@ inputs:
     required: false
     default: "true"
   artifact-name:
-    description: "Name of the uploaded artifact (default tracekit-box-<job>-<attempt>)"
+    description: "Name of the uploaded artifact (default tracekit-box-<job>-<attempt>). Set it when you use the action more than once in a job."
     required: false
     default: ""
   tkbox-version:
-    description: "A tracekit-box release tag to download, or 'source' to build tkbox with Go from the action's own checkout"
+    description: "'source' (the only choice until there is a release) builds tkbox with Go from the action's own checkout; a release tag downloads that release"
     required: false
     default: "source"
 outputs:
@@ -53,7 +53,7 @@ outputs:
     description: "Path of the .tkb bundle"
     value: ${{ steps.export.outputs.bundle }}
   trust:
-    description: "Path of the bundle's trust file"
+    description: "Path of the bundle's trust file (made by the dev signer in this job: dev assurance only)"
     value: ${{ steps.export.outputs.trust }}
   verify:
     description: "The verifier's integrity result, e.g. VERIFIED (or FAILED)"
@@ -64,8 +64,11 @@ outputs:
   patch:
     description: "Path of the box's patch file"
     value: ${{ steps.changes.outputs.patch }}
+  applied:
+    description: "true when the changes were applied to the workspace"
+    value: ${{ steps.changes.outputs.applied }}
   agent-exit-code:
-    description: "Exit code of the agent run (124 timed out, 125 tkbox error, 126 denied)"
+    description: "Exit code of the agent run (124 timed out, 125 tkbox error, 126 denied, 127 not found)"
     value: ${{ steps.agent.outputs.code }}
 runs:
   using: composite
@@ -78,6 +81,7 @@ runs:
         TKB_COMMAND: ${{ inputs.command }}
         TKB_IMAGE: ${{ inputs.image }}
         TKB_WORKSPACE: ${{ inputs.workspace }}
+        TKB_TIMEOUT: ${{ inputs.timeout }}
       run: |
         case "$TKB_AGENT" in
           claude-code|codex)
@@ -95,6 +99,8 @@ runs:
           echo "::error::set OPENAI_API_KEY in the step's env (env: OPENAI_API_KEY: \${{ secrets.OPENAI_API_KEY }}); the box sees only a placeholder"
           exit 1
         fi
+        [[ "$TKB_TIMEOUT" =~ ^([0-9]+(\.[0-9]+)?(h|m|s))+$ ]] \
+          || { echo "::error::timeout '$TKB_TIMEOUT' must be a duration such as 30m, 1h or 1h30m"; exit 1; }
         [ "$(uname -s)" = Linux ] || { echo "::error::Tracekit Box needs a Linux runner with KVM (ubuntu-latest)"; exit 1; }
         git -C "$TKB_WORKSPACE" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
           || { echo "::error::workspace '$TKB_WORKSPACE' is not a git checkout; run actions/checkout first"; exit 1; }
@@ -119,24 +125,28 @@ runs:
       with:
         python-version: "3.12"
 
+    # A same-user dev signer made in this job, so the bundle's assurance is dev. Reused by a second use in the job.
     - name: Start a Tracekit 1.4.2 dev signer
       shell: bash
       run: |
-        python -m pip install -q "tracekit-ai==1.4.2"
-        tracekit init --dev --v2 --no-hooks
-        tracekit up --wait
+        command -v tracekit >/dev/null || python -m pip install -q "tracekit-ai==1.4.2"
+        if ! tracekit up --wait >/dev/null 2>&1; then
+          tracekit init --dev --v2 --no-hooks
+          tracekit up --wait
+        fi
 
     - uses: actions/setup-go@v5
       if: inputs.tkbox-version == 'source'
       with:
         go-version-file: ${{ github.action_path }}/../go.mod
-        cache-dependency-path: ${{ github.action_path }}/../go.sum
+        cache: false
 
     - name: Get tkbox
       shell: bash
       env:
         TKB_VERSION: ${{ inputs.tkbox-version }}
         TKB_SRC: ${{ github.action_path }}/..
+        TKB_REF: ${{ github.action_ref }}
       run: |
         case "$(uname -m)" in
           x86_64) arch=amd64 ;;
@@ -145,9 +155,12 @@ runs:
         esac
         bin="$RUNNER_TEMP/tkbox-bin"
         mkdir -p "$bin"
-        if [ "$TKB_VERSION" = source ]; then
-          (cd "$TKB_SRC" && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=action-$GITHUB_ACTION_REF" -o "$bin/tkbox" ./cmd/tkbox \
-            && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags "-s -w -X main.version=action-$GITHUB_ACTION_REF" -o "$bin/tkbox-guest-linux-$arch" ./cmd/tkbox-guest)
+        if [ -x "$bin/tkbox" ] && [ -x "$bin/tkbox-guest-linux-$arch" ]; then
+          echo "tkbox is already installed in this job"
+        elif [ "$TKB_VERSION" = source ]; then
+          ldflags="-s -w -X main.version=action-${TKB_REF:-local}"
+          (cd "$TKB_SRC" && CGO_ENABLED=0 go build -trimpath -ldflags "$ldflags" -o "$bin/tkbox" ./cmd/tkbox \
+            && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags "$ldflags" -o "$bin/tkbox-guest-linux-$arch" ./cmd/tkbox-guest)
         else
           base="https://github.com/Cygnux-Labs/tracekit-box/releases/download/$TKB_VERSION"
           curl -fsSL -o "$bin/tkbox" "$base/tkbox-linux-$arch"
@@ -162,16 +175,21 @@ runs:
       run: |
         state="$RUNNER_TEMP/tkbox-state"
         log="$RUNNER_TEMP/tkbox-daemon.log"
-        sock="$state/run/tkbox.sock"
-        echo "TKBOX_SOCKET=$sock" >> "$GITHUB_ENV"
-        nohup tkbox daemon --state-dir "$state" > "$log" 2>&1 &
+        export TKBOX_SOCKET="$state/run/tkbox.sock"
+        echo "TKBOX_SOCKET=$TKBOX_SOCKET" >> "$GITHUB_ENV"
+        if tkbox ls >/dev/null 2>&1; then
+          echo "the tkbox daemon is already running in this job"
+          exit 0
+        fi
+        nohup tkbox daemon --state-dir "$state" >> "$log" 2>&1 &
         pid=$!
-        for _ in $(seq 1 60); do
-          [ -S "$sock" ] && break
+        # the first start downloads Firecracker and the guest kernel (SHA-256 checked) before it serves
+        for _ in $(seq 1 240); do
+          tkbox ls >/dev/null 2>&1 && break
           kill -0 "$pid" 2>/dev/null || { echo "::error::tkbox daemon exited"; tail -n 50 "$log"; exit 1; }
           sleep 0.5
         done
-        [ -S "$sock" ] || { echo "::error::tkbox daemon did not open $sock within 30s"; tail -n 50 "$log"; exit 1; }
+        tkbox ls >/dev/null 2>&1 || { echo "::error::tkbox daemon did not answer within 2 minutes"; tail -n 50 "$log"; exit 1; }
 
     - name: Start the box
       id: box
@@ -185,20 +203,27 @@ runs:
         TKB_TIMEOUT: ${{ inputs.timeout }}
         TKB_WORKSPACE: ${{ inputs.workspace }}
       run: |
-        name="gha-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+        # box names are [a-z0-9][a-z0-9-]{0,62}; $GITHUB_ACTION tells two uses in one job apart
+        name=$(printf 'gha-%s-%s-%s' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_ACTION" \
+          | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | tr -s '-' | cut -c1-63 | sed 's/-*$//')
+        # the box lives 15 minutes longer than the agent: installing the agent, stopping and taking the changes
+        box_timeout=$(python -c 'import re, sys; u = {"h": 3600, "m": 60, "s": 1}; print("%ds" % (sum(float(n) * u[x] for n, x in re.findall(r"([0-9.]+)([hms])", sys.argv[1])) + 900))' "$TKB_TIMEOUT")
         image="$TKB_IMAGE"
-        args=(--name "$name" --workspace "$(cd "$TKB_WORKSPACE" && pwd)" --timeout "$TKB_TIMEOUT")
+        # --no-config: the action's inputs decide the box, not a tkbox.yaml in the checkout
+        args=(--no-config --name "$name" --workspace "$(cd "$TKB_WORKSPACE" && pwd)" --timeout "$box_timeout")
         case "$TKB_AGENT" in
           claude-code)
             image="${image:-node:22-slim}"
             args+=(--allow anthropic,npm
                    --secret "ANTHROPIC_API_KEY=env:ANTHROPIC_API_KEY@api.anthropic.com#X-Api-Key"
                    --env CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+                   --agent claude-code
                    --task "$TKB_PROMPT") ;;
           codex)
             image="${image:-node:22-slim}"
             args+=(--allow openai,npm
                    --secret "OPENAI_API_KEY=env:OPENAI_API_KEY@api.openai.com#Authorization"
+                   --agent codex
                    --task "$TKB_PROMPT") ;;
           command)
             args+=(--task "$TKB_COMMAND") ;;
@@ -206,6 +231,7 @@ runs:
         [ -n "$TKB_ALLOW" ] && args+=(--allow "$TKB_ALLOW")
         tkbox run --image "$image" "${args[@]}"
         echo "name=$name" >> "$GITHUB_OUTPUT"
+        echo "out=$RUNNER_TEMP/tracekit-box-$name" >> "$GITHUB_OUTPUT"
 
     - name: Run the agent in the box
       id: agent
@@ -224,8 +250,8 @@ runs:
             run tkbox exec "$TKB_BOX" -- npm i -g @anthropic-ai/claude-code
             if [ "$code" = 0 ]; then
               # Claude Code refuses --dangerously-skip-permissions as root unless IS_SANDBOX=1; the VM is the sandbox.
-              run tkbox exec "$TKB_BOX" --timeout "$TKB_TIMEOUT" -- \
-                env IS_SANDBOX=1 claude -p "$TKB_PROMPT" --dangerously-skip-permissions
+              run tkbox exec "$TKB_BOX" --timeout "$TKB_TIMEOUT" --env IS_SANDBOX=1 -- \
+                claude -p "$TKB_PROMPT" --dangerously-skip-permissions
             fi
             ;;
           codex)
@@ -245,11 +271,14 @@ runs:
           124) echo "::warning::the agent timed out after $TKB_TIMEOUT (raise the timeout input)" ;;
           125) echo "::warning::tkbox could not run the agent (exit 125); see the messages above" ;;
           126) echo "::warning::the signer denied a command the action ran in the box (exit 126)" ;;
+          127) echo "::warning::the command was not found in the box (exit 127)" ;;
           *) echo "::warning::the agent exited $code" ;;
         esac
         echo "code=$code" >> "$GITHUB_OUTPUT"
 
+    # Stop, apply, export, verify: apply works only on a stopped box and before export (export closes the run).
     - name: Stop the box
+      if: always() && steps.box.outputs.name != ''
       shell: bash
       env:
         TKB_BOX: ${{ steps.box.outputs.name }}
@@ -257,65 +286,76 @@ runs:
 
     - name: Take the changes
       id: changes
+      if: always() && steps.box.outputs.name != ''
       shell: bash
       env:
         TKB_BOX: ${{ steps.box.outputs.name }}
+        TKB_OUT: ${{ steps.box.outputs.out }}
         TKB_APPLY: ${{ inputs.apply }}
         TKB_AGENT_CODE: ${{ steps.agent.outputs.code }}
       run: |
-        out="$RUNNER_TEMP/tracekit-box"
-        mkdir -p "$out"
-        patch="$out/tracekit-box.patch"
+        mkdir -p "$TKB_OUT"
+        patch="$TKB_OUT/tracekit-box.patch"
+        echo "patch=$patch" >> "$GITHUB_OUTPUT"
         tkbox diff "$TKB_BOX" > "$patch"
         files=$(sed -n 's|^diff --git a/.* b/||p' "$patch")
         delim="tkbox_$(python -c 'import secrets; print(secrets.token_hex(16))')"
         { echo "files<<$delim"; printf '%s\n' "$files"; echo "$delim"; } >> "$GITHUB_OUTPUT"
-        echo "patch=$patch" >> "$GITHUB_OUTPUT"
+        applied=false
+        apply_code=0
         if [ -z "$files" ]; then
           echo "The box changed no files."
         elif [ "$TKB_APPLY" != true ]; then
           echo "apply is false: the patch is in $patch"
         elif [ "$TKB_AGENT_CODE" != 0 ]; then
-          echo "::warning::not applying: the agent exited $TKB_AGENT_CODE; the patch is in $patch"
+          echo "::warning::not applying: the agent exited ${TKB_AGENT_CODE:-without a code}; the patch is in $patch"
         else
-          tkbox apply "$TKB_BOX"
+          tkbox apply "$TKB_BOX" || apply_code=$?
+          if [ "$apply_code" = 0 ]; then
+            applied=true
+          else
+            echo "::warning::tkbox apply failed (exit $apply_code): nothing was applied; the patch is in $patch"
+          fi
         fi
+        echo "applied=$applied" >> "$GITHUB_OUTPUT"
+        echo "apply-code=$apply_code" >> "$GITHUB_OUTPUT"
 
     - name: Export the bundle
       id: export
+      if: always() && steps.box.outputs.name != ''
       shell: bash
       env:
         TKB_BOX: ${{ steps.box.outputs.name }}
+        TKB_OUT: ${{ steps.box.outputs.out }}
       run: |
-        out="$RUNNER_TEMP/tracekit-box"
-        bundle="$out/tracekit-box.tkb"
+        mkdir -p "$TKB_OUT"
+        bundle="$TKB_OUT/tracekit-box.tkb"
+        trust="$TKB_OUT/tracekit-box.trust.json"
         tkbox export "$TKB_BOX" -o "$bundle"
-        trust=""
-        for t in "${bundle%.tkb}.trust.json" "$bundle.trust.json"; do
-          [ -f "$t" ] && { trust="$t"; break; }
-        done
-        [ -n "$trust" ] || { echo "::error::tkbox export wrote no trust file next to $bundle"; exit 1; }
+        [ -f "$trust" ] || { echo "::error::tkbox export wrote no trust file at $trust"; exit 1; }
         echo "bundle=$bundle" >> "$GITHUB_OUTPUT"
         echo "trust=$trust" >> "$GITHUB_OUTPUT"
 
     - name: Verify the bundle
       id: verify
+      if: always() && steps.export.outputs.bundle != ''
       shell: bash
       env:
+        TKB_OUT: ${{ steps.box.outputs.out }}
         TKB_BUNDLE: ${{ steps.export.outputs.bundle }}
         TKB_TRUST: ${{ steps.export.outputs.trust }}
       run: |
-        report="$RUNNER_TEMP/tracekit-box/verify.json"
+        report="$TKB_OUT/verify.json"
         code=0
         tracekit verify "$TKB_BUNDLE" --trust "$TKB_TRUST" --json > "$report" || code=$?
         result=$(python -c 'import json, sys; r = json.load(open(sys.argv[1])); print(r["integrity"]); print("Assurance: " + str(r["assurance"]), file=sys.stderr)' "$report" || echo FAILED)
-        echo "Integrity: $result"
+        echo "Integrity: $result (the signer and its trust file were made in this job: dev assurance)"
         echo "result=$result" >> "$GITHUB_OUTPUT"
         [ "$code" = 0 ] || { echo "::error::tracekit verify failed (exit $code); the report is in $report"; exit "$code"; }
 
     - name: Pick the artifact name
       id: artifact
-      if: always() && inputs.upload-bundle == 'true' && steps.export.outputs.bundle != ''
+      if: always() && inputs.upload-bundle == 'true' && steps.box.outputs.name != ''
       shell: bash
       env:
         TKB_NAME: ${{ inputs.artifact-name }}
@@ -332,11 +372,29 @@ runs:
           ${{ steps.changes.outputs.patch }}
         if-no-files-found: error
 
-    - name: Fail if the agent failed
-      if: steps.agent.outputs.code != '0'
+    # on failure: the daemon's log and each box's events and console, for finding out why
+    - uses: actions/upload-artifact@v4
+      if: failure()
+      with:
+        name: ${{ steps.artifact.outputs.name || format('tracekit-box-{0}-{1}', github.job, github.run_attempt) }}-logs
+        path: |
+          ${{ runner.temp }}/tkbox-daemon.log
+          ${{ runner.temp }}/tkbox-state/boxes/*/events.ndjson
+          ${{ runner.temp }}/tkbox-state/boxes/*/console.log
+        if-no-files-found: ignore
+
+    - name: Fail if the agent or apply failed
+      if: always() && steps.box.outputs.name != ''
       shell: bash
       env:
         TKB_AGENT_CODE: ${{ steps.agent.outputs.code }}
+        TKB_APPLY_CODE: ${{ steps.changes.outputs.apply-code }}
       run: |
-        echo "::error::the agent exited $TKB_AGENT_CODE; the bundle records what it did"
-        exit "$TKB_AGENT_CODE"
+        if [ "$TKB_AGENT_CODE" != 0 ]; then
+          echo "::error::the agent exited ${TKB_AGENT_CODE:-without a code}; the bundle records what crossed the box's doors"
+          exit 1
+        fi
+        if [ "${TKB_APPLY_CODE:-0}" != 0 ]; then
+          echo "::error::tkbox apply failed (exit $TKB_APPLY_CODE), so nothing was applied; the patch is in the artifact"
+          exit 1
+        fi
