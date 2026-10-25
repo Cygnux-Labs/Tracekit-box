@@ -37,16 +37,29 @@ Every door writes to the signer (one Tracekit run per box).
 
 | Door | Mechanism | Tracekit record (1.4.2 RPC) |
 |---|---|---|
-| Commands | Only through the guest agent's `exec` over vsock, started from the host (`tkbox exec`, the SDK, the action, MCP) and decided before it starts. Processes that command starts inside the VM are not decided one by one | `decide` tool `Bash` with the shell-quoted command line, the working directory, the exec's environment (placeholders redacted) and whether stdin was given; the signer's packs apply (TK-D002, TK-A001, …); `complete` with the exit status |
+| Commands | Only through the guest agent's `exec` over vsock, started from the host (`tkbox exec`, the SDK, the action, MCP) and decided before it starts. Processes that command starts inside the VM are not decided one by one | `decide` tool `Bash`, args `{command, cwd, env, stdin}`: the shell-quoted command line, the working directory, the exec's environment (a placeholder shown as `tkbox_NAME_…`, a pasted secret value as `[secret NAME]`) and whether stdin was given; per-exec env may not set `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `BASH_ENV`, `ENV` or `PROMPT_COMMAND`, and the box env is recorded once in the `tkbox.box` created observe; the signer's packs apply (TK-D002, TK-A001, …); `complete` with the exit status |
 | Network | No NIC. Guest forwarder → vsock 1025 → per-box host proxy (HTTP CONNECT and absolute-form HTTP) | `decide` tool `WebFetch`, args `{"url": "https://host:port"}` per connection; the allowlist decides, an unknown host waits for a person (`tkbox approve <id>`; refused at once with `inspect: all`), recorded as observe `tkbox.approval` |
-| Secrets | The VM sees placeholders `tkbox_<NAME>_<32 hex>`. The proxy swaps the value into the bound header (default `Authorization`) only on requests to bound hosts. On requests it reads, a placeholder anywhere else (another header, the URL, the body, another host, any plain HTTP request) is blocked, and so is the real value where it is not being swapped in; the value is redacted from responses | observe `tkbox.secret.use {name, host}`, `tkbox.secret.leak {name, host, reason}` (never the value) |
+| Secrets | The VM sees placeholders `tkbox_<NAME>_<32 hex>`. The proxy swaps the value into the bound header (default `Authorization`) only on requests to bound hosts. On requests it reads, a placeholder anywhere else (another header, the URL, the body, another host, any plain HTTP request) is blocked, and so is the real value (raw, percent-, JSON-escaped or base64) where it is not being swapped in; the value is redacted from response headers, bodies and trailers | observe `tkbox.secret.use {name, host}`, `tkbox.secret.leak {name, host, reason}` (never the value) |
 | Model calls | Model hosts are egress with a bound key (`ANTHROPIC_API_KEY` → api.anthropic.com) | egress records plus observe `tkbox.model.call {host, path, status, bytes}` for requests the proxy reads |
-| Changes out | Guest `diff` → git-format patch of /workspace (computed in the guest from the overlay's upper layer, so the image needs no git), without ignored paths and generated directories, saved as `diff.patch` at stop. `tkbox apply` (stopped box, before export) validates every path, refuses copy and rename sections and, without `--allow-sensitive`, sensitive files, and runs `git apply` isolated from the host's and the repository's git config | `decide` tool `Write` for every file before anything is written, carrying the file path, the patch digest, the file's content hash, its mode and whether it is a symlink |
+| Changes out | Guest `diff` → git-format patch of /workspace (computed in the guest from the overlay's upper layer, so the image needs no git), without ignored paths and generated directories, saved as `diff.patch` at stop; the file summary is built on the host from the patch. `tkbox apply` works only on a stopped box, from that saved patch, before export: it validates every path, refuses copy and rename sections, changes to git-ignored files and writes under the checkout's `core.hooksPath`, leaves out new files the checkout ignores, refuses sensitive files without `--allow-sensitive`, runs `git apply` with an empty bare git dir, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` and `GIT_ATTR_NOSYSTEM=1` (no host or repository filters or hooks), and checks the result against what was decided | `decide` tool `Write` for every file before anything is written, args `{file_path, sha256, mode, symlink, deleted, patch_sha256}` plus `sensitive: true` for sensitive files |
 | Stop | Box timeout, `tkbox stop`, Firecracker pause/kill; the daemon polls the signer's containment state and pauses/kills a held or quarantined run | `close_run` with the reason, at `tkbox export`, `tkbox rm`, daemon shutdown, quarantine or a failed box (a stopped box keeps its run open so that apply can record its decisions) |
 
 Fail closed everywhere: no signer → no daemon (unless it runs with `--unrecorded`, which warns and records nothing); a
-signer that stops answering refuses every later decision; an event Box must keep (secret use or leak, approval,
-containment, lifecycle) that it cannot record stops the box.
+signer that stops answering refuses every later decision. Observes Box must keep (secret use and leaks, model calls,
+Box approvals, containment) go through a queue of 4096 and are never dropped silently: if one cannot be queued or the
+signer refuses it, the box is stopped and the loss is recorded as observe `tkbox.gap {kind, dropped, reason}`, or, if
+even that fails, the run is closed with the loss as its reason. Lifecycle observes are sent synchronously, and a Box
+approval is recorded before any connection uses it. Box's own egress refusal observes are limited to 20 a second per
+box, with a summary of the rest.
+
+### Run lifecycle
+
+`register_run` at create. `tkbox stop` keeps the run open so that `tkbox apply` records its `Write` decisions in the
+same run; `tkbox export` and `tkbox rm` close it, as do daemon shutdown (every open run), quarantine and a failed box.
+Before closing, the daemon waits up to 15 s for the box's in-flight decisions. The run token is held only in the
+daemon's memory and never persisted: after a daemon crash the run stays open in the signer, and that box can be
+neither applied nor exported (export refuses at once). After a clean restart, boxes whose runs were closed still
+export, but apply is refused for recorded boxes without a live run.
 
 ## Protocols
 
@@ -58,7 +71,8 @@ Firecracker exposes the guest's vsock as a Unix socket on the host (`boxes/<id>/
 - **1025 egress** (guest → host): the guest dials CID 2 port 1025; Firecracker connects to `vsock.sock_1025`, where
   the box's proxy listens. Raw bytes (HTTP proxy protocol), no framing.
 - **1026 boot config** (guest → host): the guest dials CID 2 port 1026 (`vsock.sock_1026`), sends one
-  `{"op":"boot_config"}` frame and receives the `BootConfig` frame.
+  `{"op":"boot_config"}` frame and receives the `BootConfig` frame. The port is served once: after the guest has
+  read its config, the listener is closed.
 
 One connection per request.
 
@@ -100,18 +114,24 @@ the box's memory per tmpfs, and vanish with the box), and `/workspace` as an ove
   and the other clouds' metadata addresses), multicast, documentation and other special ranges, unspecified and this
   host's own interface addresses are refused; the proxy dials the resolved IP, so a name cannot rebind between the
   check and the dial. IPv4-mapped and NAT64 addresses are unwrapped first.
+- This host's own addresses are read live (at most 5 s old) on every dial, so an address gained after a box started is
+  refused too.
 - An allowlist entry `host` allows HTTPS on 443 (CONNECT) and plain HTTP on 80 (absolute-form requests, which the
-  proxy reads); `host:port` allows that port only. `CONNECT` to port 80 is refused.
-- Every HTTPS tunnel's TLS server name (SNI) must equal the CONNECT host, and ECH ClientHellos are refused, so an
-  allowed host cannot front for another. A tunnel that is not TLS is allowed only to a `host:port` the allowlist names
-  explicitly.
+  proxy reads); `host:port` allows that port only. `CONNECT` to port 80 is refused: plain HTTP must use the absolute
+  form (`http_proxy`), where Box writes the Host header.
+- Every HTTPS tunnel must start with a TLS ClientHello whose server name (SNI) equals the CONNECT host (a CONNECT to an
+  IP literal may omit SNI), and ECH ClientHellos are refused, so an allowed host cannot front for another. A tunnel
+  that is not TLS is allowed only to an allow entry that names the port (`host:port`), and such an entry lets any
+  protocol through to that port.
 - MITM only for hosts with a bound secret (or every allowed host with `inspect: all`, which then refuses hosts off the
   allowlist at once), with a per-box ECDSA P-256 CA, name-constrained to those hosts, whose certificate reaches the
   guest through the boot config. The guest exports `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`,
   `GIT_SSL_CAINFO` and `CURL_CA_BUNDLE`. The MITM leaf offers HTTP/1.1 only; upstream TLS is verified against the
-  host's roots. Requests to bound hosts go upstream without `Accept-Encoding`, so the proxy can redact the secret's
-  value from responses.
-- Bursts of refusals are rate-limited and summarised in the box's events.
+  host's roots. Requests to bound hosts go upstream with `Accept-Encoding: identity`, so the proxy can redact secret
+  values from responses (an encoded body a bound host sends anyway is decoded and redacted, or refused with 502).
+- Box's own refusals are recorded in the signer at most 20 a second per box, with a summary observe for the rest.
+- At most 16 Box approvals may be pending per box; a connection that would need another is refused at once. An
+  approval is withdrawn when the last connection waiting on it leaves (`Approval.Waiters` counts them).
 - Presets: `github`, `pypi`, `npm`, `anthropic`, `openai`, `claude-code`, `apt-ubuntu`, `debian`, `go-proxy`; the host
   lists are in [config.md](config.md#allow-entries).
 
@@ -120,7 +140,8 @@ the box's memory per tmpfs, and vanish with the box), and `/workspace` as an ove
 `internal/tracekit` speaks the released 1.4.2 signer RPC directly (newline-delimited JSON over the signer's Unix
 socket, identity from peer credentials; the signer must be on the daemon's host). One run per box: `register_run` at
 create, `decide`/`approval_*`/`complete` for every command started from the host, connection and file write,
-`observe` for lifecycle, secrets, model calls and Box approvals, `close_run` at export or removal. `tkbox export` runs
+`observe` for lifecycle, secrets, model calls, Box approvals, containment and lost records (`tkbox.gap`), `close_run`
+at export, removal, daemon shutdown, quarantine or failure. `tkbox export` runs
 `tracekit signer trust` and `tracekit export --v2` to produce the bundle and its trust file (`run.tkb` →
 `run.trust.json`).
 
@@ -150,7 +171,8 @@ Every boundary has an interface and a fake (`vmm.Launcher`, `agentrpc.Guest`, `i
 
 ```
 images/                 rootfs ext4 files by digest, assets/ (kernel, firecracker)
-boxes/<id>/             box.json, fc.sock, vsock.sock, console.log, events.ndjson,
+boxes/<id>/             box.json (never a secret value or the run token), fc.sock, vsock.sock, console.log,
+                        events.ndjson (capped at 64 MiB),
                         workspace-base.ext4, workspace-upper.ext4,
                         diff.patch and diff.json (the patch and its file summary, saved at stop)
 run/tkbox.sock          the API (0600; run/ is 0700)

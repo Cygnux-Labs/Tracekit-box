@@ -48,17 +48,17 @@ Each box is one Tracekit run. Every door records into it.
 
 | Door | What Box does | What the signed record shows |
 |---|---|---|
-| Commands | A command you start in the box (`tkbox exec`, the SDK, MCP or the action) runs only through the guest agent, and only after the signer allows it. The processes that command starts itself, such as the shell commands an agent runs, are not decided or recorded one by one: they show up where they cross another door (a connection, a secret, a file change) | A `Bash` decision per `tkbox exec` with the command line, working directory, environment (placeholders redacted) and whether stdin was given, then its exit status |
-| Network | Every connection goes through the host proxy. Allowlisted hosts pass; any other host waits for a person to run `tkbox approve` (with `--inspect all` it is refused at once); loopback, private, link-local, cloud metadata and this host's own addresses are refused. An HTTPS tunnel must name the same host in its TLS handshake as in its request | A `WebFetch` decision per connection; Box approvals as `tkbox.approval` |
-| Secrets | The VM only ever sees a placeholder such as `tkbox_GH_3f9c…`. The proxy swaps in the real value only in the bound header (default `Authorization`) of requests to the secret's hosts, and blocks a request that carries the placeholder to any other host whose traffic it reads | `tkbox.secret.use` and `tkbox.secret.leak` with the secret's name and host, never its value |
+| Commands | A command you start in the box (`tkbox exec`, the SDK, MCP or the action) runs only through the guest agent, and only after the signer allows it. The processes that command starts itself, such as the shell commands an agent runs, are not decided or recorded one by one: they show up where they cross another door (a connection, a secret, a file change) | A `Bash` decision per `tkbox exec` with the command line, working directory, the exec's environment (secret placeholders and values redacted) and whether stdin was given, then its exit status. The box's own environment is recorded when the box is created |
+| Network | Every connection goes through the host proxy. Allowlisted hosts pass; any other host waits for a person to run `tkbox approve` (with `--inspect all` it is refused at once); loopback, private, link-local, cloud metadata and this host's own addresses are refused. An HTTPS tunnel must name the same host in its TLS handshake as in its request (encrypted ClientHellos are refused); a tunnel that is not TLS needs an allow entry that names its port | A `WebFetch` decision per connection; Box approvals as `tkbox.approval` |
+| Secrets | The VM only ever sees a placeholder such as `tkbox_GH_3f9c…`. The proxy swaps in the real value only in the one bound header (default `Authorization`) of requests to the secret's exact hosts. On traffic it reads, it blocks the placeholder or the value anywhere else and redacts the value from responses | `tkbox.secret.use` and `tkbox.secret.leak` with the secret's name and host, never its value |
 | Model calls | Model APIs are egress with a bound key (`ANTHROPIC_API_KEY` → `api.anthropic.com`) | The connection's `WebFetch` decision plus `tkbox.model.call` (host, path, status, bytes) |
-| Code changes | The guest produces a git-format patch of `/workspace`, saved when the box stops. `tkbox apply` (on a stopped box, before export) checks every path, refuses changes to files such as `.github/workflows/**` unless you pass `--allow-sensitive`, and asks the signer about each file before it writes anything to your checkout | A `Write` decision per file, with the patch's digest and the file's content hash and mode |
+| Code changes | The guest produces a git-format patch of `/workspace`, saved when the box stops. `tkbox apply` (on a stopped box, from that saved patch, before export) checks every path, refuses changes to files such as `.github/workflows/**` unless you pass `--allow-sensitive`, asks the signer about each file before it writes anything to your checkout, and runs no git hooks or filters | A `Write` decision per file, with the patch's digest and the file's content hash and mode |
 | Stop | A box timeout, `tkbox stop`, or the signer holding or quarantining the run pauses or kills the VM | The run's close reason |
 
 **Fail closed.** No signer, no daemon: `tkbox daemon` exits at start when no signer answers (unless you start it with
 `--unrecorded`, which warns and records nothing). A signer that stops answering refuses every later command,
-connection and file write. If Box cannot record an event it must keep (a secret use or leak, an approval, a
-containment or lifecycle event), it stops the box.
+connection and file write. If Box cannot record an event it must keep (a secret use or leak, a model call, an
+approval, a containment or lifecycle event), it stops the box and records the loss in the run as `tkbox.gap`.
 
 The design, protocols and disks are in [docs/architecture.md](docs/architecture.md).
 
@@ -142,8 +142,9 @@ What each step shows:
   connection, swaps the real token into the `Authorization` header and records `tkbox.secret.use`. The output is your
   GitHub login. (Piping `curl` into `python` instead would be refused by the signer: TK-D002, a downloaded script run
   unread.)
-- **`tkbox diff`** shows a git-format patch with `x.txt`. After `tkbox stop`, `tkbox apply demo` would ask the signer
-  about `x.txt` and then write it to your checkout; the demo does not apply anything.
+- **`tkbox diff`** shows a git-format patch with `x.txt`. After `tkbox stop` (and before `tkbox export`),
+  `tkbox apply demo` would ask the signer about `x.txt` and then write it to your checkout; the demo does not apply
+  anything. Apply never works on a running box.
 - **`tracekit verify`** checks the bundle offline and prints `Integrity: VERIFIED.` With the same-user dev signer the
   assurance line says dev: a process running as your user could have reached the key. The agent inside the box cannot,
   but the bundle only states what the signer's setup proves.
@@ -167,7 +168,7 @@ trust file you expect (commit it, or keep it outside CI) rather than trusting th
 
 [`action/`](action/action.yml) runs an agent in a box on a GitHub-hosted runner: it enables KVM, starts a dev signer and
 the daemon, runs Claude Code, Codex or a command in a box with your checkout, stops the box, applies its changes if the
-signer allows every file (otherwise none), then exports and verifies the bundle and uploads it as an artifact.
+signer allows every file and none is sensitive, such as `.github/workflows/**` (otherwise none), then exports and verifies the bundle and uploads it as an artifact.
 
 ```yaml
 jobs:

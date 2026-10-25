@@ -15,7 +15,7 @@ may come before or after a command's arguments; `-flag` and `--flag` are the sam
 | Command | What it does |
 |---|---|
 | `tkbox daemon` | Run the daemon (boxes, egress proxies, the API socket) |
-| `tkbox run` | Create and start a box |
+| `tkbox run` | Check the settings, then create and start a box |
 | `tkbox exec <box> -- argv…` | Run a command in a box |
 | `tkbox ls` | List boxes |
 | `tkbox stop <box>` | Stop a box and save its patch |
@@ -60,18 +60,33 @@ Two more flags exist for Box's own end-to-end tests and must not be used anywher
 lets boxes reach a private range, and `--upstream-ca FILE` replaces the system roots for upstream TLS. Each logs a
 warning.
 
-At start the daemon claims its socket (a second daemon on the same state dir fails with `another tkbox daemon is
-already listening on …`), downloads Firecracker and the kernel into `<state dir>/images/assets` if they are not cached
-yet, checks `/dev/kvm` and the guest agent, and connects to the signer. If no signer answers it exits: `no Tracekit
-signer answering at …: start one with `tracekit up`, or pass --unrecorded to run boxes that record nothing`. It logs to
-stderr with the prefix `tkbox:`, ending with `tkbox <version> serving on <socket> (state <dir>, max 8 boxes)`.
+The daemon listens on `--socket` when it is given, else on `<state dir>/run/tkbox.sock`.
+
+At start the daemon first checks `/dev/kvm`, before it downloads anything (`this host can't run boxes: /dev/kvm is not
+usable (…): enable KVM (nested virtualization on a VM) and add this user to the kvm group`). Then it claims its socket
+(a second daemon fails with `another tkbox daemon is already listening on …`), downloads Firecracker and the kernel into
+`<state dir>/images/assets` if they are not cached yet, checks the guest agent, and connects to the signer. If no
+signer answers it exits with `tkbox: the daemon needs a Tracekit signer: no signer answering at …` and ``start one with
+`tracekit up`, or pass --unrecorded to run boxes that record nothing``. It logs to stderr with the prefix `tkbox:`,
+ending with `tkbox <version> serving on <socket> (state <dir>, max 8 boxes)`. A bad flag value exits 2.
 
 On SIGINT or SIGTERM it logs `stopping every box…` and stops every box cleanly within 60 seconds, saving each box's
-patch and closing its Tracekit run so that it can still be exported. Boxes that a previous daemon left running are
-marked failed (`daemon restarted`). After a restart, `tkbox diff` and `tkbox export` still work on stopped boxes, but
-`tkbox apply` refuses them, because their runs are closed: review the saved patch (`<state dir>/boxes/<id>/diff.patch`)
-and apply it by hand. Run the daemon in the foreground under systemd as a
-dedicated user, or in the background for a dev session.
+patch, and closes every open Tracekit run (including those of boxes already stopped and waiting for `tkbox apply`) so
+that each can still be exported. Boxes that a previous daemon left running are marked failed (`daemon restarted`).
+
+The run token that lets the daemon record into and close a box's run lives only in the daemon's memory; it is never
+written to disk. So after a restart:
+
+- After a clean shutdown (SIGINT or SIGTERM), `tkbox diff` and `tkbox export` still work on stopped boxes, but
+  `tkbox apply` refuses them, because their runs are closed.
+- After a crash or `kill -9`, the runs of that daemon's boxes stay open in the signer and no daemon can close them:
+  `tkbox export` refuses those boxes at once (`… was left open: the daemon that held its token stopped without closing
+  it (it crashed or was killed), and a restarted daemon can't close it`), and `tkbox apply` refuses them too. Start a
+  new box for a bundle.
+
+In both cases you can still review the saved patch (`<state dir>/boxes/<id>/diff.patch`) and apply it by hand. Run the
+daemon in the foreground under systemd as a dedicated user (stopped with SIGTERM, never SIGKILL), or in the background
+for a dev session.
 
 ## tkbox run
 
@@ -87,7 +102,7 @@ tkbox run --image REF [--name NAME] [--workspace DIR] [--allow ENTRY]... [--secr
 | `--name` | A unique name (default: the box id). Lower-case letters, digits and `-`, at most 63 characters |
 | `--workspace` | A host directory copied into `/workspace` (default: none, `/workspace` is empty). See [config.md](config.md#keys) for what is copied |
 | `--allow` | Repeatable or comma-separated. Presets `github`, `pypi`, `npm`, `anthropic`, `openai`, `claude-code`, `apt-ubuntu`, `debian`, `go-proxy`, or hosts (`api.example.com`, `*.example.com`, `host:8443`); see [config.md](config.md#allow-entries) |
-| `--secret` | Repeatable. `NAME=env:VAR@host1,host2[#Header]` or `NAME=file:PATH@hosts[#Header]`. The box sees a placeholder in `$NAME`; the value goes only to the hosts (exact names, no ports), in the header (default `Authorization`) |
+| `--secret` | Repeatable. `NAME=env:VAR@host1,host2[#Header]` or `NAME=file:PATH@hosts[#Header]`. The box sees a placeholder in `$NAME`; the value goes only to the hosts (exact names: no ports, no wildcards), only in the one header (default `Authorization`) |
 | `--env` | Repeatable `K=V`, plain environment for every exec |
 | `--cpus` | vCPUs, 1 to 32 (default 2) |
 | `--memory` | Memory with a unit, such as `4GiB` or `512MiB` (default 2GiB, 128MiB to 64GiB) |
@@ -100,11 +115,16 @@ tkbox run --image REF [--name NAME] [--workspace DIR] [--allow ENTRY]... [--secr
 | `--no-config` | Read no `tkbox.yaml` |
 | `--json` | Print the box as JSON on stdout, and nothing else |
 
-`tkbox run` reads `./tkbox.yaml` when it exists and `--config` is not given (and says so); `--config FILE` reads another
-file; `--no-config` reads none. The per-exec timeout (`exec_timeout`, default 30m) can be set only in the file.
+`tkbox run` reads `./tkbox.yaml` when it exists and `--config` is not given, and says so: `tkbox: reading settings from
+./tkbox.yaml (pass --no-config to skip it)`. `--config FILE` reads another file; `--no-config` reads none (giving both
+is a usage error). The per-exec timeout (`exec_timeout`, default 30m) can be set only in the file.
 
-It prints `tkbox: creating a box from <image>…`, and once the VM has booted and the guest agent answers, the box id on
-stdout and on stderr the box's name, state, Tracekit run and expiry, its allowed egress, and the next command to run.
+The daemon first checks the whole request (limits, allowlist, secrets, workspace) without creating anything, so a bad
+value is reported before any image is pulled or VM booted. Then `tkbox run` prints `tkbox: creating a box from
+<image>…`, and once the VM has booted and the guest agent answers, the box id on stdout and on stderr the box's name,
+Tracekit run and expiry, its allowed egress, one line per secret saying which header it goes in (`tkbox: secret GH goes
+only in the Authorization header, only to its bound hosts`), any notice (such as `<dir> is not a git work tree: copying
+every file except credential files`), and the next command to run. A flag the flag parser refuses exits 2.
 The first run of an image pulls it and builds its rootfs, which can take a minute; later runs reuse it by digest.
 
 ## tkbox exec
@@ -116,32 +136,43 @@ tkbox exec <box> [-i] [--timeout DUR] [--env K=V]... [--cwd DIR] [--] argv...
 Runs `argv` in the box (as root, in `/workspace` unless `--cwd` says otherwise) and streams its output. `argv` is passed
 as is, with no shell: use `sh -c '…'` for pipes and variables. `--` is needed only when the command starts with `-`.
 
-The signer decides the command before it starts, as a `Bash` decision that records the command line, the working
-directory, the exec's environment (placeholders redacted) and whether stdin was given. Commands that the command
-itself starts inside the box are not decided one by one. Box prints decisions, approvals to give and egress refusals on
-stderr as `tkbox: …` lines.
+The signer decides the command before it starts, as a `Bash` decision with the arguments `{command, cwd, env, stdin}`:
+the shell-quoted command line, the working directory, this exec's `--env` (a secret's placeholder shown as
+`tkbox_NAME_…`, a secret's real value pasted into a value shown as `[secret NAME]`) and whether stdin was given. The
+box's own `--env` is not repeated per exec; it is recorded once, when the box is created. Commands that the command
+itself starts inside the box are not decided one by one. Box prints approvals to give, egress refusals and other
+notices on stderr as `tkbox: …` lines.
 
 | Flag | Meaning |
 |---|---|
-| `-i` | Send this terminal's stdin to the command (there is no TTY) |
-| `--timeout` | This exec's time limit (default: the box's exec timeout, 30m; at most 24h) |
-| `--env` | Repeatable `K=V` for this exec only. `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `BASH_ENV`, `ENV` and `PROMPT_COMMAND` are refused |
+| `-i` | Send this terminal's stdin to the command (there is no TTY). The daemon holds up to 4 MiB the process has not read yet; past that the process's stdin is closed and a notice says so |
+| `--timeout` | This exec's time limit, 1s to 24h (default: the box's exec timeout, 30m) |
+| `--env` | Repeatable `K=V` for this exec only. `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `BASH_ENV`, `ENV` and `PROMPT_COMMAND` are refused (`env LD_PRELOAD can't be set per command`), as are the proxy and CA variables Box sets |
 | `--cwd` | The working directory in the box (default `/workspace`) |
 
-SIGINT, SIGTERM, SIGHUP and SIGQUIT are passed to the command in the box. A third Ctrl-C gives up waiting: `tkbox exec`
-exits 130 and the command may still run in the box (`tkbox stop` stops the box).
+SIGINT, SIGTERM, SIGHUP and SIGQUIT are passed to the command in the box at once, whatever the command does with its
+stdin. A signal that arrives before the command starts (while the signer decides or an approval waits) cancels it: the
+decision is abandoned, a pending signer approval is withdrawn, and `tkbox exec` prints `tkbox: cancelled before the
+command started (nothing ran)` and exits 125. A third Ctrl-C gives up waiting: `tkbox exec` exits 130 and the command
+may still run in the box (`tkbox stop` stops the box). If the connection to the daemon closes, the daemon stops the
+command.
+
+Notices `tkbox exec` may print: the process was killed by SIGKILL (maybe out of memory), output past 256 MiB was
+dropped, the exec timeout killed the command, the command was too long to record (over 1 MiB), stdin overflowed, an
+egress connection failed or was refused (for example 502 when the host did not accept the connection), an approval to
+give, expired or withdrawn, a secret blocked on its way to the wrong host. The texts are in [limits.md](limits.md).
 
 Exit codes:
 
 | Code | Meaning |
 |---|---|
-| the process's | The command ran; its own exit code |
-| 128 + n | The command was killed by signal n (137 for SIGKILL, for example after running out of memory) |
-| 124 | The command timed out and was killed |
-| 125 | tkbox error: no daemon, no such box, the box is not running or stopped during the command, a limit, the signer unavailable |
+| the process's | The command ran; its own exit code (0 to 255) |
+| 128 + n | The command was killed by signal n, 1 to 64 (137 for SIGKILL, for example after running out of memory; 143 for SIGTERM) |
+| 124 | The command reached its exec timeout and was killed |
+| 125 | tkbox error: no daemon, no such box, the box is not running or stopped during the command, a limit, the signer unavailable, or the command was cancelled before it started |
 | 126 | The signer or a person denied the command, or its approval expired; it did not run |
 | 127 | The executable was not found in the box |
-| 2 | Usage error |
+| 2 | Usage error (including a bad flag or a `--timeout` outside 1s..24h) |
 | 130 | You gave up with a third Ctrl-C |
 
 ## tkbox ls
@@ -159,8 +190,9 @@ One line per box: `ID  NAME  STATE  IMAGE  AGE  EXECS  RUN`. State is `creating`
 tkbox stop <box> [--kill]
 ```
 
-Saves the box's workspace patch, shuts the VM down cleanly (the guest syncs and unmounts) and keeps the box's state, and
-says whether the patch was saved. The Tracekit run stays open, so `tkbox apply` can still record its file decisions;
+Ends the box's running commands (SIGTERM, 3 seconds, then SIGKILL, 2 more seconds), saves the box's workspace patch,
+shuts the VM down cleanly (the guest syncs and unmounts) and keeps the box's state, and says whether the patch was
+saved; when it was not, it prints the reason and `tkbox: WARNING: nothing can be applied from this box`. The Tracekit run stays open, so `tkbox apply` can still record its file decisions;
 `tkbox export` closes it. `--kill` kills the VM at once: no patch is saved, so there is nothing to apply. Stopping a
 stopped box prints its state again.
 
@@ -182,8 +214,14 @@ tkbox diff <box> [--stat]
 Prints a git-format patch of what changed under `/workspace` (added, modified, deleted, mode changes, symlinks, binary
 files) and `tkbox: N files changed` on stderr. `--stat` lists the changed files only, one `status path` line each. On a
 running box the guest computes it from the workspace overlay, so the image needs no git; on a stopped box it is the
-patch saved at stop. Paths that the workspace's `.gitignore` ignores and generated directories (`node_modules`,
-`__pycache__`, `.venv`, `venv`, `.tox`, `.mypy_cache`, `.pytest_cache`, `.gradle`, `.next`, `.cache`) are left out.
+patch saved at stop. The file list is built on the host from the patch itself, not taken from the guest. Paths that the
+workspace's `.gitignore` ignores and generated directories (`node_modules`, `__pycache__`, `.venv`, `venv`, `.tox`,
+`.mypy_cache`, `.pytest_cache`, `.gradle`, `.next`, `.cache`, at any depth) are left out.
+
+When stdout is a terminal, control characters (escape sequences, carriage returns, C1 controls) and Unicode bidi
+overrides in the patch are printed as escapes (`\x1b`, `‮`), so a patch cannot redraw what you review. Redirected
+to a file, the patch is written as is. A stopped box with no saved patch says why: `box demo (stopped) has no saved
+diff: <reason>` (see [limits.md](limits.md#commands-approvals-and-changes)).
 
 ## tkbox apply
 
@@ -191,19 +229,32 @@ patch saved at stop. Paths that the workspace's `.gitignore` ignores and generat
 tkbox apply <box> [--dir DIR] [--check] [--allow-sensitive]
 ```
 
-Applies a stopped box's saved patch to the host checkout (default: the box's `--workspace`). It works only after
-`tkbox stop` and before `tkbox export`, and not on a box from before a daemon restart.
+Applies a stopped box's saved patch to the host checkout (default: the box's `--workspace`). It works only on a
+stopped box, from the patch saved at stop, while the box's Tracekit run is open: after `tkbox stop` and before
+`tkbox export` or `tkbox rm`, and not on a box from before a daemon restart. On a running box it is refused (`box demo
+is running`, hint ``stop the box first so the patch can't change under you: `tkbox stop demo` ``).
 
-- Every path is validated (relative, no `..`, inside `DIR`, no writes through symlinks). Copy and rename sections are
-  refused.
-- Changes to `.gitignore`, `.gitattributes`, `.gitmodules`, `tkbox.yaml`, `.husky/**` and `.github/workflows/**` are
-  refused unless you pass `--allow-sensitive`.
-- The signer decides every file as a `Write` (with the patch's digest and the file's content hash, mode and whether it
-  is a symlink) before anything is written. If the signer denies any file, nothing is applied and the denied paths are
-  listed (`tkbox: denied by the signer: <path>`).
-- `git apply` runs without the host's or the checkout's git config, so no filters, hooks or LFS run.
+- Every path is validated (relative, no `..`, no `.git`, inside `DIR`, no writes through symlinks). Copy and rename
+  sections are refused.
+- Changes to files the checkout's `.gitignore` ignores are refused (ignored files never reach the box). New files the
+  checkout ignores are left out of the apply and listed: `tkbox: left out 2 new files the checkout ignores
+  (.gitignore): …`.
+- Writes inside the checkout's `core.hooksPath` are refused.
+- Changes to `.gitignore`, `.gitattributes`, `.gitmodules`, `tkbox.yaml`, `tkbox.yml`, `.envrc` and
+  `.pre-commit-config.yaml` (in any directory), and to anything under `.husky/` or `.github/workflows/`, steer the next
+  run or host automation. They are refused unless you pass `--allow-sensitive`, and listed after a successful apply.
+- The signer decides every file as a `Write` with the arguments `{file_path, sha256, mode, symlink, deleted,
+  patch_sha256}` (plus `sensitive: true` for the files above) before anything is written. If the signer denies any
+  file, nothing is applied and the denied paths are listed (`tkbox: denied by the signer: <path>`). If the signer holds
+  a file for approval, `tkbox apply` prints the approval to give.
+- `git apply --binary` runs with a fresh, empty bare git dir and with `GIT_CONFIG_GLOBAL=/dev/null`,
+  `GIT_CONFIG_NOSYSTEM=1` and `GIT_ATTR_NOSYSTEM=1`, so neither the checkout's `.git/config` nor the host's global or
+  system git config or attributes are read: no filter drivers, hooks or LFS run.
+- Afterwards every written file is checked against what the signer decided; a file that differs is reported
+  (`applied, but … differ from what was decided: …`).
 
-`--check` validates and decides only, and writes nothing. It prints the paths written and `tkbox: applied N files`.
+`--check` validates and decides only, and writes nothing. `tkbox apply` prints the paths written on stdout and
+`tkbox: applied N files` on stderr (with `--check`, `tkbox: would apply (check only, nothing written) N files`).
 
 ## tkbox export
 
@@ -213,7 +264,8 @@ tkbox export <box> -o FILE.tkb
 
 Closes the box's Tracekit run, waits until the run is final in the signer, then writes the bundle (`tracekit export
 --v2`) and the signer's trust file next to it: `run.tkb` gets `run.trust.json`. The box must be stopped, the output
-directory must exist, and an unrecorded box cannot be exported. After export, `tkbox apply` is refused. It prints:
+directory must exist, and an unrecorded box cannot be exported. After export, `tkbox apply` is refused. A box whose run
+was left open by a daemon that crashed cannot be exported (see [tkbox daemon](#tkbox-daemon)). It prints:
 
 ```
 bundle: /path/run.tkb
@@ -224,13 +276,17 @@ verify: tracekit verify /path/run.tkb --trust /path/run.trust.json
 ## tkbox events
 
 ```
-tkbox events <box> [-f]
+tkbox events <box> [-f] [--json]
 ```
 
-Prints the box's events, one JSON object per line, as kept in `<state dir>/boxes/<id>/events.ndjson`: lifecycle,
-decisions, connections and refusals, approvals, secret use and leaks, model calls. `-f` keeps printing new events until
-the box stops. Events Box must keep (secret use and leaks, approvals, containment, lifecycle) are never dropped: if Box
-cannot record one, it stops the box. The file is capped at 64 MiB, and bursts of egress refusals are summarised.
+Prints the box's events from `<state dir>/boxes/<id>/events.ndjson`, one line each: `time  door  kind  summary`
+(lifecycle, decisions, connections and refusals, approvals, secret use and leaks, model calls, apply). `--json` prints
+the raw NDJSON lines instead. `-f` keeps printing new events while the box is alive. On a terminal, control and bidi
+characters are escaped as in `tkbox diff`. The file is capped at 64 MiB: past that one `events.capped` line is written
+and egress and signer-problem lines are dropped, while lifecycle, exec, secret, approval, containment and apply lines are
+still written. This file is Box's local log; the signed record is the Tracekit run (see
+[limits.md](limits.md#commands-approvals-and-changes) for what happens when a record Box must keep cannot be sent to the
+signer).
 
 ## tkbox image build
 
@@ -251,9 +307,12 @@ tkbox reject <id>
 
 Box approvals are connections to hosts off a box's allowlist, held until a person on the host answers (2 minutes, the
 daemon's `--approval-timeout`, then refused). `tkbox approvals` lists them as `ID  BOX  KIND  TARGET  EXPIRES IN`, with
-ids like `apr-…` and targets like `https://example.com:443`. A box can have at most 16 pending approvals. `approve` lets
-that one connection through; `--box` approves the host for the rest of the box's life. Each answer is recorded as
-`tkbox.approval` with who answered.
+ids like `apr-…` and targets like `https://example.com:443`; `--json` adds each approval's state and `waiters`, the
+connections waiting on it now. A box can have at most 16 pending approvals; a connection that would need another is
+refused at once. When the last connection waiting on an approval goes away, the approval is withdrawn (state
+`withdrawn`) and can no longer be approved. `approve` lets the waiting connections through; `--box` approves the host
+for the rest of the box's life. Each answer is recorded as `tkbox.approval` with who answered; an approval is recorded
+in the signer before any connection uses it, and one that cannot be recorded allows nothing.
 
 Commands that the signer's own policy holds are answered on the signer: `tracekit approvals approve <id>`. The exec's
 `tkbox:` line says which one to use.
@@ -261,7 +320,7 @@ Commands that the signer's own policy holds are answered on the signer: `traceki
 ## tkbox mcp
 
 ```
-tkbox mcp [--config FILE] [--workspace-root DIR]
+tkbox mcp [--config FILE] [--image REF]... [--workspace-root DIR]...
 ```
 
 Serves boxes as MCP tools over stdio (JSON-RPC, one message per line), for an agent orchestrator running on the host,
@@ -275,10 +334,22 @@ not inside a box. It talks to the daemon at `--socket` like every other command.
 | `tkbox_stop` | Stop a box (its patch is saved first unless `kill` is set) |
 | `tkbox_ls` | List boxes |
 
-`--config FILE` is the operator's [tkbox.yaml](config.md): every `tkbox_run` starts from its image, allowlist, secrets
-and limits. A `tkbox_run` call can only narrow those settings: it cannot add allowlist entries, set environment
-variables or secrets, and it can use a workspace only under `--workspace-root DIR`. `tkbox mcp` does not read
-`./tkbox.yaml` on its own. There are no MCP tools for apply or export: a person does those with the CLI.
+`--config FILE` is the operator's [tkbox.yaml](config.md): every `tkbox_run` starts from its image, allowlist, secrets,
+env and limits. A `tkbox_run` call can only narrow those settings:
+
+- `allow`: only entries that are in the config's `allow` list (without `--config`, none); given, it replaces the
+  config's list. A secret's hosts still join the allowlist, as for every box.
+- `image`: the config's `image` (the default) or one passed with `--image` (repeatable). With neither, `tkbox_run` is
+  refused.
+- `workspace`: a directory inside a `--workspace-root DIR` (repeatable, symlinks resolved); without any
+  `--workspace-root`, only the config's own `workspace`.
+- `cpus`, `memory`, `timeout`: at most the config's values, when the config sets them.
+- `env`: refused. The box gets the config's `env` and `secrets`; a call can add to neither.
+
+A refused call says what it would have widened, with the hint ``an MCP client may only narrow what the operator set up
+in `tkbox mcp` (--config, --image, --workspace-root); ask the operator``. Boxes made over MCP record the agent name
+`mcp`. `tkbox mcp` does not read `./tkbox.yaml` on its own. There are no MCP tools for apply or export: a person does
+those with the CLI.
 
 ## tkbox version
 

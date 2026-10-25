@@ -33,7 +33,7 @@ inputs:
     required: false
     default: "."
   apply:
-    description: "Apply the box's changes to the workspace when the agent exits 0. Only if the signer allows every file; otherwise nothing is applied and the action fails."
+    description: "Apply the box's changes to the workspace when the agent exits 0. Only if the signer allows every file and the patch changes no sensitive file (.github/workflows/, .husky/, .gitignore, .gitattributes, .gitmodules, tkbox.yaml, .envrc, .pre-commit-config.yaml: the action never passes --allow-sensitive); otherwise nothing is applied and the action fails."
     required: false
     default: "true"
   upload-bundle:

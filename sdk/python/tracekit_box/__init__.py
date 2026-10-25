@@ -5,6 +5,7 @@ from .client import VERSION as __version__
 from .client import Client, Diff, ExecResult, Limits, Secret, default_socket
 from .errors import (
     BadRequest,
+    Cancelled,
     Conflict,
     DaemonUnreachable,
     Denied,
@@ -28,6 +29,7 @@ __all__ = [
     "default_socket",
     "TkboxError",
     "BadRequest",
+    "Cancelled",
     "Conflict",
     "DaemonUnreachable",
     "Denied",

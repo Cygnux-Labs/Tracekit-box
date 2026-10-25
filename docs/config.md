@@ -55,8 +55,8 @@ Flags given to `tkbox run` override the file:
 image: in tkbox.yaml`.
 
 Relative paths in the file (`workspace`, `from_file`) resolve against the file's directory; `--workspace` and
-`--secret NAME=file:PATH` resolve against the current directory. A `from_file` path that starts with `~/` is expanded to
-your home directory; `workspace` is not (`workspace: ~/x` means the directory `~` next to the file).
+`--secret NAME=file:PATH` resolve against the current directory. A `workspace` or `from_file` path that starts with
+`~/` (or a `workspace` that is just `~`) is expanded to your home directory.
 
 ## Keys
 
@@ -67,7 +67,7 @@ your home directory; `workspace` is not (`workspace: ~/x` means the directory `~
 | `workspace` | path | none: `/workspace` is empty | A host directory copied into `/workspace`. In a git work tree: tracked files and untracked files that are not ignored, never `.git`. Outside git: every file except `.git`. Credential files are never copied, git or not (see [limits.md](limits.md#behaviour)). Without a workspace, `/workspace` is an empty writable directory and `tkbox apply` needs `--dir` |
 | `allow` | list of strings | empty: nothing leaves without approval | Presets and hosts the box may connect to without asking. See [Allow entries](#allow-entries) |
 | `secrets` | map | none | Environment variable name → secret. See [Secrets](#secrets) |
-| `env` | map of strings | none | Plain environment variables for every exec. Names are letters, digits and `_`. Values are visible in the box and in the box's record; never put secrets here. Box sets the proxy and CA variables itself (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY` in either case, `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `GIT_SSL_CAINFO`, `CURL_CA_BUNDLE`), so `env` and `secrets` cannot use those names |
+| `env` | map of strings | none | Plain environment variables for every exec. Names are letters, digits and `_`. Values are visible in the box and recorded in the box's run when it is created; never put secrets here. Unlike `tkbox exec --env`, the box env may set `LD_PRELOAD`, `BASH_ENV` and the like. Box sets the proxy and CA variables itself (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY` in either case, `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `GIT_SSL_CAINFO`, `CURL_CA_BUNDLE`), so `env` and `secrets` cannot use those names |
 | `limits` | map | see [Limits](#limits) | Resource and time limits |
 | `inspect` | `bound` or `all` | `bound` | `bound`: the proxy opens (MITM) only hosts with a bound secret. `all`: every allowed HTTPS host, so placeholders are caught everywhere, and a host off the allowlist is refused at once instead of waiting for approval; breaks clients that pin certificates |
 | `agent` | string | `tkbox` | The agent's name, recorded in the Tracekit run (the action uses `claude-code` or `codex`; boxes made over MCP use `mcp`) |
@@ -77,8 +77,8 @@ your home directory; `workspace` is not (`workspace: ~/x` means the directory `~
 
 | Entry | Allows |
 |---|---|
-| `example.com` | HTTPS to `example.com:443`, and plain HTTP to port 80 (plain HTTP goes through the proxy as requests it reads, which is what `http_proxy` does) |
-| `example.com:8443` | that port only. A connection that is not TLS (a raw TCP tunnel) is allowed only to a `host:port` named like this |
+| `example.com` | HTTPS to `example.com:443` (a TLS tunnel whose SNI is `example.com`; ECH is refused), and plain HTTP to port 80 as absolute-form requests the proxy reads, which is what `http_proxy` does (a `CONNECT` tunnel to port 80 is refused) |
+| `example.com:8443` | that port only. A tunnel that is not TLS is allowed only to an entry that names its port like this, and such an entry lets any protocol through to that port (SSH, SMTP, a database protocol), uninspected. A TLS tunnel must still send the host's name as its SNI |
 | `*.example.com` | any subdomain of `example.com` (not `example.com` itself), with the same port rules |
 | `203.0.113.7`, `[2001:db8::1]:8443` | an IP literal, with the same port rules; private and special addresses stay refused |
 | a preset name | the preset's hosts |
@@ -116,8 +116,8 @@ secrets:
 | `NAME` | The environment variable the box sees: upper-case letters, digits and `_`, not starting with a digit (`GITHUB_TOKEN`) |
 | `from_env` | Read the value from this environment variable of the `tkbox run` process. Unset or empty is an error |
 | `from_file` | Read the value from this file; trailing line breaks are dropped. `~/` is expanded; a relative path is relative to the `tkbox.yaml` |
-| `hosts` | Exact host names, without ports and without wildcards. Required. A secret's hosts join the box's allowlist |
-| `header` | The request header the placeholder is replaced in, for example `Authorization` or `X-Api-Key`. Default `Authorization`. `Host` and hop-by-hop headers cannot be used |
+| `hosts` | Exact host names, without ports and without wildcards (`*.github.com` is refused: `host "*.github.com" is a wildcard: a secret goes to exact hosts only; list each one (e.g. [api.github.com, uploads.github.com])`). Required. A secret's hosts join the box's allowlist |
+| `header` | The one request header the placeholder is replaced in, for example `Authorization` or `X-Api-Key`. Left out or empty, it is `Authorization`; it is never "any header". `Host` and hop-by-hop headers cannot be used. `tkbox run` prints each secret's header when the box starts |
 
 The value must not be empty, must be at most 64 KiB and must be one line (no line break or NUL), because it travels in
 a header.
@@ -126,8 +126,9 @@ Inside the box, `$NAME` holds a placeholder such as `tkbox_GH_3f9c…`, never th
 the value (`Authorization: Bearer $GH`); on a request to one of `hosts`, the host proxy replaces the placeholder in the
 bound header with the real value. A request that carries the placeholder anywhere else (another header, the URL, the
 body) or to any other host whose traffic the proxy reads is blocked and recorded as `tkbox.secret.leak`. On those
-connections the proxy also blocks the real value itself (raw, base64, URL- or JSON-escaped) wherever it is not being
-swapped in, and redacts it from responses. The value is resolved by the CLI, sent to the daemon over its socket and
+connections the proxy also blocks the real value itself (raw, base64, percent- or JSON-escaped) wherever it is not
+being swapped in, and redacts it from response headers, bodies and trailers. Requests to bound hosts are sent with
+`Accept-Encoding: identity`, so their responses can be checked. The value is resolved by the CLI, sent to the daemon over its socket and
 never written to the box, its disks, its events or the record.
 
 The same secrets on the command line, where a value is never given directly:

@@ -12,6 +12,8 @@ Exec behaviour is scripted by argv[0]:
   curl HOST     a notice and a waiting_approval event, then exit 6
   big N         N bytes of "x" on stdout, split into frames of at most 1 MiB
   showreq       the received ExecRequest as JSON on stdout
+  cancelled     a cancelled error frame (the command never started)
+  nosuchcmd     a not_found error frame for a missing executable
 """
 
 from __future__ import annotations
@@ -70,6 +72,9 @@ class FakeDaemon:
         self.exec_requests: List[Dict[str, Any]] = []
         self.signer_ok = True
         self.max_boxes = 8
+        # what the fake's apply reports: paths of the patch that steer host automation, and ignored new files
+        self.sensitive: List[str] = []
+        self.ignored: List[str] = []
         self.approvals: Dict[str, Dict[str, Any]] = {
             "ap_1": {
                 "id": "ap_1",
@@ -258,16 +263,31 @@ class FakeDaemon:
                     content_type="text/x-diff",
                 )
             if sub == ["apply"] and method == "POST":
-                check = bool((payload or {}).get("check"))
-                return self._respond(
-                    conn,
-                    200,
-                    {
-                        "applied": [] if check else ["x.txt"],
-                        "patch": f"/state/boxes/{box['id']}/diff.patch",
-                        **({"checked": True} if check else {}),
-                    },
-                )
+                p = payload or {}
+                if box["state"] != "stopped":
+                    return self._error(
+                        conn, 409, "conflict", f"box {rest[1]} is {box['state']}",
+                        hint=f"stop the box first so the patch can't change under you: `tkbox stop {rest[1]}`",
+                    )
+                if self.sensitive and not p.get("allow_sensitive"):
+                    return self._error(
+                        conn, 400, "bad_request",
+                        "the patch changes files that steer the next run or host automation: " + ", ".join(self.sensitive),
+                        hint=f"review them, then run `tkbox apply {rest[1]} --allow-sensitive`; nothing was applied",
+                    )
+                check = bool(p.get("check"))
+                res: Dict[str, Any] = {
+                    "applied": [] if check else ["x.txt"] + self.sensitive,
+                    "patch": f"/state/boxes/{box['id']}/diff.patch",
+                    "sha256": "ab" * 32,
+                }
+                if check:
+                    res["checked"] = True
+                if self.sensitive:
+                    res["sensitive"] = list(self.sensitive)
+                if self.ignored:
+                    res["ignored"] = list(self.ignored)
+                return self._respond(conn, 200, res)
             if sub == ["export"] and method == "POST":
                 out = (payload or {}).get("out", "")
                 if not out.startswith("/"):
@@ -370,6 +390,11 @@ class FakeDaemon:
             return send(_jframe(T_ERROR, {"code": "denied", "message": "the signer refused this command"}))
         if cmd == "nosigner":
             return send(_jframe(T_ERROR, {"code": "unavailable", "message": "the Tracekit signer is not answering"}))
+        if cmd == "cancelled":
+            return send(_jframe(T_ERROR, {"code": "cancelled", "message": "cancelled before the command started (nothing ran)"}))
+        if cmd == "nosuchcmd":
+            return send(_jframe(T_ERROR, {"code": "not_found", "message": "start nosuchcmd: executable file not found",
+                                          "hint": "install it in the box or use an image that has it"}))
         ev(state="deciding", decision="allow")
         ev(state="running")
         if cmd == "echo":

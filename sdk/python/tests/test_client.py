@@ -6,6 +6,8 @@ import pytest
 
 from fake_daemon import FakeDaemon
 from tracekit_box import (
+    BadRequest,
+    Cancelled,
     Client,
     Conflict,
     DaemonUnreachable,
@@ -184,6 +186,19 @@ def test_exec_unavailable(client, box):
         client.exec("demo", ["nosigner"])
 
 
+def test_exec_cancelled(client, box):
+    with pytest.raises(Cancelled) as e:
+        client.exec("demo", ["cancelled"])
+    assert e.value.code == "cancelled" and "nothing ran" in e.value.message
+    assert isinstance(e.value, TkboxError)
+
+
+def test_exec_missing_executable(client, box):
+    with pytest.raises(NotFound) as e:
+        client.exec("demo", ["nosuchcmd"])
+    assert e.value.message.startswith("start ") and e.value.hint
+
+
 def test_exec_timed_out(client, box):
     r = client.exec("demo", ["sleep"])
     assert r.timed_out and r.signal == "SIGKILL" and r.exit_code == -1 and not r.ok
@@ -227,7 +242,12 @@ def test_stop_diff_apply_export_rm(client, box, tmp_path):
     assert "+++ b/x.txt" in d.patch
     assert d.files == [{"path": "x.txt", "status": "added", "new_mode": 0o644}]
     assert d.summary["bytes"] == len(d.patch)
-    assert client.apply("demo", check=True) == {"applied": [], "patch": "/state/boxes/b_1/diff.patch", "checked": True}
+    assert client.apply("demo", check=True) == {
+        "applied": [],
+        "patch": "/state/boxes/b_1/diff.patch",
+        "checked": True,
+        "sha256": "ab" * 32,
+    }
     assert client.apply("demo", dir=str(tmp_path))["applied"] == ["x.txt"]
     out = tmp_path / "demo.tkb"
     ex = client.export("demo", str(out))
@@ -235,6 +255,28 @@ def test_stop_diff_apply_export_rm(client, box, tmp_path):
     assert ex["verify"].startswith("tracekit verify ")
     client.rm("demo")
     assert client.list_boxes() == []
+
+
+def test_apply_running_box_is_a_conflict(client, box):
+    with pytest.raises(Conflict) as e:
+        client.apply("demo")
+    assert "tkbox stop demo" in e.value.hint
+
+
+def test_apply_sensitive(client, box, daemon):
+    client.stop("demo")
+    daemon.sensitive = [".github/workflows/ci.yml"]
+    daemon.ignored = ["build/out.bin"]
+    with pytest.raises(BadRequest) as e:
+        client.apply("demo")
+    assert ".github/workflows/ci.yml" in e.value.message and "--allow-sensitive" in e.value.hint
+    assert "allow_sensitive" not in daemon.requests[-1]["body"]
+    r = client.apply("demo", allow_sensitive=True)
+    assert daemon.requests[-1]["body"] == {"allow_sensitive": True}
+    assert r["sensitive"] == [".github/workflows/ci.yml"]
+    assert r["ignored"] == ["build/out.bin"]
+    assert r["applied"] == ["x.txt", ".github/workflows/ci.yml"]
+    assert r["sha256"] == "ab" * 32
 
 
 def test_stop_kill(client, box, daemon):

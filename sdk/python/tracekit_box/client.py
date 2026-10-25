@@ -41,8 +41,8 @@ def default_socket() -> str:
 
 @dataclass
 class Secret:
-    """A secret bound to hosts. The box sees only a placeholder; the daemon's egress proxy swaps value into header
-    (any request header when header is empty) only on requests to hosts."""
+    """A secret bound to exact host names (no wildcards, no ports). The box sees only a placeholder; the daemon's egress
+    proxy swaps value into header (Authorization when header is empty) only on requests to hosts."""
 
     value: str
     hosts: Sequence[str]
@@ -80,7 +80,9 @@ class Limits:
 
 @dataclass
 class ExecResult:
-    """The outcome of one exec. exit_code is the process's exit code (-1 when a signal killed it)."""
+    """The outcome of one exec. exit_code is the process's exit code (-1 when a signal killed it; signal names it).
+    timed_out is set when the exec timeout killed it. (`tkbox exec` maps these to 128+n and 124; this is the raw
+    status.)"""
 
     exit_code: int
     stdout: bytes = b""
@@ -389,7 +391,8 @@ class Client:
         return self._json("GET", self._box_path(box))
 
     def stop(self, box: str, *, kill: bool = False, reason: Optional[str] = None) -> Dict[str, Any]:
-        """POST /v1/boxes/{box}/stop. kill=True kills the VM now instead of a clean shutdown."""
+        """POST /v1/boxes/{box}/stop: stop the box and save its workspace patch; the run stays open for apply. kill=True
+        kills the VM now instead of a clean shutdown, and then no patch is saved (the Box's diff_error says why)."""
         req: Dict[str, Any] = {}
         if kill:
             req["kill"] = True
@@ -413,25 +416,36 @@ class Client:
                 raise ProtocolError(f"bad {DIFF_SUMMARY_HEADER} header") from None
         return Diff(patch=data.decode("utf-8", "replace"), summary=summary)
 
-    def apply(self, box: str, *, dir: Optional[str] = None, check: bool = False) -> Dict[str, Any]:
-        """POST /v1/boxes/{box}/apply: decide every changed file with the signer, then write them to dir (default the
-        box's workspace). check=True decides only and writes nothing. Returns {applied, denied, patch, checked}."""
+    def apply(
+        self, box: str, *, dir: Optional[str] = None, check: bool = False, allow_sensitive: bool = False
+    ) -> Dict[str, Any]:
+        """POST /v1/boxes/{box}/apply: decide every changed file with the signer, then write them all to dir (default
+        the box's workspace), or nothing if any is denied. Works only on a stopped box, from the patch saved at stop,
+        and before export (Conflict otherwise). check=True decides only and writes nothing.
+
+        A patch that changes files steering the next run or host automation (.gitignore, .gitattributes, .gitmodules,
+        tkbox.yaml, tkbox.yml, .envrc, .pre-commit-config.yaml, anything under .husky/ or .github/workflows/) is
+        refused (BadRequest) unless allow_sensitive=True. Returns the ApplyResult: {applied, denied, patch, checked,
+        sensitive, ignored, sha256}; ignored lists new files the checkout's .gitignore ignores, which are left out."""
         req: Dict[str, Any] = {}
         if dir:
             req["dir"] = os.path.abspath(os.path.expanduser(dir))
         if check:
             req["check"] = True
+        if allow_sensitive:
+            req["allow_sensitive"] = True
         return self._json("POST", self._box_path(box, "/apply"), req)
 
     def export(self, box: str, out: str) -> Dict[str, Any]:
         """POST /v1/boxes/{box}/export: close the run, write its .tkb to out and its trust file next to it (run.tkb ->
-        run.trust.json). The box must be stopped; apply is refused afterwards.
-        Returns {run_id, bundle, trust, verify}."""
+        run.trust.json). The box must be stopped; apply is refused afterwards. A run left open by a daemon that crashed
+        can't be exported (Conflict). Returns {run_id, bundle, trust, verify}."""
         return self._json("POST", self._box_path(box, "/export"), {"out": os.path.abspath(os.path.expanduser(out))})
 
     def events(self, box: str, *, follow: bool = False) -> Iterator[Dict[str, Any]]:
-        """GET /v1/boxes/{box}/events: the box's events, one dict per line. follow=True keeps reading new events until
-        the daemon closes the stream (or the caller stops iterating)."""
+        """GET /v1/boxes/{box}/events: the box's events (api.Event: time, box_id, kind, door, summary, data), one dict
+        per line. follow=True keeps reading new events until the box is no longer alive and the daemon ends the stream
+        (or the caller stops iterating)."""
         path = self._box_path(box, "/events") + ("?follow=1" if follow else "")
         resp = self._send("GET", path, timeout=None if follow else self.timeout, accept="application/x-ndjson")
         try:
@@ -484,13 +498,17 @@ class Client:
     ) -> ExecResult:
         """Run argv in the box and wait for it. The signer decides the command before it starts.
 
-        stdin: bytes, str or a binary file object sent to the process (else its stdin is /dev/null). timeout: seconds
-        or a Go duration string (default: the box's exec timeout). on_output(stream, data) is called with "stdout" or
-        "stderr" as output arrives; on_event(event) with each ExecEvent (deciding, waiting_approval, running, notice).
+        stdin: bytes, str or a binary file object sent to the process (else its stdin is /dev/null); the daemon holds
+        up to 4 MiB the process has not read yet, and past that closes its stdin and drops the rest, with a notice.
+        env: per-command env; it may not set LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT, BASH_ENV, ENV or PROMPT_COMMAND
+        (BadRequest). timeout: seconds or a Go duration string, 1s to 24h (default: the box's exec timeout).
+        on_output(stream, data) is called with "stdout" or "stderr" as output arrives; on_event(event) with each
+        ExecEvent (deciding, waiting_approval, running, notice).
 
         Returns an ExecResult whatever the exit code. Raises Denied when the command is refused (with rule_ids),
-        Unavailable when the signer can't be reached, and the other TkboxError classes for the other failures; the
-        exception's stdout, stderr and events hold what arrived before it.
+        Unavailable when the signer can't be reached, NotFound when the executable does not exist, Cancelled when it
+        was cancelled before it started, Conflict when the box stopped first, and the other TkboxError classes for the
+        other failures; the exception's stdout, stderr and events hold what arrived before it.
         """
         if isinstance(argv, str) or not argv:
             raise ValueError("argv: a non-empty list of strings, e.g. ['python', '-c', 'print(1)']")
