@@ -5,7 +5,7 @@ create a box, run commands in it, read its changes, apply them and export the si
 only, Python 3.9 or newer. It talks to a daemon on the same machine; it does not start VMs itself.
 
 ```sh
-pip install tracekit-box
+pip install ./sdk/python        # from a checkout of this repository (the package name is tracekit-box)
 ```
 
 ```python
