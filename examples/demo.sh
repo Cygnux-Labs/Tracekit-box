@@ -36,8 +36,8 @@ fi
 tkbox rm demo >/dev/null 2>&1 || true
 
 step "A box: PyPI and Debian's mirror allowed, this checkout in /workspace, GH bound to api.github.com"
-# python:3.12-slim is Debian and has no curl; deb.debian.org lets apt-get install it.
-show tkbox run --image python:3.12-slim --allow pypi --allow deb.debian.org --workspace . --name demo \
+# python:3.12-slim is Debian and has no curl; the debian preset lets apt-get install it.
+show tkbox run --image python:3.12-slim --allow pypi --allow debian --workspace . --name demo \
   --secret GH=env:GH_TOKEN@api.github.com
 show tkbox exec demo -- sh -c 'apt-get update -q >/dev/null && apt-get install -y -q curl >/dev/null && echo curl installed'
 
@@ -74,9 +74,7 @@ show tkbox diff demo
 step "Stop, export the signed record, verify it offline"
 show tkbox stop demo
 show tkbox export demo -o demo.tkb
-trust=demo.trust.json
-[ -f "$trust" ] || trust=demo.tkb.trust.json
-show tracekit verify demo.tkb --trust "$trust"                         # Integrity: VERIFIED.
+show tracekit verify demo.tkb --trust demo.trust.json                  # Integrity: VERIFIED.
 
 echo
 echo "The box is kept: tkbox diff demo, tkbox apply demo --check, tkbox rm demo."
