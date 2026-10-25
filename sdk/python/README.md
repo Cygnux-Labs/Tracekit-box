@@ -33,12 +33,23 @@ except Denied as e:
 c.stop("demo")                           # saves the patch; the run stays open for apply
 print(c.diff("demo").files)
 print(c.apply("demo", check=True))       # decide every file, write nothing
+print(c.apply("demo"))                   # {"applied": [...], "sha256": ..., "ignored": [...], ...}
 print(c.export("demo", "demo.tkb"))      # closes the run: {"bundle": ..., "trust": ".../demo.trust.json", ...}
 ```
 
 Order matters: `apply` works only on a stopped box, from the patch saved at stop, and only before `export`, which
-closes the box's Tracekit run. Commands you run with `exec` are decided by the signer and recorded; the processes they
-start inside the box are not recorded one by one.
+closes the box's Tracekit run (`Conflict` otherwise). `stop(kill=True)` saves no patch. Commands you run with `exec`
+are decided by the signer and recorded; the processes they start inside the box are not recorded one by one.
+
+A secret is bound to exact host names (no wildcards, no ports) and is swapped into one header, `Authorization` when
+`header` is empty.
+
+`apply` writes every file the signer allows, or nothing. A patch that changes files which steer the next run or host
+automation (`.gitignore`, `.gitattributes`, `.gitmodules`, `tkbox.yaml`, `tkbox.yml`, `.envrc`,
+`.pre-commit-config.yaml`, anything under `.husky/` or `.github/workflows/`) is refused with `BadRequest` unless you
+pass `allow_sensitive=True` after reading those changes. The result is the daemon's `ApplyResult`: `applied`, `denied`,
+`patch`, `checked`, `sensitive` (the applied paths of that kind), `ignored` (new files the checkout's `.gitignore`
+ignores, left out) and `sha256` (of the patch that was decided).
 
 ## API
 
@@ -50,7 +61,7 @@ start inside the box are not recorded one by one.
 | `exec(box, argv, stdin=None, env=None, cwd=None, timeout=None, *, on_output=None, on_event=None)` | `POST /v1/boxes/{box}/exec`, upgraded to `tkbox-exec/1` |
 | `stop(box, *, kill=False, reason=None)`, `rm(box)` | `POST …/stop`, `DELETE /v1/boxes/{box}` |
 | `diff(box)` | `GET …/diff` → `Diff(patch, summary)` |
-| `apply(box, *, dir=None, check=False)` | `POST …/apply` |
+| `apply(box, *, dir=None, check=False, allow_sensitive=False)` | `POST …/apply` |
 | `export(box, out)` | `POST …/export` |
 | `events(box, *, follow=False)` | `GET …/events` (a generator of dicts) |
 | `approvals()`, `approve(id, *, scope="once")`, `reject(id)` | `GET /v1/approvals`, `POST /v1/approvals/{id}` |
@@ -60,9 +71,14 @@ Boxes, approvals and results are returned as plain dicts with the field names of
 ([`internal/api/api.go`](../../internal/api/api.go)).
 
 `exec` returns an `ExecResult` (`exit_code`, `stdout`, `stderr`, `signal`, `timed_out`, `notices`, `events`,
-`duration_ms`, `truncated`) whatever the exit code. `notices` are messages the daemon wants a person to see, such as an
-egress refusal or an approval to give with `tkbox approve <id>`. The exec stream has no client-side timeout: the daemon
-enforces the exec timeout (default 30 minutes) and approval waits.
+`duration_ms`, `truncated`) whatever the exit code. `exit_code` is the raw status: the process's code, or -1 with
+`signal` set when a signal killed it (`timed_out` too when the exec timeout did); `tkbox exec` maps the same outcomes to
+128+n and 124. `notices` are messages the daemon wants a person to see, such as an egress refusal, an approval to give
+with `tkbox approve <id>`, or stdin cut off: the daemon holds at most 4 MiB of stdin the process has not read yet, then
+closes its stdin and drops the rest. A per-command `env` may not set `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`,
+`BASH_ENV`, `ENV` or `PROMPT_COMMAND`. The exec stream has no client-side timeout: the daemon enforces the exec timeout
+(default 30 minutes, 1s to 24h) and approval waits. Closing the connection (for example on `KeyboardInterrupt`) cancels
+the command if it has not started and stops it if it has.
 
 ## Errors
 
@@ -73,7 +89,10 @@ Every error is a `TkboxError` with `code`, `message`, `rule_ids`, `hint` and `st
 | `Denied` | `denied` | the signer or a person refused the command or action; `rule_ids` names the rules |
 | `Unavailable` | `unavailable` | the Tracekit signer can't be reached, so Box refused (fail closed) |
 | `LimitError` | `limit`, `too_large`, `busy` | a limit was hit; `hint` says what to do ([limits](../../docs/limits.md)) |
-| `NotFound`, `Conflict`, `BadRequest`, `Forbidden`, `TimedOut`, `NotSupported` | as named | |
+| `Cancelled` | `cancelled` | the command was cancelled before it started (nothing ran), or the client went away while it ran |
+| `Conflict` | `conflict` | the name is taken or the box is in the wrong state: `apply` on a running box or after `export`, a box that stopped before or while the command ran, `export` of a run a crashed daemon left open |
+| `NotFound` | `not_found` | no such box or approval; from `exec`, the executable does not exist in the box |
+| `BadRequest`, `Forbidden`, `TimedOut`, `NotSupported` | as named | |
 | `DaemonUnreachable` | | no daemon at the socket: start `tkbox daemon` or set `TKBOX_SOCKET` |
 | `ProtocolError` | | the daemon answered something this client does not understand |
 

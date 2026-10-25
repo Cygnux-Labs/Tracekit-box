@@ -58,7 +58,8 @@ class NotFound(TkboxError):
 
 
 class Conflict(TkboxError):
-    """The name is taken or the box is in the wrong state (conflict)."""
+    """The name is taken or the box is in the wrong state (conflict): for example apply on a box that is still
+    running, apply after export, or a box that stopped before or while the command ran."""
 
     code = "conflict"
 
@@ -88,9 +89,17 @@ class Forbidden(TkboxError):
 
 
 class TimedOut(TkboxError):
-    """A box timeout or an approval timeout (timeout)."""
+    """An exec that did not finish within its timeout as the daemon saw it, or another timeout (timeout). An exec the
+    guest killed at its timeout is not an error: it returns an ExecResult with timed_out set."""
 
     code = "timeout"
+
+
+class Cancelled(TkboxError):
+    """The command was cancelled before it started, so nothing ran, or the client went away while it ran
+    (cancelled)."""
+
+    code = "cancelled"
 
 
 class NotSupported(TkboxError):
@@ -123,6 +132,7 @@ _BY_CODE = {
     "forbidden": Forbidden,
     "timeout": TimedOut,
     "not_supported": NotSupported,
+    "cancelled": Cancelled,
 }
 
 

@@ -5,7 +5,9 @@ image: python:3.12-slim
 name: service-agent
 
 # The repository root: copied into /workspace (tracked and untracked-not-ignored files; never .git, never credential
-# files such as .env or *.pem, even when they are not ignored). Changes come back only through tkbox diff / tkbox apply.
+# files such as .env or *.pem, even when they are not ignored). Changes come back only through tkbox diff / tkbox apply
+# (after tkbox stop, before tkbox export). A patch that changes this file, .gitignore or .github/workflows/ is applied
+# only with tkbox apply --allow-sensitive.
 workspace: .
 
 # Hosts the box may reach without asking. Anything else waits up to 2 minutes for `tkbox approve <id>` on the host.
@@ -15,7 +17,7 @@ allow:
   - anthropic
 
 # The box sees placeholders in these variables; the host proxy swaps the real value in only on requests to `hosts`
-# (exact names, no wildcards), in `header` (default Authorization). Values are read on the host when the box starts and
+# (exact names, no wildcards), and only in the one `header` (Authorization when left out). Values are read on the host when the box starts and
 # never enter the VM. A secret's hosts join the allowlist.
 secrets:
   ANTHROPIC_API_KEY:
@@ -27,7 +29,7 @@ secrets:
     hosts: [api.github.com, github.com]
     header: Authorization
 
-# Plain environment for every exec (visible in the box: never secrets).
+# Plain environment for every exec (visible in the box and recorded in the run: never secrets).
 env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PIP_ROOT_USER_ACTION: ignore
