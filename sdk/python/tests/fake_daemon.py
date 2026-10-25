@@ -410,6 +410,9 @@ class FakeDaemon:
             return send(_jframe(T_EXIT, {"code": int(argv[1])}))
         if cmd == "sleep":
             return send(_jframe(T_EXIT, {"code": -1, "signal": "SIGKILL", "timed_out": True, "duration_ms": 1000}))
+        if cmd == "stdin-unread":
+            return send(_jframe(T_EXIT, {"code": -1, "signal": "SIGKILL", "stdin_truncated": True,
+                                         "stdin_dropped_bytes": 4096}))
         if cmd == "curl":
             host = argv[1]
             ev(state="notice", message=f"egress: {host}:443 is not on the allowlist; waiting for `tkbox approve ap_2`")

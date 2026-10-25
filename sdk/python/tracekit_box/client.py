@@ -93,10 +93,13 @@ class ExecResult:
     events: List[Dict[str, Any]] = field(default_factory=list)  # every ExecEvent, in order
     duration_ms: int = 0
     truncated: bool = False  # output beyond the per-exec limit was dropped
+    # stdin was not consumed fast enough: Box killed the process rather than hand it a false end of input
+    stdin_truncated: bool = False
+    stdin_dropped_bytes: int = 0
 
     @property
     def ok(self) -> bool:
-        return self.exit_code == 0 and not self.timed_out
+        return self.exit_code == 0 and not self.timed_out and not self.stdin_truncated
 
     @property
     def stdout_text(self) -> str:
@@ -611,6 +614,8 @@ class Client:
                     events=events,
                     duration_ms=int(st.get("duration_ms") or 0),
                     truncated=bool(st.get("truncated")),
+                    stdin_truncated=bool(st.get("stdin_truncated")),
+                    stdin_dropped_bytes=int(st.get("stdin_dropped_bytes") or 0),
                 )
             elif f.type == frames.TYPE_ERROR:
                 try:

@@ -349,3 +349,9 @@ def test_frames_limits():
     with pytest.raises(frames.FrameError):
         frames.read(io.BytesIO(frames.encode(frames.TYPE_STDOUT, b"abc")[:-1]))
     assert len(list(frames.chunks(frames.TYPE_STDIN, b"x" * (frames.MAX_FRAME + 1)))) == 2
+
+
+def test_exec_stdin_truncated_is_a_failure(client, box):
+    r = client.exec(box, ["stdin-unread"])
+    assert r.stdin_truncated and r.stdin_dropped_bytes == 4096
+    assert not r.ok
