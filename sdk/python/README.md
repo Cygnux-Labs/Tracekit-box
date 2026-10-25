@@ -30,11 +30,15 @@ try:
 except Denied as e:
     print("refused:", e.rule_ids)
 
-c.stop("demo")
+c.stop("demo")                           # saves the patch; the run stays open for apply
 print(c.diff("demo").files)
 print(c.apply("demo", check=True))       # decide every file, write nothing
-print(c.export("demo", "demo.tkb"))      # {"bundle": ..., "trust": ..., "verify": "tracekit verify ..."}
+print(c.export("demo", "demo.tkb"))      # closes the run: {"bundle": ..., "trust": ".../demo.trust.json", ...}
 ```
+
+Order matters: `apply` works only on a stopped box, from the patch saved at stop, and only before `export`, which
+closes the box's Tracekit run. Commands you run with `exec` are decided by the signer and recorded; the processes they
+start inside the box are not recorded one by one.
 
 ## API
 

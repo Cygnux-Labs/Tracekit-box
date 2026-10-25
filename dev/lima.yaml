@@ -7,11 +7,10 @@ disk: "40GiB"
 images:
   - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
     arch: "aarch64"
+# The checkout is mounted at the same path as on the Mac (/Users/<you>/tracekit-box); HOME in the VM is /home/<you>.guest.
 mounts:
   - location: "~/tracekit-box"
     writable: true
-  - location: "~/Tracekit"
-    writable: false
 provision:
   - mode: system
     script: |
@@ -21,4 +20,4 @@ provision:
       apt-get update -q
       apt-get install -y -q e2fsprogs git curl jq python3-venv python3-pip acl
       # the kvm group, not setfacl: udev resets ACLs on /dev/kvm every time a VM starts or stops
-      usermod -aG kvm "${LIMA_CIDATA_USER}"
+      usermod -aG kvm "{{.User}}"
