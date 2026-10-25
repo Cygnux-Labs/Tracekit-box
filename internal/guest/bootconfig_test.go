@@ -50,7 +50,9 @@ func TestFetchBootConfigFailsClosed(t *testing.T) {
 	}
 	// a host refusal is final, and a config with unknown fields is rejected
 	for _, reply := range []func(net.Conn){
-		func(c net.Conn) { proto.WriteJSON(c, proto.TypeError, proto.Error{Code: proto.CodeNotFound, Message: "no box"}) },
+		func(c net.Conn) {
+			proto.WriteJSON(c, proto.TypeError, proto.Error{Code: proto.CodeNotFound, Message: "no box"})
+		},
 		func(c net.Conn) { proto.WriteFrame(c, proto.TypeJSON, []byte(`{"version":1,"surprise":true}`)) },
 	} {
 		_, err := FetchBootConfig(context.Background(), func(ctx context.Context) (net.Conn, error) {
@@ -74,7 +76,9 @@ func TestCheckBootConfig(t *testing.T) {
 	for name, mut := range map[string]func(c *proto.BootConfig){
 		"version": func(c *proto.BootConfig) { c.Version = 99 },
 		"box id":  func(c *proto.BootConfig) { c.BoxID = "other" },
-		"ws root": func(c *proto.BootConfig) { c.Workspace = &proto.WorkspaceMount{Path: "/", BaseDevice: "a", UpperDevice: "b"} },
+		"ws root": func(c *proto.BootConfig) {
+			c.Workspace = &proto.WorkspaceMount{Path: "/", BaseDevice: "a", UpperDevice: "b"}
+		},
 		"ws dev":  func(c *proto.BootConfig) { c.Workspace = &proto.WorkspaceMount{Path: "/w"} },
 		"ca path": func(c *proto.BootConfig) { c.CABundlePath = "rel.pem" },
 	} {
