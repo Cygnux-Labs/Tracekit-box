@@ -2,7 +2,8 @@
 
 // Command vsockinit is PID 1 for the vmm boot test (go test -tags kvm). It prints markers on the console, listens on
 // vsock 1024, dials the host on vsock 1026 with one line, echoes one line per host connection, then reboots. With
-// tkbox.test=stay on the kernel command line it keeps serving until the host stops the VM.
+// tkbox.test=stay on the kernel command line it keeps serving until the host stops the VM; with tkbox.test=poweroff
+// it powers off instead of rebooting.
 package main
 
 import (
@@ -23,7 +24,8 @@ func main() {
 	b, _ := os.ReadFile("/proc/cmdline")
 	cmdline := strings.TrimSpace(string(b))
 	fmt.Println("TKBOX-TEST-CMDLINE", cmdline)
-	id, stay := param(cmdline, "tkbox.id"), param(cmdline, "tkbox.test") == "stay"
+	id, mode := param(cmdline, "tkbox.id"), param(cmdline, "tkbox.test")
+	stay := mode == "stay"
 
 	// Listen before telling the host we are up, so it can dial at once.
 	lfd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
@@ -56,6 +58,12 @@ func main() {
 		if !stay {
 			break
 		}
+	}
+	if mode == "poweroff" {
+		fmt.Println("TKBOX-TEST-REBOOT poweroff")
+		unix.Sync()
+		unix.Reboot(unix.LINUX_REBOOT_CMD_POWER_OFF)
+		select {}
 	}
 	reboot()
 }

@@ -350,7 +350,7 @@ func (m *machine) launch() error {
 		return m.reason
 	}
 	if err := cmd.Start(); err != nil {
-		return m.errorf("start %s: %v", m.bin, err)
+		return m.errorf("start %s: %v: check it is a Firecracker %s binary for this architecture", m.bin, err, TestedFirecracker)
 	}
 	m.cmd = cmd
 	m.ownSockets = true

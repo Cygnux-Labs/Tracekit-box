@@ -171,7 +171,7 @@ func assertGone(t *testing.T, m Machine, spec Spec, pid int) {
 }
 
 func TestBoot(t *testing.T) {
-	for _, tc := range []struct{ name, args string }{{"default", ""}, {"verbose", "loglevel=7"}} {
+	for _, tc := range []struct{ name, args string }{{"default", ""}, {"verbose", "loglevel=7"}, {"poweroff", "tkbox.test=poweroff"}} {
 		t.Run(tc.name, func(t *testing.T) {
 			l, spec := bootSpec(t, "boot-"+tc.name, tc.args)
 			m, err := l.New(spec)
