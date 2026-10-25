@@ -85,8 +85,9 @@ type builder struct {
 	parallel int
 	logf     func(string, ...any)
 
-	mu      sync.Mutex
-	flights map[string]*flight
+	mu        sync.Mutex
+	flights   map[string]*flight
+	downloads map[string]chan struct{} // blob digest → closed when its download ends
 }
 
 // NewBuilder returns the real Builder. mkfs.ext4 and debugfs are looked up when first needed, so a host without
@@ -116,7 +117,7 @@ func NewBuilder(opts Options) (Builder, error) {
 		stall = 60 * time.Second
 	}
 	b := &builder{opts: opts, lim: opts.Limits.withDefaults(), reg: newRegistry(opts, stall), parallel: opts.Parallel,
-		logf: opts.Logf, flights: map[string]*flight{}}
+		logf: opts.Logf, flights: map[string]*flight{}, downloads: map[string]chan struct{}{}}
 	if b.parallel <= 0 {
 		b.parallel = 4
 	}
@@ -398,12 +399,34 @@ func (b *builder) blobPath(digest string) string {
 	return filepath.Join(b.dir("blobs/sha256"), strings.TrimPrefix(digest, "sha256:"))
 }
 
-// ensureBlob returns the cached blob for d, downloading and verifying it first if needed. Readers verify again.
+// ensureBlob returns the cached blob for d, downloading and verifying it first if needed; concurrent callers in this
+// process share one download. Readers verify again.
 func (b *builder) ensureBlob(ctx context.Context, ref reference, d descriptor) (string, error) {
 	p := b.blobPath(d.Digest)
 	if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() && fi.Size() == d.Size {
 		return p, nil
 	}
+	b.mu.Lock()
+	wait, busy := b.downloads[d.Digest]
+	if !busy {
+		wait = make(chan struct{})
+		b.downloads[d.Digest] = wait
+	}
+	b.mu.Unlock()
+	if busy {
+		select {
+		case <-wait:
+			return b.ensureBlob(ctx, ref, d) // cached now, or the other download failed and we try ourselves
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	defer func() {
+		b.mu.Lock()
+		delete(b.downloads, d.Digest)
+		b.mu.Unlock()
+		close(wait)
+	}()
 	f, err := os.CreateTemp(b.dir("tmp"), "blob-")
 	if err != nil {
 		return "", err

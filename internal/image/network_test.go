@@ -54,3 +54,24 @@ func TestNetworkPythonSlim(t *testing.T) {
 	}
 	t.Logf("cached lookup: %s", time.Since(start).Round(time.Millisecond))
 }
+
+// TestNetworkGHCR resolves a public GHCR image (anonymous token from ghcr.io/token) without building it.
+func TestNetworkGHCR(t *testing.T) {
+	if os.Getenv("TKBOX_NETWORK_TESTS") != "1" {
+		t.Skip("set TKBOX_NETWORK_TESTS=1 to pull from GHCR")
+	}
+	refStr := os.Getenv("TKBOX_GHCR_IMAGE")
+	if refStr == "" {
+		refStr = "ghcr.io/linuxcontainers/alpine:latest"
+	}
+	b := newTestBuilder(t, nil, nil)
+	ref, err := parseReference(refStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := b.resolve(t.Context(), ref, "arm64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("%s arm64: %s, %d layers", ref.Name(), res.digest, len(res.man.Layers))
+}
