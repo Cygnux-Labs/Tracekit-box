@@ -468,7 +468,18 @@ func TestAllowlistPorts(t *testing.T) {
 		"other.example:8443": true, "other.example:443": false,
 	}
 	for target := range want {
-		_, _, resp := e.rawConnect(target)
+		var resp *http.Response
+		if strings.HasSuffix(target, ":80") {
+			// Port 80 is plain HTTP in absolute form (a CONNECT to it is refused before the Decider).
+			c := e.dialProxy()
+			fmt.Fprintf(c, "GET http://%s/ HTTP/1.1\r\nHost: %s\r\n\r\n", target, target)
+			var err error
+			if resp, err = http.ReadResponse(bufio.NewReader(c), nil); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			_, _, resp = e.rawConnect(target)
+		}
 		if resp.StatusCode != 403 {
 			t.Errorf("%s: %s", target, resp.Status)
 		}
@@ -487,7 +498,7 @@ func TestAddressRefusals(t *testing.T) {
 	checkGoroutines(t)
 	e := newEnv(t, func(c *Config) {
 		c.Allow = []string{"internal.example", "mixed.example", "loop2.example", "meta.example", "[::ffff:10.0.0.1]:443",
-			"169.254.169.254:80", "6to4.example", "nat64.example", "teredo.example"}
+			"169.254.169.254", "6to4.example", "nat64.example", "teredo.example"}
 		c.AllowPrivate = []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32"), netip.MustParsePrefix("169.254.0.0/16")}
 	})
 	e.res.set("internal.example", "10.0.0.7")
@@ -503,7 +514,7 @@ func TestAddressRefusals(t *testing.T) {
 		"loop2.example:443":      "loopback",
 		"meta.example:443":       "metadata",
 		"[::ffff:10.0.0.1]:443":  "private",
-		"169.254.169.254:80":     "metadata",
+		"169.254.169.254:443":    "metadata",
 		"6to4.example:443":       "6to4",
 		"nat64.example:443":      "NAT64",
 		"teredo.example:443":     "Teredo",
@@ -804,7 +815,7 @@ func TestSNIMismatch(t *testing.T) {
 	for {
 		n := 0
 		for _, ev := range e.sink.events() {
-			if ev.Kind == EventDenied && (strings.Contains(ev.Reason, "does not match") || strings.Contains(ev.Reason, "no server name")) {
+			if ev.Kind == EventDenied && (strings.Contains(ev.Reason, "is not the CONNECT host") || strings.Contains(ev.Reason, "no server name")) {
 				n++
 			}
 		}
@@ -1030,7 +1041,7 @@ func TestMaxConns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b := body(t, resp); resp.StatusCode != 503 || !strings.Contains(b, "MaxConns") || !strings.Contains(b, "1 open connections") {
+	if b := body(t, resp); resp.StatusCode != 503 || !strings.Contains(b, "MaxConns") || !strings.Contains(b, "1 open connections") || strings.Contains(b, "max_conns") {
 		t.Errorf("%s %q", resp.Status, b)
 	}
 	e.waitKind(EventDenied)

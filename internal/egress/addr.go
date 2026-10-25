@@ -128,20 +128,26 @@ func normPrefixes(what string, in []netip.Prefix) ([]netip.Prefix, error) {
 	return out, nil
 }
 
-// refused applies the proxy's full address policy: metadata and BlockPrefixes always, the built-in ranges unless
-// AllowPrivate exempts the address.
-func (p *Proxy) refused(a netip.Addr) (bool, string) {
+// operatorBlocked names an address BlockPrefixes or BlockFunc refuses (the daemon blocks the host's own addresses).
+const operatorBlocked = "an address of this host or one the operator blocked"
+
+// refused applies the proxy's full address policy: metadata, BlockPrefixes and BlockFunc always, the built-in ranges
+// unless AllowPrivate exempts the address. what names the address for a sentence ("a loopback address").
+func (p *Proxy) refused(a netip.Addr) (bad bool, what string) {
 	if !a.IsValid() {
-		return true, "invalid address"
+		return true, "an invalid address"
 	}
 	for _, v := range addrViews(a) {
 		if why, ok := metadataAddrs[v]; ok {
-			return true, why
+			return true, "a " + why + " address"
 		}
 		for _, bp := range p.blockPrefixes {
 			if bp.Contains(v) {
-				return true, "blocked by the operator"
+				return true, operatorBlocked
 			}
+		}
+		if bad, what := p.blockFunc(v); bad {
+			return true, what
 		}
 	}
 	bad, why := Blocked(a)
@@ -154,7 +160,27 @@ func (p *Proxy) refused(a netip.Addr) (bool, string) {
 			return false, ""
 		}
 	}
-	return true, why
+	return true, "a " + why + " address"
+}
+
+// blockFunc asks Config.BlockFunc, the operator's live check; a panic refuses.
+func (p *Proxy) blockFunc(a netip.Addr) (bad bool, what string) {
+	if p.cfg.BlockFunc == nil {
+		return false, ""
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			bad, what = true, operatorBlocked+" (the operator's address check failed)"
+		}
+	}()
+	bad, why := p.cfg.BlockFunc(a)
+	if !bad {
+		return false, ""
+	}
+	if why = printable(why, 100); why != "" {
+		return true, operatorBlocked + " (" + why + ")"
+	}
+	return true, operatorBlocked
 }
 
 // resolveError is a refusal found while resolving: detail goes to events, public to the guest.
@@ -187,8 +213,8 @@ func (p *Proxy) resolve(ctx context.Context, host string, lit netip.Addr) ([]net
 	for _, a := range addrs {
 		if bad, why := p.refused(a); bad {
 			return nil, &resolveError{status: 403,
-				public: "it resolves to a " + why + " address, which Box never connects to",
-				detail: fmt.Sprintf("it resolves to %v, a %s address, which Box never connects to", a, why)}
+				public: "it resolves to " + why + ", which Box never connects to",
+				detail: fmt.Sprintf("it resolves to %v, %s, which Box never connects to", a, why)}
 		}
 		u := a.Unmap().WithZone("")
 		if !seen[u] {
@@ -242,7 +268,7 @@ func (p *Proxy) dialControl(network, address string, _ syscall.RawConn) error {
 		return fmt.Errorf("refusing to dial %q: %v", address, err)
 	}
 	if bad, why := p.refused(ap.Addr()); bad {
-		return fmt.Errorf("refusing to dial a %s address", why)
+		return fmt.Errorf("refusing to dial %s", why)
 	}
 	return nil
 }
