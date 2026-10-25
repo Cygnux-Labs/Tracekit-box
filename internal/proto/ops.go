@@ -100,6 +100,8 @@ type FileInfo struct {
 type DiffRequest struct {
 	Op       string `json:"op"`
 	MaxBytes int64  `json:"max_bytes,omitempty"` // 0: 64 MiB; a larger patch is an error with CodeTooLarge
+	// ExcludeDirs are directory names skipped anywhere in the workspace (also when sizing), e.g. "node_modules".
+	ExcludeDirs []string `json:"exclude_dirs,omitempty"`
 }
 
 // DiffSummary lists what changed in the workspace relative to the image it booted with.

@@ -66,6 +66,7 @@ const (
 	CodeInternal     = "internal"
 	CodeTimeout      = "timeout"       // a box timeout or approval timeout
 	CodeNotSupported = "not_supported" // e.g. this host has no /dev/kvm
+	CodeCancelled    = "cancelled"     // the caller cancelled (Ctrl-C, a closed connection) before the command started
 )
 
 type ErrorBody struct {
@@ -153,6 +154,9 @@ type CreateBoxRequest struct {
 	Inspect   string                `json:"inspect,omitempty"` // "bound" (default: MITM only hosts with a bound secret) or "all"
 	Agent     string                `json:"agent,omitempty"`   // agent name recorded in the Tracekit run (default "tkbox")
 	Task      string                `json:"task,omitempty"`    // the task, recorded as trusted observe content
+	// ValidateOnly checks the request (limits, allowlist, secrets, workspace) and answers 200 with the box it would
+	// create, without creating anything.
+	ValidateOnly bool `json:"validate_only,omitempty"`
 }
 
 type Box struct {
@@ -176,6 +180,11 @@ type Box struct {
 	StopReason  string            `json:"stop_reason,omitempty"`
 	Error       string            `json:"error,omitempty"` // why it failed
 	Execs       int               `json:"execs"`           // execs started so far
+	// DiffSaved is set once the workspace patch was saved at stop (apply and diff read it); DiffError says why it
+	// was not (killed, paused, too large, the guest did not answer, …).
+	DiffSaved bool     `json:"diff_saved,omitempty"`
+	DiffError string   `json:"diff_error,omitempty"`
+	Notices   []string `json:"notices,omitempty"` // what the person should know (e.g. the workspace is not a git work tree)
 }
 
 type ExecRequest struct {
@@ -211,13 +220,19 @@ type StopRequest struct {
 type ApplyRequest struct {
 	Dir   string `json:"dir,omitempty"`   // host checkout to apply to; default the box's workspace
 	Check bool   `json:"check,omitempty"` // validate and decide only, write nothing
+	// AllowSensitive lets the patch change files that steer the next run or host automation (.gitignore,
+	// .gitattributes, .gitmodules, tkbox.yaml, .husky/, .github/workflows/, …); without it such a patch is refused.
+	AllowSensitive bool `json:"allow_sensitive,omitempty"`
 }
 
 type ApplyResult struct {
-	Applied []string `json:"applied"`           // paths written (relative to Dir)
-	Denied  []string `json:"denied,omitempty"`  // paths the signer refused; nothing is applied if any is denied
-	Patch   string   `json:"patch,omitempty"`   // path of the saved patch file under the box's state dir
-	Checked bool     `json:"checked,omitempty"` // Check was set: nothing was written
+	Applied   []string `json:"applied"`             // paths written (relative to Dir)
+	Denied    []string `json:"denied,omitempty"`    // paths the signer refused; nothing is applied if any is denied
+	Patch     string   `json:"patch,omitempty"`     // path of the saved patch file under the box's state dir
+	Checked   bool     `json:"checked,omitempty"`   // Check was set: nothing was written
+	Sensitive []string `json:"sensitive,omitempty"` // paths of Applied that steer the next run or host automation
+	Ignored   []string `json:"ignored,omitempty"`   // new files the checkout's .gitignore ignores: left out of the apply
+	SHA256    string   `json:"sha256,omitempty"`    // sha256 of the patch that was decided (and applied)
 }
 
 type ExportRequest struct {
@@ -239,10 +254,11 @@ type Approval struct {
 	BoxName   string    `json:"box_name"`
 	Kind      string    `json:"kind"`   // "egress"
 	Target    string    `json:"target"` // e.g. "https://example.com:443"
-	State     string    `json:"state"`  // "pending", "approved", "rejected", "expired"
+	State     string    `json:"state"`  // "pending", "approved", "rejected", "expired", "withdrawn"
 	CreatedAt time.Time `json:"created_at"`
 	ExpiresAt time.Time `json:"expires_at"`
 	DecidedBy string    `json:"decided_by,omitempty"` // "uid:<n>" of the API caller who answered
+	Waiters   int       `json:"waiters"`              // connections waiting on it now; at 0 it is withdrawn
 }
 
 type ApprovalDecision struct {

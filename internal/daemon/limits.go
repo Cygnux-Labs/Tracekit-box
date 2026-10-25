@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"fmt"
+	"net/netip"
 	"net/textproto"
 	"os"
 	"path/filepath"
@@ -59,6 +60,8 @@ type spec struct {
 	secrets    []egress.Secret // placeholders filled later
 	inspect    string
 	agent      string
+	// this host's own addresses, which the proxy refuses
+	blockPrefixes []netip.Prefix
 }
 
 // validate checks a create request and fills in defaults. Errors never hold a secret value.
@@ -111,7 +114,8 @@ func (d *Daemon) validate(req api.CreateBoxRequest) (*spec, *api.ErrorDetail) {
 	if len(req.Allow) > 0 {
 		allow, model, err := d.eg.expand(req.Allow)
 		if err != nil {
-			return bad("use a preset (github, pypi, npm, anthropic, openai, apt-ubuntu, go-proxy) or a host (api.example.com, h:8443)", "allow: %v", err)
+			// the egress package's message names the presets and says what to do
+			return bad("", "%s", strings.TrimPrefix(err.Error(), "egress: "))
 		}
 		s.allow, s.modelHosts = allow, model
 	}

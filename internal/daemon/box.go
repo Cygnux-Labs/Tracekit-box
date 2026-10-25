@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -44,7 +46,11 @@ type box struct {
 	listeners     []net.Listener
 	run           tracekit.Run
 	runClosed     bool   // close_run accepted
+	runClosedBy   string // "export", "failed", "quarantine", "shutdown", "rm"
+	runLost       bool   // a previous daemon left the run open and its token died with it
 	closeReason   string // why the box stopped: the run's close reason
+	calls         callTracker
+	ctlMu         sync.Mutex // orders containment's pause/resume against stop's state change
 	secrets       []egress.Secret
 	approvedHosts map[string]bool // "host:port" approved for the rest of the box (scope "box")
 	sessions      map[*execSession]struct{}
@@ -105,6 +111,7 @@ func (b *box) view() api.Box {
 	v := b.info
 	v.Allow = append([]string{}, b.info.Allow...)
 	v.Secrets = append([]string(nil), b.info.Secrets...)
+	v.Notices = append([]string(nil), b.info.Notices...)
 	if b.info.Env != nil {
 		v.Env = make(map[string]string, len(b.info.Env))
 		for k, x := range b.info.Env {
@@ -123,7 +130,7 @@ func (b *box) persist() {
 	b.persistMu.Lock()
 	defer b.persistMu.Unlock()
 	b.mu.Lock()
-	p := persisted{Box: b.info, CID: b.cid}
+	p := persisted{Box: b.info, CID: b.cid, RunClosed: b.runClosed, RunClosedBy: b.runClosedBy, CloseReason: b.closeReason}
 	b.mu.Unlock()
 	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
@@ -146,6 +153,24 @@ func (d *Daemon) Create(ctx context.Context, req api.CreateBoxRequest) (api.Box,
 	s, e := d.validate(req)
 	if e != nil {
 		return api.Box{}, e
+	}
+	prefixes, err := hostPrefixes()
+	if err != nil {
+		return api.Box{}, errf(api.CodeInternal, "check the host's network interfaces; a box can't start without knowing which addresses to keep it away from",
+			"could not list this host's addresses: %v", err)
+	}
+	s.blockPrefixes = prefixes
+	var notices []string
+	if ws := s.req.Workspace; ws != "" && !gitWorkTree(ws) {
+		notices = append(notices, ws+" is not a git work tree: copying every file except credential files")
+	}
+	if req.ValidateOnly {
+		names := make([]string, 0, len(s.secrets))
+		for _, sec := range s.secrets {
+			names = append(names, sec.Name)
+		}
+		return api.Box{Name: req.Name, Image: s.req.Image, Allow: s.allow, Secrets: names, Env: s.req.Env,
+			Workspace: s.req.Workspace, Limits: s.limits, Inspect: s.inspect, Unrecorded: d.opts.Unrecorded, Notices: notices}, nil
 	}
 	d.mu.Lock()
 	if d.closed {
@@ -194,7 +219,7 @@ func (d *Daemon) Create(ctx context.Context, req api.CreateBoxRequest) (api.Box,
 	}
 	info := api.Box{ID: id, Name: name, State: api.StateCreating, Image: s.req.Image, Allow: s.allow, Secrets: names,
 		Env: s.req.Env, Workspace: s.req.Workspace, Limits: s.limits, Inspect: s.inspect,
-		Unrecorded: d.opts.Unrecorded, CreatedAt: d.now().UTC()}
+		Unrecorded: d.opts.Unrecorded, CreatedAt: d.now().UTC(), Notices: notices}
 	dir := d.boxDir(id)
 	b := newBox(d, info, dir, cid)
 	bctx, cancel := context.WithCancel(d.ctx)
@@ -214,6 +239,9 @@ func (d *Daemon) Create(ctx context.Context, req api.CreateBoxRequest) (api.Box,
 	b.persist()
 	b.event(api.EventBoxCreated, "lifecycle", fmt.Sprintf("box %s created from %s", name, s.req.Image), map[string]any{
 		"image": s.req.Image, "allow": s.allow, "secrets": names, "unrecorded": d.opts.Unrecorded})
+	for _, n := range notices {
+		b.event(api.EventBoxCreated, "lifecycle", n, nil)
+	}
 	// a client that gives up (Ctrl-C on `tkbox run`) abandons the box rather than leaving one nobody knows about
 	unwatch := context.AfterFunc(ctx, func() {
 		b.mu.Lock()
@@ -223,7 +251,7 @@ func (d *Daemon) Create(ctx context.Context, req api.CreateBoxRequest) (api.Box,
 		b.mu.Unlock()
 		cancel()
 	})
-	err := b.boot(bctx, s)
+	err = b.boot(bctx, s)
 	unwatch()
 	if err != nil {
 		b.mu.Lock()
@@ -231,12 +259,33 @@ func (d *Daemon) Create(ctx context.Context, req api.CreateBoxRequest) (api.Box,
 			err = fmt.Errorf("stopped while creating (%s): %w", b.stopReason, err)
 		}
 		b.mu.Unlock()
+		detail := ""
+		var ge *guestError
+		if errors.As(err, &ge) {
+			detail = ge.detail
+		}
 		ae := asAPIError(err)
 		ae.Message = b.scrub().str(ae.Message)
-		b.teardown(context.Background(), ae.Message, false, true)
+		b.teardown(context.Background(), ae.Message, detail, false, true)
 		return b.view(), ae
 	}
 	return b.view(), nil
+}
+
+// guestError is a failure whose recorded reason is a fixed host-side phrase; detail (text the guest or the VM's
+// console produced) goes only to events.ndjson, never into a trusted Tracekit record.
+type guestError struct {
+	msg, detail string
+}
+
+func (e *guestError) Error() string { return e.msg }
+
+// gitWorkTree reports whether dir is inside a git work tree (git's own config and hooks stay out of it).
+func gitWorkTree(dir string) bool {
+	cmd := exec.Command("git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", dir, "rev-parse", "--is-inside-work-tree")
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0")
+	out, err := cmd.Output()
+	return err == nil && strings.TrimSpace(string(out)) == "true"
 }
 
 // boot does the work of Create after the box is registered.
@@ -255,6 +304,7 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 		if err := run.Observe(ctx, tracekit.SourceBox, trustedObs, map[string]any{
 			"event": "created", "box_id": b.id, "name": b.info.Name, "image": s.req.Image, "allow": s.allow,
 			"limits": s.limits, "secrets": b.info.Secrets, "workspace": s.req.Workspace, "inspect": s.inspect,
+			"env": envValue(s.req.Env),
 		}); err != nil {
 			return fmt.Errorf("record the box in Tracekit: %w", err)
 		}
@@ -332,7 +382,7 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 
 	proxy, err := d.opts.NewProxy(egress.Config{BoxID: b.id, Allow: s.allow, ModelHosts: s.modelHosts,
 		Secrets: s.secrets, Inspect: s.inspect, CA: ca, Decider: (*boxDecider)(b), Sink: (*boxSink)(b),
-		BlockPrefixes: hostPrefixes(), AllowPrivate: d.opts.EgressAllowPrivate, UpstreamRoots: d.opts.EgressUpstreamRoots,
+		BlockPrefixes: s.blockPrefixes, AllowPrivate: d.opts.EgressAllowPrivate, UpstreamRoots: d.opts.EgressUpstreamRoots,
 		DecideTimeout: d.opts.ApprovalTimeout + 30*time.Second})
 	if err != nil {
 		return fmt.Errorf("start the egress proxy: %w", err)
@@ -448,8 +498,19 @@ func buildEnv(imageEnv []string, boxEnv map[string]string, secrets []egress.Secr
 	return out
 }
 
-// serveBootConfig answers every boot_config request on the config port with the box's BootConfig.
+// envValue is a box env as an observe value (map[string]any, which canonical JSON takes).
+func envValue(env map[string]string) map[string]any {
+	out := make(map[string]any, len(env))
+	for k, v := range env {
+		out[k] = v
+	}
+	return out
+}
+
+// serveBootConfig answers boot_config requests on the config port with the box's BootConfig until the guest has
+// fetched it once; then the port is closed (the guest has no reason to ask twice).
 func (b *box) serveBootConfig(l net.Listener) {
+	var once sync.Once
 	for {
 		c, err := l.Accept()
 		if err != nil {
@@ -469,7 +530,9 @@ func (b *box) serveBootConfig(l net.Listener) {
 			}
 			cfg := b.bootCfg
 			cfg.UnixNano = time.Now().UnixNano()
-			proto.WriteJSON(c, proto.TypeJSON, cfg)
+			if proto.WriteJSON(c, proto.TypeJSON, cfg) == nil {
+				once.Do(func() { l.Close() })
+			}
 		}()
 	}
 }
@@ -497,13 +560,13 @@ func (b *box) waitReady(ctx context.Context, m vmm.Machine, g agentrpc.Guest) er
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-m.Done():
-			return fmt.Errorf("the VM exited while booting (%v): read %s", m.Err(), console)
+			return &guestError{msg: "the VM exited while booting: read " + console, detail: fmt.Sprint(m.Err())}
 		case <-deadline.C:
 			why := "it never said ready"
 			if last != nil {
 				why = last.Error()
 			}
-			return fmt.Errorf("the guest did not come up within %s (%s): read %s", b.d.opts.ReadyTimeout, why, console)
+			return &guestError{msg: fmt.Sprintf("the guest did not come up within %s: read %s", b.d.opts.ReadyTimeout, console), detail: why}
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
@@ -520,7 +583,7 @@ func (b *box) watchMachine(m vmm.Machine) {
 			if console == "" {
 				console = filepath.Join(b.dir, "console.log")
 			}
-			b.teardown(context.Background(), fmt.Sprintf("the VM exited on its own (%v): read %s", m.Err(), console), false, true)
+			b.teardown(context.Background(), "the VM exited on its own: read "+console, fmt.Sprint(m.Err()), false, true)
 		}
 	}
 }
@@ -551,7 +614,7 @@ func (b *box) containmentLoop() {
 
 func (b *box) checkContainment() {
 	b.mu.Lock()
-	run, m, st, held := b.run, b.machine, b.info.State, b.heldPaused
+	run, m, st := b.run, b.machine, b.info.State
 	b.mu.Unlock()
 	if run == nil || m == nil || (st != api.StateRunning && st != api.StatePaused) {
 		return
@@ -573,18 +636,27 @@ func (b *box) checkContainment() {
 	b.mu.Lock()
 	b.signerTrouble = false
 	b.mu.Unlock()
-	switch {
-	case c.Contained && c.State == "quarantined":
+	if c.Contained && c.State == "quarantined" {
 		b.event(api.EventContained, "lifecycle", "Tracekit quarantined the run: killing the VM",
 			map[string]any{"state": c.State, "incident_id": c.IncidentID, "reason": c.Reason})
 		b.observe(tracekit.SourceContained, trustedObs, map[string]any{"state": c.State, "incident_id": c.IncidentID})
 		b.stop(context.Background(), fmt.Sprintf("contained: Tracekit quarantined the run (incident %s)", c.IncidentID), true)
 		// a quarantined job applies nothing: close its run now
-		if err := b.closeRun(context.Background()); err != nil {
+		if err := b.closeRun(context.Background(), "quarantine"); err != nil {
 			b.event(api.EventSignerProblem, "lifecycle", "could not close the Tracekit run: "+err.Error(), nil)
 		}
+		return
+	}
+	// pause and resume decide on the state as it is now, under ctlMu, so a box that started stopping meanwhile is
+	// never paused under its stop or brought back to running
+	b.ctlMu.Lock()
+	b.mu.Lock()
+	st, held := b.info.State, b.heldPaused
+	b.mu.Unlock()
+	switch {
 	case c.Contained && st == api.StateRunning:
 		if err := m.Pause(ctx); err != nil {
+			b.ctlMu.Unlock()
 			b.event(api.EventContained, "lifecycle", "Tracekit holds the run but pausing failed ("+err.Error()+"): killing the VM", nil)
 			b.stop(context.Background(), "contained: held by Tracekit and the VM could not be paused", true)
 			return
@@ -593,12 +665,14 @@ func (b *box) checkContainment() {
 		b.info.State = api.StatePaused
 		b.heldPaused = true
 		b.mu.Unlock()
+		b.ctlMu.Unlock()
 		b.persist()
 		b.event(api.EventContained, "lifecycle", "Tracekit holds the run: VM paused",
 			map[string]any{"state": "held", "incident_id": c.IncidentID, "reason": c.Reason})
 		b.observe(tracekit.SourceContained, trustedObs, map[string]any{"state": "held", "incident_id": c.IncidentID})
 	case !c.Contained && st == api.StatePaused && held:
 		if err := m.Resume(ctx); err != nil {
+			b.ctlMu.Unlock()
 			b.event(api.EventContained, "lifecycle", "the hold was released but resuming failed: "+err.Error(), nil)
 			return
 		}
@@ -606,15 +680,26 @@ func (b *box) checkContainment() {
 		b.info.State = api.StateRunning
 		b.heldPaused = false
 		b.mu.Unlock()
+		b.ctlMu.Unlock()
 		b.persist()
 		b.event(api.EventContained, "lifecycle", "Tracekit released the hold: VM resumed", map[string]any{"state": ""})
 		b.observe(tracekit.SourceContained, trustedObs, map[string]any{"state": "", "incident_id": c.IncidentID})
+	default:
+		b.ctlMu.Unlock()
 	}
 }
 
-// stop brings a box down: the diff is saved first (unless kill or paused), then the guest and the VM are shut down,
-// the proxy closed and the run closed with reason. Idempotent; waits for the box to be down.
+// How long stop gives running commands to end after SIGTERM (then SIGKILL) before it takes the diff.
+var (
+	execTermGrace = 3 * time.Second
+	execKillGrace = 2 * time.Second
+)
+
+// stop brings a box down: running commands are signalled and the diff is saved first (unless kill or paused), then
+// the guest and the VM are shut down, the proxy closed and the stop recorded. Idempotent; waits for the box to be
+// down. Once started, a stop runs to the end even if ctx ends (its steps have their own timeouts).
 func (b *box) stop(ctx context.Context, reason string, kill bool) {
+	b.ctlMu.Lock()
 	b.mu.Lock()
 	st := b.info.State
 	switch st {
@@ -624,6 +709,7 @@ func (b *box) stop(ctx context.Context, reason string, kill bool) {
 		}
 		cancel := b.bootCancel
 		b.mu.Unlock()
+		b.ctlMu.Unlock()
 		if cancel != nil {
 			cancel()
 		}
@@ -632,21 +718,82 @@ func (b *box) stop(ctx context.Context, reason string, kill bool) {
 	case api.StateRunning, api.StatePaused:
 		b.info.State = api.StateStopping
 		b.mu.Unlock()
+		b.ctlMu.Unlock()
 	case api.StateStopping:
 		b.mu.Unlock()
+		b.ctlMu.Unlock()
 		b.waitDone(ctx)
 		return
 	default:
 		b.mu.Unlock()
+		b.ctlMu.Unlock()
 		return
 	}
 	b.persist()
-	if !kill && st == api.StateRunning {
-		b.saveDiff(ctx)
-	} else if st == api.StatePaused {
-		b.event(api.EventBoxStopped, "lifecycle", "diff not saved: the VM was paused", nil)
+	sctx := context.WithoutCancel(ctx)
+	switch {
+	case kill:
+		b.diffNotSaved("the box was killed (--kill or containment), so its workspace diff was not saved")
+	case st == api.StatePaused:
+		b.diffNotSaved("the VM was paused (held by Tracekit) when it stopped, so its workspace diff was not saved")
+	default:
+		b.endExecs()
+		b.saveDiff(sctx)
 	}
-	b.teardown(ctx, reason, kill, false)
+	b.teardown(sctx, reason, "", kill, false)
+}
+
+// endExecs asks the box's running commands to end (SIGTERM, then SIGKILL) so the diff is not taken from files they
+// are still writing.
+func (b *box) endExecs() {
+	b.mu.Lock()
+	var running []*execSession
+	for s := range b.sessions {
+		if s.started.Load() && !isClosed(s.execDone) {
+			running = append(running, s)
+		}
+	}
+	b.mu.Unlock()
+	if len(running) == 0 {
+		return
+	}
+	b.event(api.EventBoxStopped, "lifecycle", fmt.Sprintf("stopping: sent SIGTERM to %d running commands", len(running)), nil)
+	for _, sig := range []string{"SIGTERM", "SIGKILL"} {
+		grace := execTermGrace
+		if sig == "SIGKILL" {
+			grace = execKillGrace
+		}
+		var left []*execSession
+		for _, s := range running {
+			if !isClosed(s.execDone) {
+				select {
+				case s.sigs <- sig:
+				default:
+				}
+				left = append(left, s)
+			}
+		}
+		if len(left) == 0 {
+			return
+		}
+		t := time.NewTimer(grace)
+		waited := true
+		for _, s := range left {
+			select {
+			case <-s.execDone:
+			case <-t.C:
+				waited = false
+			}
+			if !waited {
+				break
+			}
+		}
+		t.Stop()
+		if waited {
+			return
+		}
+	}
+	b.event(api.EventBoxStopped, "lifecycle", "stopping: some commands did not end after SIGKILL; the diff is taken anyway", nil)
 }
 
 func (b *box) waitDone(ctx context.Context) {
@@ -656,12 +803,54 @@ func (b *box) waitDone(ctx context.Context) {
 	}
 }
 
-// saveDiff writes the guest's workspace patch to diff.patch and its summary to diff.json.
+// diffNotSaved records why a box has no saved diff: in box.json (DiffError, shown by `tkbox diff` and `tkbox apply`),
+// in events.ndjson and loudly in the daemon log.
+func (b *box) diffNotSaved(why string) {
+	b.mu.Lock()
+	if b.info.DiffSaved || b.info.DiffError != "" {
+		b.mu.Unlock()
+		return
+	}
+	b.info.DiffError = why
+	b.mu.Unlock()
+	b.persist()
+	b.event(api.EventBoxStopped, "lifecycle", "diff not saved: "+why, nil)
+}
+
+// diffExcludeDirs are dir names left out of every workspace diff: generated trees (dependencies, caches) that would
+// blow the 64 MiB cap and that nobody applies by hand.
+var diffExcludeDirs = []string{"node_modules", "__pycache__", ".venv", "venv", ".tox", ".mypy_cache", ".pytest_cache",
+	".gradle", ".next", ".cache"}
+
+// excludingDiffer is a guest client that can leave dirs out of a diff (proto.DiffRequest.ExcludeDirs).
+type excludingDiffer interface {
+	DiffExcluding(ctx context.Context, maxBytes int64, excludeDirs []string, w io.Writer) (proto.DiffSummary, error)
+}
+
+// guestDiff asks the guest for the workspace patch, without diffExcludeDirs when the client can say so.
+func guestDiff(ctx context.Context, g agentrpc.Guest, w io.Writer) error {
+	var err error
+	if x, ok := g.(excludingDiffer); ok {
+		_, err = x.DiffExcluding(ctx, maxDiffBytes, diffExcludeDirs, w)
+	} else {
+		_, err = g.Diff(ctx, maxDiffBytes, w)
+	}
+	return err // the guest's summary is not used: the host builds its own from the patch (summarize)
+}
+
+func isTooLarge(err error) bool {
+	var pe *proto.Error
+	return errors.Is(err, errDiffTooLarge) || (errors.As(err, &pe) && pe.Code == proto.CodeTooLarge)
+}
+
+// saveDiff writes the guest's workspace patch to diff.patch and the host's summary of it to diff.json. A failure is
+// recorded (diffNotSaved) and the stop goes on.
 func (b *box) saveDiff(ctx context.Context) {
 	b.mu.Lock()
-	g := b.guest
+	g, name := b.guest, b.info.Name
 	b.mu.Unlock()
 	if g == nil {
+		b.diffNotSaved("the guest never came up, so there is no workspace diff")
 		return
 	}
 	dctx, cancel := context.WithTimeout(ctx, 60*time.Second)
@@ -669,29 +858,45 @@ func (b *box) saveDiff(ctx context.Context) {
 	tmp := filepath.Join(b.dir, ".diff.patch.tmp")
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
-		b.event(api.EventBoxStopped, "lifecycle", "diff not saved: "+err.Error(), nil)
+		b.diffNotSaved("the diff could not be written: " + err.Error())
 		return
 	}
-	sum, err := g.Diff(dctx, maxDiffBytes, f)
+	err = guestDiff(dctx, g, &limitWriter{w: f, n: maxDiffBytes})
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
 		os.Remove(tmp)
-		b.event(api.EventBoxStopped, "lifecycle", "diff not saved: "+err.Error(), nil)
+		switch {
+		case isTooLarge(err):
+			b.diffNotSaved(fmt.Sprintf("the workspace patch was over %d MiB when box %s stopped, so no diff was saved; keep build output and generated files out of /workspace (write them under /tmp) or remove them before stopping", maxDiffBytes>>20, name))
+		case errors.Is(dctx.Err(), context.DeadlineExceeded):
+			b.diffNotSaved("the guest did not send the workspace diff within 60s, so no diff was saved")
+		default:
+			b.diffNotSaved("the guest did not send the workspace diff (" + err.Error() + "), so no diff was saved")
+		}
+		b.d.log.Printf("WARNING: box %s (%s): the workspace diff was NOT saved; nothing can be applied from it", name, b.id)
 		return
 	}
 	if err := os.Rename(tmp, filepath.Join(b.dir, "diff.patch")); err != nil {
-		b.event(api.EventBoxStopped, "lifecycle", "diff not saved: "+err.Error(), nil)
+		b.diffNotSaved("the diff could not be saved: " + err.Error())
 		return
 	}
-	if js, err := json.Marshal(sum); err == nil {
-		os.WriteFile(filepath.Join(b.dir, "diff.json"), js, 0o600)
+	if patch, err := os.ReadFile(filepath.Join(b.dir, "diff.patch")); err == nil {
+		if js, err := json.Marshal(summarize(patch)); err == nil {
+			os.WriteFile(filepath.Join(b.dir, "diff.json"), js, 0o600)
+		}
 	}
+	b.mu.Lock()
+	b.info.DiffSaved, b.info.DiffError = true, ""
+	b.mu.Unlock()
+	b.persist()
 }
 
-// teardown releases everything a box holds and records why. failed marks it failed instead of stopped.
-func (b *box) teardown(ctx context.Context, reason string, kill, failed bool) {
+// teardown releases everything a box holds and records why. failed marks it failed instead of stopped. reason is a
+// host-side phrase (it is recorded in Tracekit as trusted); detail, which may hold text from the guest or the VM's
+// console, goes only to events.ndjson.
+func (b *box) teardown(ctx context.Context, reason, detail string, kill, failed bool) {
 	b.mu.Lock()
 	if b.tearingDown {
 		b.mu.Unlock()
@@ -741,6 +946,9 @@ func (b *box) teardown(ctx context.Context, reason string, kill, failed bool) {
 	for _, l := range ls {
 		l.Close()
 	}
+	if failed {
+		b.diffNotSaved("the box failed (" + reason + "), so its workspace diff was not saved")
+	}
 	if run != nil {
 		fctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		b.flushObserver(fctx)
@@ -751,15 +959,17 @@ func (b *box) teardown(ctx context.Context, reason string, kill, failed bool) {
 		if err := run.Observe(fctx, tracekit.SourceBox, trustedObs, map[string]any{"event": event, "box_id": b.id, "reason": reason}); err != nil {
 			b.event(api.EventSignerProblem, "lifecycle", "could not record the stop: "+err.Error(), nil)
 		}
+		cancel()
 		b.mu.Lock()
 		b.closeReason = reason
 		b.mu.Unlock()
 		if failed { // nothing left to apply: close now; a stopped box keeps its run open for apply (see closeRun)
-			if err := b.closeRun(fctx); err != nil {
+			cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if err := b.closeRun(cctx, "failed"); err != nil {
 				b.event(api.EventSignerProblem, "lifecycle", "could not close the Tracekit run: "+err.Error(), nil)
 			}
+			cancel()
 		}
-		cancel()
 	}
 	b.mu.Lock()
 	b.info.StoppedAt = b.d.now().UTC()
@@ -772,25 +982,44 @@ func (b *box) teardown(ctx context.Context, reason string, kill, failed bool) {
 	}
 	b.mu.Unlock()
 	b.persist()
-	if failed {
-		b.event(api.EventBoxFailed, "lifecycle", reason, nil)
-	} else {
-		b.event(api.EventBoxStopped, "lifecycle", "box stopped: "+reason, nil)
+	data := map[string]any(nil)
+	if detail != "" {
+		data = map[string]any{"detail": detail}
 	}
+	if failed {
+		b.event(api.EventBoxFailed, "lifecycle", reason, data)
+	} else {
+		b.event(api.EventBoxStopped, "lifecycle", "box stopped: "+reason, data)
+	}
+	b.events.release()
 	b.closeDone()
 }
 
-// closeRun closes the box's Tracekit run once, with the reason the box stopped. A stopped box keeps its run open so
-// `tkbox apply` records its Write decisions in the same run (one bundle per job); export, rm and daemon shutdown
-// close it.
-func (b *box) closeRun(ctx context.Context) error {
+// runCloseWait bounds how long closing a run waits for the box's in-flight gated calls to complete.
+var runCloseWait = 15 * time.Second
+
+// closeRun closes the box's Tracekit run once, with the reason the box stopped, after the box's in-flight gated
+// calls (exec, egress, apply) completed (at most runCloseWait). A stopped box keeps its run open so `tkbox apply`
+// records its Write decisions in the same run (one bundle per job); export, rm and daemon shutdown close it. by says
+// who closed it ("export", "failed", "quarantine", "shutdown", "rm").
+func (b *box) closeRun(ctx context.Context, by string) error {
 	b.mu.Lock()
-	run, reason := b.run, b.closeReason
+	run := b.run
 	if run == nil || b.runClosed {
 		b.mu.Unlock()
 		return nil
 	}
+	b.mu.Unlock()
+	if !b.calls.wait(runCloseWait) {
+		b.event(api.EventSignerProblem, "lifecycle", fmt.Sprintf("closing the Tracekit run while gated calls are still in flight (they did not finish within %s)", runCloseWait), nil)
+	}
+	b.mu.Lock()
+	if b.runClosed {
+		b.mu.Unlock()
+		return nil
+	}
 	b.runClosed = true
+	reason := b.closeReason
 	b.mu.Unlock()
 	if reason == "" {
 		reason = "box stopped"
@@ -801,6 +1030,10 @@ func (b *box) closeRun(ctx context.Context) error {
 		b.mu.Unlock()
 		return err
 	}
+	b.mu.Lock()
+	b.runClosedBy = by
+	b.mu.Unlock()
+	b.persist()
 	return nil
 }
 
@@ -831,12 +1064,17 @@ func (d *Daemon) Remove(ctx context.Context, ref string) error {
 	if alive(b.state()) {
 		return errf(api.CodeConflict, "try again, or `tkbox stop --kill "+ref+"`", "box %s is still going down", ref)
 	}
-	if err := b.closeRun(ctx); err != nil {
+	if err := b.closeRun(ctx, "rm"); err != nil {
 		return errf(api.CodeUnavailable, "check the signer (`tracekit status`) and run `tkbox rm "+ref+"` again",
 			"could not close the Tracekit run of box %s: %v", ref, err)
 	}
 	d.mu.Lock()
 	delete(d.boxes, b.id)
+	for id, a := range d.approvals {
+		if a.box == b {
+			delete(d.approvals, id)
+		}
+	}
 	d.mu.Unlock()
 	b.events.close()
 	if err := os.RemoveAll(b.dir); err != nil {
@@ -874,11 +1112,11 @@ func caHosts(secrets []egress.Secret, allow []string, inspect string) []string {
 
 // hostPrefixes are this host's own non-loopback addresses: a guest must not reach host services on them, even on a
 // public address. (Loopback is in the proxy's built-in block list, where the test-only --egress-allow-private may
-// exempt it.)
-func hostPrefixes() []netip.Prefix {
+// exempt it.) Without them a box is not started: an empty list would let a guest reach the host's own services.
+var hostPrefixes = func() ([]netip.Prefix, error) {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var out []netip.Prefix
 	for _, a := range addrs {
@@ -893,5 +1131,5 @@ func hostPrefixes() []netip.Prefix {
 		ip = ip.Unmap()
 		out = append(out, netip.PrefixFrom(ip, ip.BitLen()))
 	}
-	return out
+	return out, nil
 }

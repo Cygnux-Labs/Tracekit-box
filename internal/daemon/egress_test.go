@@ -54,7 +54,7 @@ func TestDecider(t *testing.T) {
 		return tracekit.Decision{Decision: "allow"}
 	}
 	v, _ = dec.Decide(ctx, r)
-	if v.Allow || v.RuleIDs[0] != "TK-N001" || v.Reason != "no package installs" || len(e.d.Approvals()) != 0 {
+	if v.Allow || v.RuleIDs[0] != "TK-N001" || v.Reason != "denied by Tracekit policy [TK-N001]: no package installs" || len(e.d.Approvals()) != 0 {
 		t.Fatalf("signer deny %+v", v)
 	}
 	e.tk.DecideFunc = nil

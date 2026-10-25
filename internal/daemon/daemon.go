@@ -229,7 +229,10 @@ func (d *Daemon) SocketPath() string { return filepath.Join(d.opts.StateDir, "ru
 // persisted is box.json: the public view plus what a restarted daemon needs. Never a secret value.
 type persisted struct {
 	api.Box
-	CID uint32 `json:"cid"`
+	CID         uint32 `json:"cid"`
+	RunClosed   bool   `json:"run_closed,omitempty"`    // close_run was accepted
+	RunClosedBy string `json:"run_closed_by,omitempty"` // "export", "failed", "quarantine", "shutdown", "rm"
+	CloseReason string `json:"close_reason,omitempty"`
 }
 
 // load reads boxes/*/box.json. A box a previous daemon left alive died with it: mark it failed.
@@ -254,6 +257,7 @@ func (d *Daemon) load() error {
 			continue
 		}
 		bx := newBox(d, p.Box, dir, p.CID)
+		bx.runClosed, bx.runClosedBy, bx.closeReason = p.RunClosed, p.RunClosedBy, p.CloseReason
 		switch p.State {
 		case api.StateCreating, api.StateRunning, api.StatePaused, api.StateStopping:
 			bx.info.State = api.StateFailed
@@ -262,9 +266,20 @@ func (d *Daemon) load() error {
 			if bx.info.StoppedAt.IsZero() {
 				bx.info.StoppedAt = d.now()
 			}
+			if !bx.info.DiffSaved && bx.info.DiffError == "" {
+				bx.info.DiffError = "the daemon stopped while the box was alive, so its workspace diff was not saved"
+			}
 			bx.persist()
 			bx.event(api.EventBoxFailed, "lifecycle", bx.info.Error, nil)
 		}
+		if !bx.info.Unrecorded && bx.info.RunID != "" && !bx.runClosed {
+			// the run token died with the previous daemon and Tracekit Box can't rebuild a run from its id: the run
+			// stays open in the signer, can't be closed from here and so can't be exported
+			bx.runLost = true
+			bx.event(api.EventSignerProblem, "lifecycle", fmt.Sprintf("the Tracekit run %s was left open by a daemon that stopped without closing it (crashed or killed); this daemon can't close it, so the box can't be exported", bx.info.RunID), nil)
+			d.log.Printf("WARNING: box %s: Tracekit run %s was left open by the previous daemon; it can't be closed or exported", p.ID, bx.info.RunID)
+		}
+		bx.events.release()
 		bx.closeDone()
 		d.boxes[p.ID] = bx
 	}
@@ -349,9 +364,13 @@ func (d *Daemon) Shutdown(ctx context.Context) {
 		go func() {
 			defer wg.Done()
 			b.stop(ctx, "daemon shutdown", false)
-			// the run token dies with the daemon: close every open run so its bundle can still be exported
-			if err := b.closeRun(ctx); err != nil {
+			// the run token dies with the daemon: close every open run so its bundle can still be exported. The close
+			// has its own clock: a slow stop must not leave the run open
+			cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := b.closeRun(cctx, "shutdown"); err != nil {
 				b.event(api.EventSignerProblem, "lifecycle", "could not close the Tracekit run: "+err.Error(), nil)
+				d.log.Printf("WARNING: box %s: could not close its Tracekit run: %v", b.id, err)
 			}
 		}()
 	}
