@@ -175,7 +175,9 @@ func fakeEgress() egressHooks {
 			return allow, model, nil
 		},
 		placeholder: func(name string) (string, error) { return "tkbox_" + name + "_" + randHex(16), nil },
-		newCA:       func(string) (*egress.CA, string, error) { return nil, "-----BEGIN CERTIFICATE-----\nfake\n", nil },
+		newCA: func(string, egress.CAOptions) (*egress.CA, string, error) {
+			return nil, "-----BEGIN CERTIFICATE-----\nfake\n", nil
+		},
 	}
 }
 

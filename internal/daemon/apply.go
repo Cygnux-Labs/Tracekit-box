@@ -228,6 +228,10 @@ func (d *Daemon) Export(ctx context.Context, ref string, req api.ExportRequest) 
 	if fi, err := os.Stat(filepath.Dir(out)); err != nil || !fi.IsDir() {
 		return api.ExportResult{}, errf(api.CodeBadRequest, "create the directory first, or pass -o in an existing one", "the directory of %s does not exist", out)
 	}
+	if err := b.closeRun(ctx); err != nil {
+		return api.ExportResult{}, errf(api.CodeUnavailable, "check the signer (`tracekit status`) and export again",
+			"could not close the Tracekit run of box %s: %v", ref, err)
+	}
 	trust := strings.TrimSuffix(out, ".tkb") + ".trust.json"
 	if err := d.opts.Tracekit.Export(ctx, v.RunID, out, trust); err != nil {
 		return api.ExportResult{}, asAPIError(fmt.Errorf("export: %w", err))

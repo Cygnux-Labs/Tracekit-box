@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -42,6 +43,8 @@ type box struct {
 	proxy         Proxy
 	listeners     []net.Listener
 	run           tracekit.Run
+	runClosed     bool   // close_run accepted
+	closeReason   string // why the box stopped: the run's close reason
 	secrets       []egress.Secret
 	approvedHosts map[string]bool // "host:port" approved for the rest of the box (scope "box")
 	sessions      map[*execSession]struct{}
@@ -302,7 +305,9 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 	var ca *egress.CA
 	caPEM := ""
 	if len(s.secrets) > 0 || s.inspect == egress.InspectAll {
-		if ca, caPEM, err = d.eg.newCA(b.id); err != nil {
+		// the CA may impersonate only the hosts it must, and only while the box may live
+		opts := egress.CAOptions{Lifetime: time.Duration(s.limits.Timeout) + time.Hour, Hosts: caHosts(s.secrets, s.allow, s.inspect)}
+		if ca, caPEM, err = d.eg.newCA(b.id, opts); err != nil {
 			return fmt.Errorf("create the box CA: %w", err)
 		}
 	}
@@ -327,7 +332,7 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 
 	proxy, err := d.opts.NewProxy(egress.Config{BoxID: b.id, Allow: s.allow, ModelHosts: s.modelHosts,
 		Secrets: s.secrets, Inspect: s.inspect, CA: ca, Decider: (*boxDecider)(b), Sink: (*boxSink)(b),
-		AllowPrivate: d.opts.EgressAllowPrivate, UpstreamRoots: d.opts.EgressUpstreamRoots,
+		BlockPrefixes: hostPrefixes(), AllowPrivate: d.opts.EgressAllowPrivate, UpstreamRoots: d.opts.EgressUpstreamRoots,
 		DecideTimeout: d.opts.ApprovalTimeout + 30*time.Second})
 	if err != nil {
 		return fmt.Errorf("start the egress proxy: %w", err)
@@ -574,6 +579,10 @@ func (b *box) checkContainment() {
 			map[string]any{"state": c.State, "incident_id": c.IncidentID, "reason": c.Reason})
 		b.observe(tracekit.SourceContained, trustedObs, map[string]any{"state": c.State, "incident_id": c.IncidentID})
 		b.stop(context.Background(), fmt.Sprintf("contained: Tracekit quarantined the run (incident %s)", c.IncidentID), true)
+		// a quarantined job applies nothing: close its run now
+		if err := b.closeRun(context.Background()); err != nil {
+			b.event(api.EventSignerProblem, "lifecycle", "could not close the Tracekit run: "+err.Error(), nil)
+		}
 	case c.Contained && st == api.StateRunning:
 		if err := m.Pause(ctx); err != nil {
 			b.event(api.EventContained, "lifecycle", "Tracekit holds the run but pausing failed ("+err.Error()+"): killing the VM", nil)
@@ -742,8 +751,13 @@ func (b *box) teardown(ctx context.Context, reason string, kill, failed bool) {
 		if err := run.Observe(fctx, tracekit.SourceBox, trustedObs, map[string]any{"event": event, "box_id": b.id, "reason": reason}); err != nil {
 			b.event(api.EventSignerProblem, "lifecycle", "could not record the stop: "+err.Error(), nil)
 		}
-		if err := run.Close(fctx, reason); err != nil {
-			b.event(api.EventSignerProblem, "lifecycle", "could not close the Tracekit run: "+err.Error(), nil)
+		b.mu.Lock()
+		b.closeReason = reason
+		b.mu.Unlock()
+		if failed { // nothing left to apply: close now; a stopped box keeps its run open for apply (see closeRun)
+			if err := b.closeRun(fctx); err != nil {
+				b.event(api.EventSignerProblem, "lifecycle", "could not close the Tracekit run: "+err.Error(), nil)
+			}
 		}
 		cancel()
 	}
@@ -764,6 +778,30 @@ func (b *box) teardown(ctx context.Context, reason string, kill, failed bool) {
 		b.event(api.EventBoxStopped, "lifecycle", "box stopped: "+reason, nil)
 	}
 	b.closeDone()
+}
+
+// closeRun closes the box's Tracekit run once, with the reason the box stopped. A stopped box keeps its run open so
+// `tkbox apply` records its Write decisions in the same run (one bundle per job); export, rm and daemon shutdown
+// close it.
+func (b *box) closeRun(ctx context.Context) error {
+	b.mu.Lock()
+	run, reason := b.run, b.closeReason
+	if run == nil || b.runClosed {
+		b.mu.Unlock()
+		return nil
+	}
+	b.runClosed = true
+	b.mu.Unlock()
+	if reason == "" {
+		reason = "box stopped"
+	}
+	if err := run.Close(ctx, reason); err != nil {
+		b.mu.Lock()
+		b.runClosed = false
+		b.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 // Stop stops a box (see box.stop) and returns it.
@@ -793,6 +831,10 @@ func (d *Daemon) Remove(ctx context.Context, ref string) error {
 	if alive(b.state()) {
 		return errf(api.CodeConflict, "try again, or `tkbox stop --kill "+ref+"`", "box %s is still going down", ref)
 	}
+	if err := b.closeRun(ctx); err != nil {
+		return errf(api.CodeUnavailable, "check the signer (`tracekit status`) and run `tkbox rm "+ref+"` again",
+			"could not close the Tracekit run of box %s: %v", ref, err)
+	}
 	d.mu.Lock()
 	delete(d.boxes, b.id)
 	d.mu.Unlock()
@@ -801,4 +843,55 @@ func (d *Daemon) Remove(ctx context.Context, ref string) error {
 		return asAPIError(err)
 	}
 	return nil
+}
+
+// caHosts are the hosts a box's CA may impersonate: the bound secrets' hosts and, with inspect all, the allowlist's
+// (ports dropped: name constraints have none).
+func caHosts(secrets []egress.Secret, allow []string, inspect string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(h string) {
+		if !seen[h] {
+			seen[h] = true
+			out = append(out, h)
+		}
+	}
+	for _, s := range secrets {
+		for _, h := range s.Hosts {
+			add(h)
+		}
+	}
+	if inspect == egress.InspectAll {
+		for _, a := range allow {
+			if h, _, err := net.SplitHostPort(a); err == nil {
+				a = h
+			}
+			add(strings.Trim(a, "[]"))
+		}
+	}
+	return out
+}
+
+// hostPrefixes are this host's own non-loopback addresses: a guest must not reach host services on them, even on a
+// public address. (Loopback is in the proxy's built-in block list, where the test-only --egress-allow-private may
+// exempt it.)
+func hostPrefixes() []netip.Prefix {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	var out []netip.Prefix
+	for _, a := range addrs {
+		ipn, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip, ok := netip.AddrFromSlice(ipn.IP)
+		if !ok || ip.Unmap().IsLoopback() {
+			continue
+		}
+		ip = ip.Unmap()
+		out = append(out, netip.PrefixFrom(ip, ip.BitLen()))
+	}
+	return out
 }

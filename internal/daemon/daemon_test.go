@@ -124,9 +124,10 @@ func TestLifecycle(t *testing.T) {
 		t.Fatalf("shutdowns %d machine %s proxy closed %v", e.guest.Shutdowns, m.State, e.proxy(0).closed)
 	}
 	run := e.run(0)
-	if !run.Closed || run.Agent.Name != "claude-code" {
-		t.Fatalf("run %+v", run)
+	if run.Closed || run.Agent.Name != "claude-code" {
+		t.Fatalf("a stopped box closed its run (apply could not record): %+v", run)
 	}
+
 	var sources []string
 	for _, r := range run.Records {
 		if r.Method == "observe" {
@@ -149,8 +150,8 @@ func TestLifecycle(t *testing.T) {
 			t.Fatalf("%s holds the secret value", name)
 		}
 	}
-	if err := e.d.Remove(context.Background(), "demo"); err != nil {
-		t.Fatal(err)
+	if err := e.d.Remove(context.Background(), "demo"); err != nil || !run.Closed {
+		t.Fatalf("rm: %v (run closed %v)", err, run.Closed)
 	}
 	if _, err := os.Stat(e.d.boxDir(b.ID)); !os.IsNotExist(err) {
 		t.Fatalf("box dir still there: %v", err)

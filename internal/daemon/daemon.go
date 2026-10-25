@@ -110,14 +110,14 @@ type Daemon struct {
 type egressHooks struct {
 	expand      func(entries []string) (allow, modelHosts []string, err error)
 	placeholder func(name string) (string, error)
-	newCA       func(boxID string) (*egress.CA, string, error) // the CA and its certificate PEM
+	newCA       func(boxID string, opts egress.CAOptions) (*egress.CA, string, error) // the CA and its certificate PEM
 }
 
 var defaultEgressHooks = egressHooks{
 	expand:      egress.Expand,
 	placeholder: egress.NewPlaceholder,
-	newCA: func(boxID string) (*egress.CA, string, error) {
-		ca, err := egress.NewCA(boxID)
+	newCA: func(boxID string, opts egress.CAOptions) (*egress.CA, string, error) {
+		ca, err := egress.NewCAWith(boxID, opts)
 		if err != nil {
 			return nil, "", err
 		}
@@ -349,6 +349,10 @@ func (d *Daemon) Shutdown(ctx context.Context) {
 		go func() {
 			defer wg.Done()
 			b.stop(ctx, "daemon shutdown", false)
+			// the run token dies with the daemon: close every open run so its bundle can still be exported
+			if err := b.closeRun(ctx); err != nil {
+				b.event(api.EventSignerProblem, "lifecycle", "could not close the Tracekit run: "+err.Error(), nil)
+			}
 		}()
 	}
 	wg.Wait()
