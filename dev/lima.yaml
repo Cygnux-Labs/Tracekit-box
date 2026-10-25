@@ -20,4 +20,5 @@ provision:
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -q
       apt-get install -y -q e2fsprogs git curl jq python3-venv python3-pip acl
-      [ -e /dev/kvm ] && setfacl -m u:${LIMA_CIDATA_USER}:rw /dev/kvm || true
+      # the kvm group, not setfacl: udev resets ACLs on /dev/kvm every time a VM starts or stops
+      usermod -aG kvm "${LIMA_CIDATA_USER}"
