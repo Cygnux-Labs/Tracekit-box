@@ -201,8 +201,8 @@ func Gate(ctx context.Context, r Run, call Call, hooks GateHooks) (Outcome, erro
 		for state == ApprovalRequested && ctx.Err() == nil {
 			s, err := r.WaitApproval(ctx, id, maxWait)
 			if err != nil {
-				if ctx.Err() != nil {
-					break
+				if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+					break // ctx ended: the approval is withdrawn below
 				}
 				// the call won't run, so no one may approve it: withdraw it (gate.py leaves it to expire)
 				abandon(ctx, r, id, "Tracekit Box could not wait for the answer")

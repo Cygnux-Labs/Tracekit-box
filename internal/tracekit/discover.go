@@ -45,6 +45,8 @@ type discovered struct {
 	alt    string // dev: the sibling runtime dir's socket, used when the first one serves another HOME's data dir
 }
 
+var loadSystemConfig = systemConfig // tests replace it: a root-owned file can't be made there
+
 // systemConfig is the root-owned client config, nil when there is none; any doubt about it is an error (fail closed),
 // as tracekit/client.py system_config.
 func systemConfig() (map[string]any, error) {
@@ -79,7 +81,7 @@ func clip(s string, n int) string {
 
 // discoverSigner finds the signer's socket for opts.
 func discoverSigner(opts Options) (discovered, error) {
-	sys, err := systemConfig()
+	sys, err := loadSystemConfig()
 	if err != nil {
 		return discovered{}, &Unavailable{Err: err}
 	}

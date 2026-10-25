@@ -304,6 +304,9 @@ func (t *transport) send(ctx context.Context, method string, frame []byte, own b
 		case ctx.Err() != nil:
 			return nil, &Unavailable{Err: fmt.Errorf("%s: %w", method, ctx.Err())}
 		case errors.As(err, &ne) && ne.Timeout():
+			if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) { // ctx's deadline, a moment before ctx says so
+				return nil, &Unavailable{Err: fmt.Errorf("%s: %w", method, context.DeadlineExceeded)}
+			}
 			return nil, &Unavailable{Err: fmt.Errorf("no answer to %s within %s", method, timeout)}
 		case errors.Is(err, errFrameTooLong), errors.Is(err, errBadAnswer):
 			return nil, &Unavailable{Err: fmt.Errorf("%s: %w", method, err)}
