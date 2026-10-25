@@ -480,6 +480,49 @@ func lcs(a, b [][]byte) int {
 	return dp[0][0]
 }
 
+// TestDiffExcludeDirs: excluded directory names are left out wherever they are (new, changed, deleted, below an
+// opaque dir, nested), do not count toward max, and the patch still applies; a file with such a name is kept.
+func TestDiffExcludeDirs(t *testing.T) {
+	f := newDiffFixture(t)
+	f.baseFile("app.js", "v1\n", 0o644)
+	f.baseFile("node_modules/left/index.js", "left\n", 0o644)
+	f.baseFile("pkg/__pycache__/old.pyc", "\x00old", 0o644)
+	f.baseFile("pkg/mod.py", "x = 1\n", 0o644)
+	f.baseFile("lib/a.txt", "a\n", 0o644)
+	f.baseFile("lib/node_modules/z.js", "z\n", 0o644)
+	f.seal()
+
+	f.write("app.js", "v2\n", 0o644)
+	f.write("src/m.py", "print(1)\n", 0o644)
+	f.write("notes/__pycache__", "a file, not a dir\n", 0o644)
+	f.write("node_modules.txt", "kept\n", 0o644)
+	// excluded: written to upper only, so want keeps the base's version
+	writeFile(t, f.upper, "node_modules/left/index.js", "changed\n", 0o644)
+	writeFile(t, f.upper, "node_modules/big/blob.bin", randBytes(3, 300000), 0o644)
+	writeFile(t, f.upper, "sub/deep/node_modules/x/y.js", "y\n", 0o644)
+	writeFile(t, f.upper, "src/__pycache__/m.cpython-312.pyc", "\x00pyc", 0o644)
+	writeFile(t, f.upper, "pkg/__pycache__", "", 0o644) // whiteout of the base dir
+	f.wh["pkg/__pycache__"] = true
+	f.opaque("lib") // drops lib/a.txt, but not the excluded lib/node_modules
+	must(t, copyTree(filepath.Join(f.base, "lib/node_modules"), filepath.Join(f.want, "lib/node_modules")))
+
+	if _, _, err := Diff(f.upperTree(), &DirTree{Root: f.base}, 64<<10); err != errTooLarge {
+		t.Fatalf("without exclusions the 300 KB blob should be over 64 KiB, got %v", err)
+	}
+	sum, patch, err := Diff(f.upperTree(), &DirTree{Root: f.base}, 64<<10, "node_modules", "__pycache__")
+	must(t, err)
+	gitApply(t, f.base, f.want, patch)
+	var paths []string
+	for _, df := range sum.Files {
+		paths = append(paths, df.Path)
+	}
+	sort.Strings(paths)
+	want := []string{"app.js", "lib/a.txt", "node_modules.txt", "notes/__pycache__", "src/m.py"}
+	if strings.Join(paths, ",") != strings.Join(want, ",") {
+		t.Fatalf("files %v, want %v\n%s", paths, want, patch)
+	}
+}
+
 func TestQuotePath(t *testing.T) {
 	for in, want := range map[string]string{
 		"plain/x.go": "a/plain/x.go",
