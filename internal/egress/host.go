@@ -274,6 +274,16 @@ func (ps patterns) match(host string, addr netip.Addr, port int) bool {
 	return false
 }
 
+// matchExplicitPort reports whether an entry that names a port (not a bare host) matches.
+func (ps patterns) matchExplicitPort(host string, addr netip.Addr, port int) bool {
+	for _, p := range ps {
+		if p.port != 0 && p.match(host, addr, port) {
+			return true
+		}
+	}
+	return false
+}
+
 func (ps patterns) matchHost(host string, addr netip.Addr) bool {
 	for _, p := range ps {
 		if p.matchHost(host, addr) {

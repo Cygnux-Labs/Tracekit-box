@@ -60,6 +60,7 @@ type secretRule struct {
 	Secret
 	hosts   patterns
 	lowerPH string
+	forms   []string // valueForms(Value); forms[0] is the value itself
 }
 
 func newSecretRule(s Secret) (*secretRule, error) {
@@ -88,16 +89,23 @@ func newSecretRule(s Secret) (*secretRule, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s.Header != "" {
-		if !validHeaderName(s.Header) {
-			return nil, fmt.Errorf("egress: secret %s: header %q is not a valid header name", s.Name, s.Header)
-		}
-		s.Header = textproto.CanonicalMIMEHeaderKey(s.Header)
-		if s.Header == "Host" || isHopByHop(s.Header) {
-			return nil, fmt.Errorf("egress: secret %s: header %s is never forwarded; bind a request header such as Authorization", s.Name, s.Header)
+	for _, h := range hosts {
+		if h.wildcard {
+			return nil, fmt.Errorf("egress: secret %s: host %s is a wildcard, which would hand the value to every host under %s "+
+				"(on a multi-tenant domain, every tenant); list the exact hosts that need it", s.Name, h, h.host)
 		}
 	}
-	return &secretRule{Secret: s, hosts: hosts, lowerPH: asciiLower(s.Placeholder)}, nil
+	if s.Header == "" {
+		s.Header = DefaultSecretHeader
+	}
+	if !validHeaderName(s.Header) {
+		return nil, fmt.Errorf("egress: secret %s: header %q is not a valid header name", s.Name, s.Header)
+	}
+	s.Header = textproto.CanonicalMIMEHeaderKey(s.Header)
+	if s.Header == "Host" || isHopByHop(s.Header) {
+		return nil, fmt.Errorf("egress: secret %s: header %s is never forwarded; bind a request header such as Authorization", s.Name, s.Header)
+	}
+	return &secretRule{Secret: s, hosts: hosts, lowerPH: asciiLower(s.Placeholder), forms: valueForms(s.Value)}, nil
 }
 
 func (s *secretRule) boundTo(host string) bool {
@@ -184,15 +192,20 @@ func (p *Proxy) findTarget(target string) []*secretRule {
 	return nil
 }
 
-// redact replaces every placeholder (and every value long enough to tell apart from ordinary text) in s with
-// "[secret NAME]", so events and refusals never carry one.
+// redact replaces every placeholder (and every value long enough to tell apart from ordinary text, in any of its
+// encoded forms) in s with "[secret NAME]", so events and refusals never carry one.
 func (p *Proxy) redact(s string) string {
 	if len(p.secrets) == 0 || s == "" {
 		return s
 	}
 	for _, r := range p.secrets {
-		if len(r.Value) >= minRedactLen && strings.Contains(s, r.Value) {
-			s = strings.ReplaceAll(s, r.Value, "[secret "+r.Name+"]")
+		for _, f := range r.forms {
+			if strings.Contains(s, f) {
+				s = strings.ReplaceAll(s, f, "[secret "+r.Name+"]")
+			}
+		}
+		if len(r.forms) > 0 && strings.Contains(asciiLower(s), asciiLower(r.Value)) {
+			s = replaceFold(s, r.Value, "[secret "+r.Name+"]") // host names arrive lower-cased
 		}
 	}
 	low := asciiLower(s)
@@ -304,16 +317,17 @@ func containsRule(rs []*secretRule, r *secretRule) bool {
 	return false
 }
 
-// checkUse decides whether secret r may be swapped into header canon on a request to host.
+// checkUse decides whether secret r may be swapped into header canon on a request to host (swap is false over
+// plain HTTP). The wrong host is named first: it is the bigger mistake.
 func (p *Proxy) checkUse(r *secretRule, canon, host string, swap bool) *leakError {
 	switch {
-	case !swap:
-		return &leakError{secret: r, reason: fmt.Sprintf("secret %s would go over plain HTTP; Box swaps secrets only into HTTPS requests", r.Name),
-			todo: "Use https:// for this host"}
 	case !r.boundTo(host):
 		return &leakError{secret: r, reason: fmt.Sprintf("secret %s is not bound to this host", r.Name),
 			todo: fmt.Sprintf("Send it only to %s, or bind it to this host in the box's secrets", strings.Join(r.Hosts, ", "))}
-	case r.Header != "" && canon != r.Header:
+	case !swap:
+		return &leakError{secret: r, reason: fmt.Sprintf("secret %s would go over plain HTTP; Box swaps secrets only into HTTPS requests", r.Name),
+			todo: "Use https:// for this host"}
+	case canon != r.Header:
 		return &leakError{secret: r, reason: fmt.Sprintf("secret %s is only sent in the %s header, not %s", r.Name, r.Header, canon),
 			todo: "Put the placeholder in the " + r.Header + " header"}
 	}
@@ -323,58 +337,150 @@ func (p *Proxy) checkUse(r *secretRule, canon, host string, swap bool) *leakErro
 // minRedactLen: shorter values cannot be told apart from ordinary text and are not redacted from output.
 const minRedactLen = 6
 
-// redactValues replaces secret values echoed in response headers with their placeholders.
+// replaceFold replaces every ASCII-case-insensitive occurrence of old in s.
+func replaceFold(s, old, repl string) string {
+	lo := asciiLower(old)
+	for {
+		i := strings.Index(asciiLower(s), lo)
+		if i < 0 {
+			return s
+		}
+		s = s[:i] + repl + s[i+len(old):]
+	}
+}
+
+// redactValues replaces secret values echoed in response headers with their placeholders, and the value's encoded
+// forms (base64 Basic credentials, percent- or JSON-escaped) with a marker.
 func (p *Proxy) redactValues(h http.Header) {
 	for _, r := range p.secrets {
-		if len(r.Value) < minRedactLen {
-			continue
-		}
 		for k, vs := range h {
 			for i, v := range vs {
-				if strings.Contains(v, r.Value) {
-					h[k][i] = strings.ReplaceAll(v, r.Value, r.Placeholder)
+				for j, f := range r.forms {
+					if strings.Contains(v, f) {
+						repl := "[tkbox: redacted]"
+						if j == 0 {
+							repl = r.Placeholder
+						}
+						v = strings.ReplaceAll(v, f, repl)
+					}
+				}
+				h[k][i] = v
+			}
+		}
+	}
+}
+
+// valuePatterns are the encoded forms of every secret value.
+func (p *Proxy) valuePatterns() []pattern {
+	var out []pattern
+	for _, r := range p.secrets {
+		for _, f := range r.forms {
+			out = append(out, pattern{s: []byte(f), rule: r, kind: patValue})
+		}
+	}
+	return out
+}
+
+// findValues returns the secrets whose value (in any encoded form) occurs in s.
+func (p *Proxy) findValues(s string) []*secretRule {
+	var out []*secretRule
+	for _, m := range p.valMatch.findString(s) {
+		out = append(out, m.rule)
+	}
+	return out
+}
+
+// findValueTarget looks for secret values in a request target: raw, percent-decoded, and case-insensitively (DNS
+// lower-cases host names, so a value in a host still travels).
+func (p *Proxy) findValueTarget(target string) []*secretRule {
+	if p.valMatch.empty() {
+		return nil
+	}
+	if f := p.findValues(target); f != nil {
+		return f
+	}
+	for _, un := range []func(string) (string, error){url.PathUnescape, url.QueryUnescape} {
+		if u, err := un(target); err == nil {
+			if f := p.findValues(u); f != nil {
+				return f
+			}
+		}
+	}
+	low := asciiLower(target)
+	for _, r := range p.secrets {
+		if len(r.forms) > 0 && strings.Contains(low, asciiLower(r.Value)) {
+			return []*secretRule{r}
+		}
+	}
+	return nil
+}
+
+// checkValues looks for real secret values in request headers. A value may only travel in its own header to one of
+// its hosts over TLS (a guest that somehow holds the value and sends it where Box would have swapped it in); in a
+// header name, another header, to another host or over plain HTTP it is a leak.
+func (p *Proxy) checkValues(h http.Header, host string, overTLS bool) *leakError {
+	if p.valMatch.empty() {
+		return nil
+	}
+	names := make([]string, 0, len(h))
+	for k := range h {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if f := p.findValues(name); f != nil {
+			return valueLeak(f[0], "a header name", "")
+		}
+		canon := textproto.CanonicalMIMEHeaderKey(name)
+		for _, v := range h[name] {
+			for _, r := range p.findValues(v) {
+				switch {
+				case canon != r.Header || !r.boundTo(host):
+					return valueLeak(r, "the "+canon+" header of a request to this host",
+						fmt.Sprintf("Box sends it only to %s in the %s header; send the placeholder there instead.", strings.Join(r.Hosts, ", "), r.Header))
+				case !overTLS:
+					return valueLeak(r, "a plain-HTTP request header", "Box never sends secrets over plain HTTP; use https:// and the placeholder.")
 				}
 			}
 		}
 	}
+	return nil
 }
 
-var errLeak = errors.New("placeholder in request body")
+// valueLeak is a real secret value (not its placeholder) found where it may not go. The box should never hold a
+// value, so it also means the value reached the guest some other way.
+func valueLeak(r *secretRule, where, todo string) *leakError {
+	if todo == "" {
+		todo = "Use the placeholder in $" + r.Name + " in the " + r.Header + " header and let Box swap the value in."
+	}
+	return &leakError{secret: r, reason: fmt.Sprintf("the real value of secret %s is in %s", r.Name, where), todo: todo}
+}
 
-// scanReader passes a body through while holding back enough bytes that no placeholder leaves before it is seen
-// whole. On a hit it stops (the request is cut off upstream) and calls onLeak once.
+var errLeak = errors.New("secret in request body")
+
+// scanReader passes a body through while holding back any tail that may still become a placeholder or a secret
+// value, so neither leaves before it is seen whole. On a hit it stops (the request is cut off upstream) and calls
+// onLeak once.
 type scanReader struct {
-	p      *Proxy
+	m      *matcher
 	r      io.Reader
-	hold   int // longest placeholder - 1
-	buf    []byte
+	buf    []byte // [ready | held]
+	ready  int
 	tmp    []byte
 	srcErr error
-	onLeak func(*secretRule)
+	onLeak func(*pattern)
 }
 
-func (p *Proxy) newScanReader(r io.Reader, onLeak func(*secretRule)) *scanReader {
-	hold := 0
-	for _, s := range p.secrets {
-		if len(s.Placeholder) > hold {
-			hold = len(s.Placeholder)
-		}
-	}
-	return &scanReader{p: p, r: r, hold: max(hold-1, 0), tmp: make([]byte, 32<<10), onLeak: onLeak}
+func (p *Proxy) newScanReader(r io.Reader, onLeak func(*pattern)) *scanReader {
+	return &scanReader{m: p.reqMatch, r: r, tmp: make([]byte, 32<<10), onLeak: onLeak}
 }
 
 func (s *scanReader) Read(b []byte) (int, error) {
 	for {
-		if len(s.buf) > 0 {
-			safe := len(s.buf) - s.hold
-			if s.srcErr != nil {
-				safe = len(s.buf)
-			}
-			if safe > 0 {
-				n := copy(b, s.buf[:safe])
-				s.buf = s.buf[n:]
-				return n, nil
-			}
+		if s.ready > 0 {
+			n := copy(b, s.buf[:s.ready])
+			s.buf, s.ready = s.buf[n:], s.ready-n
+			return n, nil
 		}
 		if s.srcErr != nil {
 			return 0, s.srcErr
@@ -382,16 +488,18 @@ func (s *scanReader) Read(b []byte) (int, error) {
 		n, err := s.r.Read(s.tmp)
 		if n > 0 {
 			s.buf = append(s.buf, s.tmp[:n]...)
-			if f := s.p.find(string(s.buf), false); f != nil {
+			if _, pat := s.m.index(s.buf, 0); pat != nil {
 				s.buf, s.srcErr = nil, errLeak
 				if s.onLeak != nil {
-					s.onLeak(f[0])
+					s.onLeak(pat)
 				}
 				return 0, errLeak
 			}
+			s.ready = len(s.buf) - s.m.hold(s.buf, 0)
 		}
 		if err != nil {
 			s.srcErr = err
+			s.ready = len(s.buf)
 		}
 	}
 }
