@@ -350,8 +350,14 @@ func replaceFold(s, old, repl string) string {
 }
 
 // redactValues replaces secret values echoed in response headers with their placeholders, and the value's encoded
-// forms (base64 Basic credentials, percent- or JSON-escaped) with a marker.
+// forms (base64 Basic credentials, percent- or JSON-escaped) with a marker. A header whose name holds a value or a
+// placeholder is dropped.
 func (p *Proxy) redactValues(h http.Header) {
+	for k := range h {
+		if p.nameHoldsSecret(k) {
+			delete(h, k)
+		}
+	}
 	for _, r := range p.secrets {
 		for k, vs := range h {
 			for i, v := range vs {
@@ -368,6 +374,23 @@ func (p *Proxy) redactValues(h http.Header) {
 			}
 		}
 	}
+}
+
+// nameHoldsSecret reports whether a header name holds a placeholder or any form of a secret value, without regard to
+// case: names arrive canonicalized ("X-Ghp_abc" for "x-ghp_ABC"), which still gives most of a value away.
+func (p *Proxy) nameHoldsSecret(name string) bool {
+	if p.find(name, true) != nil {
+		return true
+	}
+	low := asciiLower(name)
+	for _, r := range p.secrets {
+		for _, f := range r.forms {
+			if strings.Contains(low, asciiLower(f)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // valuePatterns are the encoded forms of every secret value.

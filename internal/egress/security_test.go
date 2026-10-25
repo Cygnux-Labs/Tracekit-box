@@ -815,3 +815,324 @@ func TestDeniedEventsAreLimited(t *testing.T) {
 		t.Errorf("%d leak events (%d summaries) for %d identical leaks, want the first and one summary", leakEvents, repeated, leaks)
 	}
 }
+
+// ---- re-review: ClientHellos after a HelloRetryRequest, server_name lists, ranges, upgrades, names ----
+
+type sniEntry struct {
+	typ  byte
+	name string
+}
+
+func tlsRecord(typ byte, payload []byte) []byte {
+	return append([]byte{typ, 3, 1, byte(len(payload) >> 8), byte(len(payload))}, payload...)
+}
+
+// clientHello builds a minimal TLS 1.3 ClientHello record whose server_name extension lists entries (none: no
+// extension).
+func clientHello(entries ...sniEntry) []byte {
+	body := append([]byte{3, 3}, make([]byte, 32)...) // legacy_version, random
+	body = append(body, 0, 0, 2, 0x13, 0x01, 1, 0)    // session id, cipher_suites, compression
+	var exts []byte
+	if len(entries) > 0 {
+		var list []byte
+		for _, e := range entries {
+			list = append(list, e.typ)
+			list = binary.BigEndian.AppendUint16(list, uint16(len(e.name)))
+			list = append(list, e.name...)
+		}
+		exts = binary.BigEndian.AppendUint16(exts, 0) // server_name
+		exts = binary.BigEndian.AppendUint16(exts, uint16(len(list)+2))
+		exts = binary.BigEndian.AppendUint16(exts, uint16(len(list)))
+		exts = append(exts, list...)
+	}
+	exts = append(exts, 0, 0x2b, 0, 3, 2, 3, 4) // supported_versions: TLS 1.3
+	body = binary.BigEndian.AppendUint16(body, uint16(len(exts)))
+	body = append(body, exts...)
+	return tlsRecord(22, append([]byte{1, 0, byte(len(body) >> 8), byte(len(body))}, body...))
+}
+
+// helloRetryRequest is a TLS 1.3 HelloRetryRequest record asking for secp256r1.
+func helloRetryRequest() []byte {
+	random := []byte{
+		0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+		0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+	}
+	body := append([]byte{3, 3}, random...)
+	body = append(body, 0, 0x13, 0x01, 0)                       // session id, cipher suite, compression
+	exts := []byte{0, 0x2b, 0, 2, 3, 4, 0, 0x33, 0, 2, 0, 0x17} // supported_versions, key_share
+	body = binary.BigEndian.AppendUint16(body, uint16(len(exts)))
+	body = append(body, exts...)
+	return tlsRecord(22, append([]byte{2, 0, byte(len(body) >> 8), byte(len(body))}, body...))
+}
+
+var ccsRecord = []byte{20, 3, 3, 0, 1, 1}
+
+func alertRecord(desc byte) string { return string([]byte{21, 3, 3, 0, 2, 2, desc}) }
+
+// readRecord reads one TLS record.
+func readRecord(t *testing.T, r io.Reader) (byte, []byte) {
+	t.Helper()
+	hdr := make([]byte, 5)
+	if _, err := io.ReadFull(r, hdr); err != nil {
+		t.Fatalf("record header: %v", err)
+	}
+	b := make([]byte, binary.BigEndian.Uint16(hdr[3:]))
+	if _, err := io.ReadFull(r, b); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	return hdr[0], b
+}
+
+func waitDone(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the upstream connection did not end")
+	}
+}
+
+func TestTunnelChecksClientHelloAfterRetry(t *testing.T) {
+	checkGoroutines(t)
+	// A host that answers every ClientHello with a HelloRetryRequest (and a middlebox-compatibility CCS).
+	done := make(chan struct{}, 8)
+	port, got := startRaw(t, func(c net.Conn) {
+		defer func() { done <- struct{}{} }()
+		br := bufio.NewReader(c)
+		for {
+			hdr := make([]byte, 5)
+			if _, err := io.ReadFull(br, hdr); err != nil {
+				return
+			}
+			if _, err := io.CopyN(io.Discard, br, int64(binary.BigEndian.Uint16(hdr[3:]))); err != nil {
+				return
+			}
+			if hdr[0] == 22 {
+				c.Write(append(helloRetryRequest(), ccsRecord...))
+			}
+		}
+	})
+	e := newEnv(t, func(c *Config) { c.Allow = []string{"example.com:" + port} })
+	good, bad := clientHello(sniEntry{0, "example.com"}), clientHello(sniEntry{0, "unlisted.test"})
+
+	for _, pipelined := range []bool{false, true} {
+		c, br, resp := e.rawConnect("example.com:" + port)
+		if resp.StatusCode != 200 {
+			t.Fatal(resp.Status)
+		}
+		if pipelined {
+			// Sent at once, before the host's HelloRetryRequest exists.
+			c.Write(append(append([]byte{}, good...), bad...))
+		} else {
+			c.Write(good)
+			if typ, b := readRecord(t, br); typ != 22 || b[0] != 2 {
+				t.Fatalf("want the host's HelloRetryRequest, got a record of type %d", typ)
+			}
+			c.Write(append(append([]byte{}, ccsRecord...), bad...))
+		}
+		rest, _ := io.ReadAll(br)
+		if !strings.Contains(string(rest), alertRecord(112)) {
+			t.Errorf("pipelined=%v: the guest got no unrecognized_name alert: %x", pipelined, rest)
+		}
+		c.Close()
+		waitDone(t, done)
+	}
+	e.waitReason(EventDenied, `TLS server name "unlisted.test" is not the CONNECT host example.com`)
+
+	// A second ClientHello that names the CONNECT host passes; a second HelloRetryRequest ends the tunnel before
+	// the third ClientHello leaves.
+	c, br, resp := e.rawConnect("example.com:" + port)
+	if resp.StatusCode != 200 {
+		t.Fatal(resp.Status)
+	}
+	c.Write(good)
+	readRecord(t, br)
+	c.Write(append(append(append([]byte{}, ccsRecord...), good...), clientHello(sniEntry{0, "third.test"})...))
+	rest, _ := io.ReadAll(br)
+	if !strings.Contains(string(rest), alertRecord(10)) {
+		t.Errorf("no unexpected_message alert after a second HelloRetryRequest: %x", rest)
+	}
+	c.Close()
+	waitDone(t, done)
+	e.waitReason(EventDenied, "second TLS HelloRetryRequest")
+
+	g := got()
+	if strings.Contains(g, "unlisted.test") || strings.Contains(g, "third.test") {
+		t.Error("a ClientHello after a HelloRetryRequest reached the host unchecked")
+	}
+	if n := strings.Count(g, "example.com"); n != 4 {
+		t.Errorf("the host got %d ClientHellos for example.com, want 4 (two first, two second)", n)
+	}
+}
+
+func TestTunnelRealHelloRetryRequest(t *testing.T) {
+	checkGoroutines(t)
+	// A host that accepts only P-521 makes a Go client, which sends X25519 key shares, retry.
+	ca := upstreamCA(t)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "retried") }))
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.TLS = &tls.Config{MinVersion: tls.VersionTLS13, CurvePreferences: []tls.CurveID{tls.CurveP521},
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return MintLeaf(ca, "example.com") }}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	p := port(t, srv.Listener.Addr())
+	e := newEnv(t, func(c *Config) { c.Allow = []string{"example.com:" + p} })
+	resp, err := e.client().Get("https://example.com:" + p + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := body(t, resp); b != "retried" || !resp.TLS.HelloRetryRequest {
+		t.Errorf("body %q, HelloRetryRequest %v", b, resp.TLS.HelloRetryRequest)
+	}
+}
+
+func TestTunnelServerNameListMustBeOneHostName(t *testing.T) {
+	checkGoroutines(t)
+	port, got := startRaw(t, func(c net.Conn) { io.Copy(io.Discard, c) })
+	e := newEnv(t, func(c *Config) { c.Allow = []string{"example.com:" + port} })
+	// crypto/tls skips entries that are not host names and takes the host name wherever it sits; a router that
+	// reads the first entry routes to front.test.
+	for _, entries := range [][]sniEntry{{{1, "front.test"}, {0, "example.com"}}, {{0, "example.com"}, {1, "front.test"}}} {
+		c, br, resp := e.rawConnect("example.com:" + port)
+		if resp.StatusCode != 200 {
+			t.Fatal(resp.Status)
+		}
+		c.Write(clientHello(entries...))
+		rest, _ := io.ReadAll(br)
+		if !strings.Contains(string(rest), alertRecord(47)) {
+			t.Errorf("%v: no illegal_parameter alert: %x", entries, rest)
+		}
+		c.Close()
+	}
+	e.waitReason(EventDenied, "the TLS server_name extension has an entry of type 1, not a host name")
+	// The same ClientHello with the one host name passes.
+	c, _, _ := e.rawConnect("example.com:" + port)
+	c.Write(clientHello(sniEntry{0, "example.com"}))
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(got(), "example.com") {
+		if time.Now().After(deadline) {
+			t.Fatal("a ClientHello with one host name did not reach the host")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	c.Close()
+	if strings.Contains(got(), "front.test") {
+		t.Error("a ClientHello with two server names reached the host")
+	}
+}
+
+func TestBoundHostAnswersWhole(t *testing.T) {
+	checkGoroutines(t)
+	var mu sync.Mutex
+	var ranges []string
+	e, port, gh, other := echoEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		ranges = append(ranges, r.Header.Get("Range")+r.Header.Get("If-Range")+r.Header.Get("Request-Range"))
+		mu.Unlock()
+		echo := "you sent: " + r.Header.Get("Authorization")
+		switch r.URL.Path {
+		case "/range":
+			http.ServeContent(w, r, "", time.Time{}, strings.NewReader(echo))
+		case "/force206":
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 17-22/%d", len(echo)))
+			w.WriteHeader(http.StatusPartialContent)
+			io.WriteString(w, echo[17:23])
+		}
+	})
+	bearer := "Authorization: Bearer " + gh.Placeholder
+	// Bytes 17-22 are the first six of the value: alone, too short to recognise.
+	for _, hdr := range [][]string{{"Range: bytes=17-22"}, {"Range: bytes=17-22", `If-Range: "x"`}, {"Request-Range: bytes=17-22"}} {
+		resp, b := rawGet(e, port, "example.com", "/range", append(hdr, bearer)...)
+		noSecret(t, "range body", b, gh, other)
+		if resp.StatusCode != 200 || !strings.Contains(b, "[tkbox: redacted") {
+			t.Errorf("%v: %s %q", hdr, resp.Status, b)
+		}
+	}
+	resp, b := rawGet(e, port, "example.com", "/force206", bearer)
+	if resp.StatusCode != 502 || !strings.Contains(b, "partial response (206)") || strings.Contains(b, "ghp_Re") {
+		t.Errorf("a 206 from a bound host: %s %q", resp.Status, b)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, r := range ranges {
+		if r != "" {
+			t.Errorf("a host with a bound secret got a range request: %q", r)
+		}
+	}
+}
+
+func TestUpgradeToBoundHostRefused(t *testing.T) {
+	checkGoroutines(t)
+	// example.com has a bound secret; other.example is inspected (inspect all) but has none.
+	e, rec, port, gh, _ := secretEnv(t, func(c *Config, _, other *Secret) {
+		c.Inspect = InspectAll
+		other.Hosts = []string{"api.github.com"}
+	})
+	tc, br := e.tunnelTLS("example.com:"+port, "example.com")
+	fmt.Fprintf(tc, "GET /ws HTTP/1.1\r\nHost: example.com:%s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nAuthorization: Bearer %s\r\n\r\n", port, gh.Placeholder)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := body(t, resp); resp.StatusCode != 403 || !strings.Contains(b, "protocol upgrades") {
+		t.Errorf("upgrade to a bound host: %s %q", resp.Status, b)
+	}
+	tc.Close()
+	e.waitReason(EventDenied, "protocol upgrades")
+	for _, ev := range e.sink.events() {
+		if ev.Kind == EventSecretUse {
+			t.Errorf("the value was swapped into a refused upgrade: %+v", ev)
+		}
+	}
+
+	// The Upgrade header is the one hop-by-hop header Box sends on: a placeholder in it is a leak.
+	tc, br = e.tunnelTLS("other.example:"+port, "other.example")
+	fmt.Fprintf(tc, "GET /ws HTTP/1.1\r\nHost: other.example:%s\r\nConnection: Upgrade\r\nUpgrade: %s\r\n\r\n", port, gh.Placeholder)
+	if resp, err = http.ReadResponse(br, nil); err != nil {
+		t.Fatal(err)
+	}
+	if b := body(t, resp); resp.StatusCode != 403 || !strings.Contains(b, "Upgrade header") {
+		t.Errorf("placeholder in Upgrade: %s %q", resp.Status, b)
+	}
+	tc.Close()
+	if ev := e.waitReason(EventSecretLeak, "Upgrade header"); ev.Secret != "GH" {
+		t.Errorf("leak %+v", ev)
+	}
+	if rec.count() != 0 {
+		t.Errorf("the upstream saw %d requests", rec.count())
+	}
+}
+
+func TestEchoInStatusAndNamesRedacted(t *testing.T) {
+	checkGoroutines(t)
+	gh := mkSecret(t, "GH", "Authorization", "example.com")
+	gh.Value = "ghpRealValue0123456789abcdef" // header-name characters only
+	port := startTLS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		v := r.Header.Get("Authorization")
+		c, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		io.WriteString(c, "HTTP/1.1 200 you sent "+v+"\r\nX-Echo-"+v+": 1\r\nX-Ph-"+gh.Placeholder+": 1\r\nTrailer: X-Tr-"+v+"\r\n"+
+			"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\nok\r\n0\r\nX-Tr-"+v+": 1\r\nX-Late-"+v+": 1\r\n\r\n")
+	}), "example.com")
+	e := newEnv(t, func(c *Config) {
+		c.Allow = []string{"example.com:" + port}
+		c.Secrets = []Secret{gh}
+	})
+	tc, _ := e.tunnelTLS("example.com:"+port, "example.com")
+	fmt.Fprintf(tc, "GET / HTTP/1.1\r\nHost: example.com:%s\r\nAuthorization: %s\r\n\r\n", port, gh.Placeholder)
+	raw, _ := io.ReadAll(tc)
+	s := string(raw)
+	if !strings.HasPrefix(s, "HTTP/1.1 200 OK\r\n") || !strings.Contains(s, "\r\nok\r\n") {
+		t.Errorf("response %q", s)
+	}
+	// Names arrive canonicalized ("X-Echo-Ghprealvalue..."), which still gives the value away.
+	if strings.Contains(strings.ToLower(s), strings.ToLower(gh.Value)) {
+		t.Errorf("the response holds the value in some case: %q", s)
+	}
+	noSecret(t, "response", s, gh)
+	tc.Close()
+	e.waitKind(EventClosed)
+}

@@ -1199,7 +1199,7 @@ func TestUpstreamUntrusted(t *testing.T) {
 func TestUpgradeSplice(t *testing.T) {
 	checkGoroutines(t)
 	port := startTLS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Upgrade") != "echo" || r.Header.Get("Authorization") != "real-gh-value-0123456789" {
+		if r.Header.Get("Upgrade") != "echo" {
 			http.Error(w, "bad upgrade", 400)
 			return
 		}
@@ -1214,14 +1214,15 @@ func TestUpgradeSplice(t *testing.T) {
 			c.Write(buf)
 		}
 	}), "example.com")
-	gh := mkSecret(t, "GH", "Authorization", "example.com")
-	gh.Value = "real-gh-value-0123456789"
+	// An inspected host with no bound secret (upgrades to a bound host are refused: TestUpgradeToBoundHostRefused).
+	gh := mkSecret(t, "GH", "Authorization", "api.github.com")
 	e := newEnv(t, func(c *Config) {
 		c.Allow = []string{"example.com:" + port}
 		c.Secrets = []Secret{gh}
+		c.Inspect = InspectAll
 	})
 	tc, br := e.tunnelTLS("example.com:"+port, "example.com")
-	fmt.Fprintf(tc, "GET /ws HTTP/1.1\r\nHost: example.com:%s\r\nConnection: Upgrade\r\nUpgrade: echo\r\nAuthorization: %s\r\n\r\n", port, gh.Placeholder)
+	fmt.Fprintf(tc, "GET /ws HTTP/1.1\r\nHost: example.com:%s\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n", port)
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
 		t.Fatal(err)
