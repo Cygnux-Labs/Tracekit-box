@@ -20,6 +20,7 @@ type Guest struct {
 	Files     map[string][]byte
 	Patch     string
 	Summary   proto.DiffSummary
+	Diffs     []proto.DiffRequest // every Diff/DiffWith request
 	PingErr   error
 	Shutdowns int
 }
@@ -78,6 +79,14 @@ func (g *Guest) Stat(ctx context.Context, path string) (proto.FileInfo, error) {
 }
 
 func (g *Guest) Diff(ctx context.Context, maxBytes int64, w io.Writer) (proto.DiffSummary, error) {
+	return g.DiffWith(ctx, proto.DiffRequest{Op: proto.OpDiff, MaxBytes: maxBytes}, w)
+}
+
+// DiffWith records req in Diffs and answers with Patch and Summary (ExcludeDirs is not applied).
+func (g *Guest) DiffWith(ctx context.Context, req proto.DiffRequest, w io.Writer) (proto.DiffSummary, error) {
+	g.mu.Lock()
+	g.Diffs = append(g.Diffs, req)
+	g.mu.Unlock()
 	_, err := io.WriteString(w, g.Patch)
 	s := g.Summary
 	s.Bytes = int64(len(g.Patch))

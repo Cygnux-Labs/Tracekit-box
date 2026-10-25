@@ -14,30 +14,27 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"time"
 )
 
 // serveMITM terminates the guest's TLS with a leaf from the box CA, verifies the upstream, and forwards HTTP/1.1
 // requests one by one, swapping placeholders for values where bound and refusing every other placeholder.
-func (p *Proxy) serveMITM(s *session, t target, br *bufio.Reader, up *meteredConn) {
-	if _, err := io.WriteString(s.client, "HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {
-		p.emit(Event{Kind: EventClosed, Host: t.host, Port: t.port, Reason: s.endReason("the client went away")})
-		return
+// The guest's ClientHello passes the same checks as on any tunnel first. rawOK: the allow entry names the port.
+func (p *Proxy) serveMITM(s *session, t target, br *bufio.Reader, up *meteredConn, rawOK bool) {
+	// Only TLS can be inspected. With nothing to swap outside TLS, anything else may pass as an opaque tunnel where
+	// the allow entry names the port; Inspect "all" promised leak checks, so there it may not.
+	nonTLS := ""
+	switch {
+	case p.cfg.Inspect == InspectAll:
+		nonTLS = "inspect all: the tunnel does not carry TLS, so Box cannot check it for secrets"
+	case !rawOK:
+		nonTLS = msgNotTLS
 	}
-	// Only TLS can be inspected. With nothing to swap outside TLS, anything else may pass as an opaque tunnel;
-	// Inspect "all" promised leak checks, so there it may not.
-	isTLS, err := peekTLS(s, br)
-	if err != nil {
-		p.emit(Event{Kind: EventClosed, Host: t.host, Port: t.port, Reason: s.endReason("the client went away")})
+	br0, isTLS, ok := p.checkTunnel(s, t, br, tlsPeekTimeout, nonTLS)
+	if !ok {
 		return
 	}
 	if !isTLS {
-		if p.cfg.Inspect == InspectAll {
-			p.emit(Event{Kind: EventDenied, Host: t.host, Port: t.port,
-				Reason: "inspect all: the tunnel does not carry TLS, so Box cannot check it for secrets"})
-			return
-		}
-		in, out := s.splice(br, s.client, up, up)
+		in, out := s.splice(br0, s.client, up, up)
 		p.emit(Event{Kind: EventClosed, Host: t.host, Port: t.port, BytesIn: in, BytesOut: out, Reason: s.endReason("")})
 		return
 	}
@@ -59,10 +56,10 @@ func (p *Proxy) serveMITM(s *session, t target, br *bufio.Reader, up *meteredCon
 	}
 
 	var sniErr error
-	cli := tls.Server(&bufConn{Conn: s.client, r: br}, p.serverTLS(t, &sniErr))
+	cli := tls.Server(&bufConn{Conn: s.client, r: br0}, p.serverTLS(t, &sniErr))
 	s.track(cli)
 	hctx, cancel = context.WithTimeout(p.ctx, p.cfg.DialTimeout)
-	err = cli.HandshakeContext(hctx)
+	err := cli.HandshakeContext(hctx)
 	cancel()
 	if err == nil {
 		// Belt and braces: the SNI the session actually negotiated.
@@ -115,21 +112,6 @@ func (p *Proxy) serveMITM(s *session, t target, br *bufio.Reader, up *meteredCon
 		BytesIn: cliOut.n.Load() + x.spliceIn, BytesOut: upOut.n.Load() + x.spliceOut, Reason: s.endReason(x.endReason)})
 }
 
-// peekTLS reports whether the guest's first byte on a tunnel is a TLS handshake record. A guest that waits for the
-// server to speak first (SSH banners, SMTP) times out into "not TLS".
-func peekTLS(s *session, br *bufio.Reader) (bool, error) {
-	s.raw.SetReadDeadline(time.Now().Add(tlsPeekTimeout))
-	b, err := br.Peek(1)
-	s.raw.SetReadDeadline(time.Time{})
-	if err != nil {
-		if isTimeout(err) && !s.idle.Load() && s.p.ctx.Err() == nil {
-			return false, nil
-		}
-		return false, err
-	}
-	return b[0] == 0x16, nil
-}
-
 // exchange forwards requests from the guest to one upstream connection.
 type exchange struct {
 	p      *Proxy
@@ -169,6 +151,16 @@ func (x *exchange) forward(req *http.Request, overTLS bool) bool {
 		return x.leak(method, path, &leakError{secret: f[0], reason: fmt.Sprintf("a placeholder for secret %s is in the Host header", f[0].Name),
 			todo: "Never put a secret in a host name."})
 	}
+	// Real values: never in the method, the URL or the Host either.
+	if f := p.findValues(method); f != nil {
+		return x.leak(method, path, valueLeak(f[0], "the request method", ""))
+	}
+	if f := p.findValueTarget(req.RequestURI); f != nil {
+		return x.leak(method, path, valueLeak(f[0], "the URL", ""))
+	}
+	if f := p.findValueTarget(req.Host); f != nil {
+		return x.leak(method, path, valueLeak(f[0], "the Host header", ""))
+	}
 	// Where the request goes must be the tunnel's host.
 	if overTLS {
 		if r := x.checkInner(req); r != nil {
@@ -183,12 +175,21 @@ func (x *exchange) forward(req *http.Request, overTLS bool) bool {
 	}
 	teTrailers := headerHasToken(req.Header, "Te", "trailers")
 	stripHopByHop(req.Header)
+	// Before the swap puts values in: a value the guest sent itself may only go where Box would have put it.
+	if l := p.checkValues(req.Header, t.host, overTLS); l != nil {
+		return x.leak(method, path, l)
+	}
 	var used []*secretRule
+	bound := overTLS && p.boundSecrets(t.host, t.addr)
 	if overTLS {
 		var l *leakError
 		if used, l = p.swapHeaders(req.Header, t.host, true); l != nil {
 			return x.leak(method, path, l)
 		}
+	}
+	if bound {
+		// A host that may echo a value must answer in plain bytes, where Box can redact it.
+		req.Header.Set("Accept-Encoding", "identity")
 	}
 	if upType != "" {
 		req.Header.Set("Connection", "Upgrade")
@@ -201,14 +202,17 @@ func (x *exchange) forward(req *http.Request, overTLS bool) bool {
 		req.Header.Set("Connection", "close")
 	}
 
-	// The body streams through a scanner that holds back enough to stop a placeholder before it leaves.
-	var bodyLeak atomic.Pointer[secretRule]
+	// The body streams through a scanner that holds back enough to stop a placeholder or a value before it leaves.
+	var bodyLeak atomic.Pointer[pattern]
 	var body io.Reader
 	if req.Body != nil && req.Body != http.NoBody {
-		body = p.newScanReader(req.Body, func(r *secretRule) {
-			bodyLeak.Store(r)
-			x.upRaw.Close()
-		})
+		body = req.Body
+		if !p.reqMatch.empty() {
+			body = p.newScanReader(req.Body, func(m *pattern) {
+				bodyLeak.Store(m)
+				x.upRaw.Close()
+			})
+		}
 	}
 	target := req.RequestURI
 	if req.URL.Scheme != "" || req.URL.Host != "" {
@@ -286,8 +290,8 @@ func (x *exchange) forward(req *http.Request, overTLS bool) bool {
 		break
 	}
 	if err != nil {
-		if r := bodyLeak.Load(); r != nil {
-			return cutOff(func() { x.leak(method, path, bodyLeakError(r, overTLS, t.host)) })
+		if m := bodyLeak.Load(); m != nil {
+			return cutOff(func() { x.leak(method, path, bodyLeakError(m, overTLS)) })
 		}
 		x.endReason = "the host sent no valid response: " + err.Error()
 		return cutOff(func() {
@@ -315,16 +319,22 @@ func (x *exchange) forward(req *http.Request, overTLS bool) bool {
 		return false
 	}
 
+	if overTLS {
+		if r := p.guardBody(resp, method, bound); r != nil {
+			x.endReason = r.reason
+			return cutOff(func() { p.writeRefusal(x.cliOut, r.status, t, r.reason, r.todo) })
+		}
+	}
 	closeAfter := !overTLS || req.Close || resp.Close
 	_, werr := writeResponse(x.cliOut, resp, method, req.ProtoAtLeast(1, 1), closeAfter, "", p.redactValues)
 	if werr != nil {
 		return cutOff(nil)
 	}
 	rerr := <-wdone
-	if r := bodyLeak.Load(); r != nil {
+	if m := bodyLeak.Load(); m != nil {
 		// The host answered before the guest finished the body; the rest never left.
-		l := bodyLeakError(r, overTLS, t.host)
-		p.emit(Event{Kind: EventSecretLeak, Host: t.host, Port: t.port, Method: method, Path: path, Secret: r.Name, Reason: l.reason})
+		l := bodyLeakError(m, overTLS)
+		p.emit(Event{Kind: EventSecretLeak, Host: t.host, Port: t.port, Method: method, Path: path, Secret: m.rule.Name, Reason: l.reason})
 		x.endReason = l.reason
 		x.s.closeAll()
 		return false
@@ -338,7 +348,45 @@ func (x *exchange) forward(req *http.Request, overTLS bool) bool {
 	return rerr == nil && !closeAfter
 }
 
-func bodyLeakError(r *secretRule, overTLS bool, host string) *leakError {
+// guardBody makes sure no secret value in a response body on an inspected connection reaches the guest: a plain body
+// streams through the redactor; a bound host's encoded body (which it sent although Box asked for identity) is
+// decoded first when it is gzip or deflate, and refused otherwise.
+func (p *Proxy) guardBody(resp *http.Response, method string, bound bool) *refusal {
+	code := resp.StatusCode
+	if p.valMatch.empty() || method == http.MethodHead || code == http.StatusNoContent || code == http.StatusNotModified || code < 200 {
+		return nil
+	}
+	codings := contentCodings(resp.Header)
+	if len(codings) == 0 {
+		resp.Body = io.NopCloser(newRedactReader(p.valMatch, resp.Body))
+		return nil
+	}
+	if !bound {
+		return nil // no value is ever sent to this host; its encoded bodies pass as they are
+	}
+	const todo = "Box asks hosts with a bound secret for unencoded responses (Accept-Encoding: identity) so it can keep secret values out of them; this host ignored that."
+	if code == http.StatusPartialContent {
+		return &refusal{status: 502, reason: "the host answered with a range of an encoded body, which Box can't check for secret values", todo: todo}
+	}
+	dec, err := decodeBody(resp.Body, codings)
+	if err != nil {
+		return &refusal{status: 502, reason: "the host answered with " + err.Error() + ", which Box can't check for secret values", todo: todo}
+	}
+	resp.Body = io.NopCloser(newRedactReader(p.valMatch, dec))
+	resp.Header.Del("Content-Encoding")
+	resp.Header.Del("Content-Length")
+	resp.ContentLength = -1
+	return nil
+}
+
+func bodyLeakError(m *pattern, overTLS bool) *leakError {
+	r := m.rule
+	if m.kind == patValue {
+		if !overTLS {
+			return valueLeak(r, "a plain-HTTP request body", "Box never sends secrets over plain HTTP, and never in bodies.")
+		}
+		return valueLeak(r, "the request body", "Box sends secrets only in their header; send the placeholder there instead.")
+	}
 	if !overTLS {
 		return &leakError{secret: r, reason: fmt.Sprintf("a placeholder for secret %s is in a plain-HTTP request body", r.Name),
 			todo: "Box never sends secrets over plain HTTP; use https://."}
@@ -386,7 +434,14 @@ func (p *Proxy) servePlain(s *session, req *http.Request, br *bufio.Reader) {
 	path := u.Path
 	defer s.linger(br)
 	// Leaks first, wherever the request was going: nothing in plain HTTP may carry a placeholder.
-	t0 := target{scheme: "http", host: u.Host}
+	t0 := target{scheme: "http", host: printable(u.Host, maxHostLen)}
+	defPort := 80
+	if u.Scheme == "https" {
+		defPort = 443
+	}
+	if h, lit, port, err := parseAuthority(u.Host, defPort); err == nil {
+		t0.host, t0.addr, t0.port = h, lit, port
+	}
 	if f := p.find(req.Method, true); f != nil {
 		p.leak(s, s.client, t0, "", path, &leakError{secret: f[0], reason: fmt.Sprintf("a placeholder for secret %s is in the request method", f[0].Name), todo: "Use a normal HTTP method."})
 		return
@@ -397,7 +452,20 @@ func (p *Proxy) servePlain(s *session, req *http.Request, br *bufio.Reader) {
 			todo:   "Box never sends secrets over plain HTTP; use https:// and the secret's bound header."})
 		return
 	}
-	if _, l := p.swapHeaders(req.Header, "", false); l != nil {
+	if _, l := p.swapHeaders(req.Header, t0.host, false); l != nil {
+		p.leak(s, s.client, t0, req.Method, path, l)
+		return
+	}
+	// Nor a real value (before the Decider sees the host).
+	if f := p.findValues(req.Method); f != nil {
+		p.leak(s, s.client, t0, "", path, valueLeak(f[0], "the request method", ""))
+		return
+	}
+	if f := p.findValueTarget(req.RequestURI); f != nil {
+		p.leak(s, s.client, t0, req.Method, path, valueLeak(f[0], "a plain-HTTP URL", "Box never sends secrets over plain HTTP, and never in URLs."))
+		return
+	}
+	if l := p.checkValues(req.Header, t0.host, false); l != nil {
 		p.leak(s, s.client, t0, req.Method, path, l)
 		return
 	}

@@ -160,26 +160,28 @@ type CreateBoxRequest struct {
 }
 
 type Box struct {
-	ID          string            `json:"id"`
-	Name        string            `json:"name"`
-	State       string            `json:"state"`
-	Image       string            `json:"image"`
-	ImageDigest string            `json:"image_digest,omitempty"`
-	Allow       []string          `json:"allow"`             // after preset expansion
-	Secrets     []string          `json:"secrets,omitempty"` // names only, never values
-	Env         map[string]string `json:"env,omitempty"`
-	Workspace   string            `json:"workspace,omitempty"`
-	Limits      Limits            `json:"limits"`
-	Inspect     string            `json:"inspect"`
-	RunID       string            `json:"run_id,omitempty"` // the Tracekit run; "" when unrecorded
-	Unrecorded  bool              `json:"unrecorded,omitempty"`
-	CreatedAt   time.Time         `json:"created_at"`
-	StartedAt   time.Time         `json:"started_at,omitzero"`
-	StoppedAt   time.Time         `json:"stopped_at,omitzero"`
-	ExpiresAt   time.Time         `json:"expires_at,omitzero"`
-	StopReason  string            `json:"stop_reason,omitempty"`
-	Error       string            `json:"error,omitempty"` // why it failed
-	Execs       int               `json:"execs"`           // execs started so far
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	State       string   `json:"state"`
+	Image       string   `json:"image"`
+	ImageDigest string   `json:"image_digest,omitempty"`
+	Allow       []string `json:"allow"`             // after preset expansion
+	Secrets     []string `json:"secrets,omitempty"` // names only, never values
+	// SecretHeaders is the header each secret is swapped into (an empty SecretSpec.Header means Authorization).
+	SecretHeaders map[string]string `json:"secret_headers,omitempty"`
+	Env           map[string]string `json:"env,omitempty"`
+	Workspace     string            `json:"workspace,omitempty"`
+	Limits        Limits            `json:"limits"`
+	Inspect       string            `json:"inspect"`
+	RunID         string            `json:"run_id,omitempty"` // the Tracekit run; "" when unrecorded
+	Unrecorded    bool              `json:"unrecorded,omitempty"`
+	CreatedAt     time.Time         `json:"created_at"`
+	StartedAt     time.Time         `json:"started_at,omitzero"`
+	StoppedAt     time.Time         `json:"stopped_at,omitzero"`
+	ExpiresAt     time.Time         `json:"expires_at,omitzero"`
+	StopReason    string            `json:"stop_reason,omitempty"`
+	Error         string            `json:"error,omitempty"` // why it failed
+	Execs         int               `json:"execs"`           // execs started so far
 	// DiffSaved is set once the workspace patch was saved at stop (apply and diff read it); DiffError says why it
 	// was not (killed, paused, too large, the guest did not answer, …).
 	DiffSaved bool     `json:"diff_saved,omitempty"`

@@ -117,6 +117,11 @@ func cmdRun(ctx context.Context, args []string, env *cliEnv) error {
 	}
 	fmt.Fprintf(env.stderr, "; expires %s\n", b.ExpiresAt.Local().Format(time.Kitchen))
 	fmt.Fprintf(env.stderr, "tkbox: allowed egress: %s\n", orNone(b.Allow))
+	for _, n := range b.Secrets {
+		if h := b.SecretHeaders[n]; h != "" {
+			fmt.Fprintf(env.stderr, "tkbox: secret %s goes only in the %s header, only to its bound hosts\n", n, h)
+		}
+	}
 	for _, n := range b.Notices {
 		fmt.Fprintf(env.stderr, "tkbox: %s\n", printable(env.stderr, n))
 	}

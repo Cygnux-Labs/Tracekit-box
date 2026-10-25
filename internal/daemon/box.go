@@ -112,6 +112,12 @@ func (b *box) view() api.Box {
 	v.Allow = append([]string{}, b.info.Allow...)
 	v.Secrets = append([]string(nil), b.info.Secrets...)
 	v.Notices = append([]string(nil), b.info.Notices...)
+	if b.info.SecretHeaders != nil {
+		v.SecretHeaders = make(map[string]string, len(b.info.SecretHeaders))
+		for k, x := range b.info.SecretHeaders {
+			v.SecretHeaders[k] = x
+		}
+	}
 	if b.info.Env != nil {
 		v.Env = make(map[string]string, len(b.info.Env))
 		for k, x := range b.info.Env {
@@ -214,10 +220,15 @@ func (d *Daemon) Create(ctx context.Context, req api.CreateBoxRequest) (api.Box,
 		name = id
 	}
 	names := make([]string, 0, len(s.secrets))
+	headers := map[string]string{}
 	for _, sec := range s.secrets {
 		names = append(names, sec.Name)
+		headers[sec.Name] = sec.Header
 	}
-	info := api.Box{ID: id, Name: name, State: api.StateCreating, Image: s.req.Image, Allow: s.allow, Secrets: names,
+	if len(headers) == 0 {
+		headers = nil
+	}
+	info := api.Box{ID: id, Name: name, State: api.StateCreating, Image: s.req.Image, Allow: s.allow, Secrets: names, SecretHeaders: headers,
 		Env: s.req.Env, Workspace: s.req.Workspace, Limits: s.limits, Inspect: s.inspect,
 		Unrecorded: d.opts.Unrecorded, CreatedAt: d.now().UTC(), Notices: notices}
 	dir := d.boxDir(id)
@@ -382,7 +393,7 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 
 	proxy, err := d.opts.NewProxy(egress.Config{BoxID: b.id, Allow: s.allow, ModelHosts: s.modelHosts,
 		Secrets: s.secrets, Inspect: s.inspect, CA: ca, Decider: (*boxDecider)(b), Sink: (*boxSink)(b),
-		BlockPrefixes: s.blockPrefixes, AllowPrivate: d.opts.EgressAllowPrivate, UpstreamRoots: d.opts.EgressUpstreamRoots,
+		BlockPrefixes: s.blockPrefixes, BlockFunc: d.hostAddrs.blocked, AllowPrivate: d.opts.EgressAllowPrivate, UpstreamRoots: d.opts.EgressUpstreamRoots,
 		DecideTimeout: d.opts.ApprovalTimeout + 30*time.Second})
 	if err != nil {
 		return fmt.Errorf("start the egress proxy: %w", err)
@@ -822,20 +833,11 @@ func (b *box) diffNotSaved(why string) {
 var diffExcludeDirs = []string{"node_modules", "__pycache__", ".venv", "venv", ".tox", ".mypy_cache", ".pytest_cache",
 	".gradle", ".next", ".cache"}
 
-// excludingDiffer is a guest client that can leave dirs out of a diff (proto.DiffRequest.ExcludeDirs).
-type excludingDiffer interface {
-	DiffExcluding(ctx context.Context, maxBytes int64, excludeDirs []string, w io.Writer) (proto.DiffSummary, error)
-}
-
-// guestDiff asks the guest for the workspace patch, without diffExcludeDirs when the client can say so.
+// guestDiff asks the guest for the workspace patch without diffExcludeDirs. The guest's summary is not used: the
+// host builds its own from the patch (summarize).
 func guestDiff(ctx context.Context, g agentrpc.Guest, w io.Writer) error {
-	var err error
-	if x, ok := g.(excludingDiffer); ok {
-		_, err = x.DiffExcluding(ctx, maxDiffBytes, diffExcludeDirs, w)
-	} else {
-		_, err = g.Diff(ctx, maxDiffBytes, w)
-	}
-	return err // the guest's summary is not used: the host builds its own from the patch (summarize)
+	_, err := g.DiffWith(ctx, proto.DiffRequest{Op: proto.OpDiff, MaxBytes: maxDiffBytes, ExcludeDirs: diffExcludeDirs}, w)
+	return err
 }
 
 func isTooLarge(err error) bool {
@@ -1108,6 +1110,33 @@ func caHosts(secrets []egress.Secret, allow []string, inspect string) []string {
 		}
 	}
 	return out
+}
+
+// hostAddrs is the live view of this host's own addresses the proxy consults on every dial (egress.Config.BlockFunc),
+// so an address the host gains after a box started (a new interface, DHCP) is refused too. Re-read at most every 5s;
+// a failed re-read keeps the last list.
+type hostAddrs struct {
+	mu  sync.Mutex
+	at  time.Time
+	set map[netip.Addr]bool
+}
+
+func (h *hostAddrs) blocked(a netip.Addr) (bool, string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.set == nil || time.Since(h.at) > 5*time.Second {
+		if ps, err := hostPrefixes(); err == nil {
+			h.set = make(map[netip.Addr]bool, len(ps))
+			for _, p := range ps {
+				h.set[p.Addr()] = true
+			}
+			h.at = time.Now()
+		}
+	}
+	if h.set[a.Unmap()] {
+		return true, "an address of this host"
+	}
+	return false, ""
 }
 
 // hostPrefixes are this host's own non-loopback addresses: a guest must not reach host services on them, even on a

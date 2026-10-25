@@ -106,8 +106,11 @@ func (bd *boxDecider) Decide(ctx context.Context, req egress.Request) (egress.Ve
 		return egress.Verdict{Reason: fmt.Sprintf("too many pending approvals in this box (%d): egress to %s refused at once; answer the pending ones with `tkbox approvals`, or start the box with `--allow %s`", maxPendingApprovals, req.URL, allowHint)}, nil
 	default:
 		complete("error", map[string]any{"allowed": false, "approval_id": id, "decision": state})
-		return egress.Verdict{Reason: fmt.Sprintf("no one approved egress to %s within %s (%s): approve it for this box with `tkbox approve <id> --box`; next time start the box with `--allow %s`",
-			req.URL, b.d.opts.ApprovalTimeout, id, allowHint)}, nil
+		if id == "" {
+			return egress.Verdict{Reason: fmt.Sprintf("egress to %s was not approved: the box is going down", req.URL)}, nil
+		}
+		return egress.Verdict{Reason: fmt.Sprintf("no one approved egress to %s within %s (%s); next time answer sooner with `tkbox approve %s --box` (allows it for the rest of the box), or start the box with `--allow %s`",
+			req.URL, b.d.opts.ApprovalTimeout, id, id, allowHint)}, nil
 	}
 }
 
@@ -332,7 +335,12 @@ type boxSink box
 
 func (s *boxSink) Emit(e egress.Event) {
 	b := (*box)(s)
+	// "egress to host:port", or just "egress" when the event names no host (connection-limit refusals, summaries)
 	target := net.JoinHostPort(e.Host, strconv.Itoa(e.Port))
+	egressTo := "egress to " + target
+	if e.Host == "" {
+		target, egressTo = "", "egress"
+	}
 	data := map[string]any{"host": e.Host, "port": e.Port}
 	if e.Method != "" {
 		data["method"] = e.Method
@@ -357,15 +365,15 @@ func (s *boxSink) Emit(e egress.Event) {
 	}
 	switch e.Kind {
 	case egress.EventAllowed:
-		b.event(e.Kind, "egress", "egress to "+target+" allowed", data)
+		b.event(e.Kind, "egress", egressTo+" allowed", data)
 	case egress.EventClosed:
-		b.event(e.Kind, "egress", fmt.Sprintf("egress to %s closed (%d bytes in, %d out)", target, e.BytesIn, e.BytesOut), data)
+		b.event(e.Kind, "egress", fmt.Sprintf("%s closed (%d bytes in, %d out)", egressTo, e.BytesIn, e.BytesOut), data)
 		if e.Reason != "" && e.BytesIn == 0 && e.BytesOut == 0 {
-			b.notice("egress to " + target + " failed: " + e.Reason) // e.g. the host did not answer (502)
+			b.notice(egressTo + " failed: " + e.Reason) // e.g. the host did not answer (502)
 		}
 	case egress.EventDenied:
-		b.event(e.Kind, "egress", "egress to "+target+" refused: "+e.Reason, data)
-		msg := "egress to " + target + " refused: " + e.Reason
+		b.event(e.Kind, "egress", egressTo+" refused: "+e.Reason, data)
+		msg := egressTo + " refused: " + e.Reason
 		if len(e.RuleIDs) > 0 {
 			if !strings.Contains(e.Reason, e.RuleIDs[0]) {
 				msg += " [" + strings.Join(e.RuleIDs, ", ") + "]"
@@ -388,6 +396,6 @@ func (s *boxSink) Emit(e egress.Event) {
 		b.observe(tracekit.SourceModelCall, untrustedObs, map[string]any{"host": e.Host, "path": e.Path,
 			"status": e.Status, "bytes": e.BytesIn + e.BytesOut})
 	default:
-		b.event(e.Kind, "egress", e.Kind+" "+target, data)
+		b.event(e.Kind, "egress", strings.TrimSpace(e.Kind+" "+target), data)
 	}
 }

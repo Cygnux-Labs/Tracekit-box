@@ -424,8 +424,9 @@ class Client:
         return self._json("POST", self._box_path(box, "/apply"), req)
 
     def export(self, box: str, out: str) -> Dict[str, Any]:
-        """POST /v1/boxes/{box}/export: write the run's .tkb to out and its trust file to <out>.trust.json. Returns
-        {run_id, bundle, trust, verify}."""
+        """POST /v1/boxes/{box}/export: close the run, write its .tkb to out and its trust file next to it (run.tkb ->
+        run.trust.json). The box must be stopped; apply is refused afterwards.
+        Returns {run_id, bundle, trust, verify}."""
         return self._json("POST", self._box_path(box, "/export"), {"out": os.path.abspath(os.path.expanduser(out))})
 
     def events(self, box: str, *, follow: bool = False) -> Iterator[Dict[str, Any]]:

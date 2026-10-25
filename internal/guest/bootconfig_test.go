@@ -38,6 +38,12 @@ func TestFetchBootConfigRetries(t *testing.T) {
 	if err != nil || cfg.BoxID != "b1" || tries.Load() != 3 {
 		t.Fatalf("%+v %v after %d tries", cfg, err, tries.Load())
 	}
+	// the config is taken once: nothing dials the config port again (the host closes its listener after the
+	// first fetch), so the agent RPC never depends on it
+	time.Sleep(500 * time.Millisecond)
+	if n := tries.Load(); n != 3 {
+		t.Fatalf("the config port was dialed again after a successful fetch (%d dials)", n)
+	}
 }
 
 func TestFetchBootConfigFailsClosed(t *testing.T) {

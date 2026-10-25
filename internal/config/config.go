@@ -328,9 +328,11 @@ func checkHosts(hosts []string) error {
 	}
 	for _, h := range hosts {
 		hl := strings.ToLower(strings.TrimSpace(h))
-		if hl == "" || hl == "*" || strings.ContainsAny(hl, " /@#:") || strings.Count(hl, "*") > 1 ||
-			(strings.Contains(hl, "*") && !strings.HasPrefix(hl, "*.")) {
-			return fmt.Errorf("host %q: want an exact host name or \"*.example.com\"", h)
+		if strings.Contains(hl, "*") {
+			return fmt.Errorf("host %q is a wildcard: a secret goes to exact hosts only; list each one (e.g. [api.github.com, uploads.github.com])", h)
+		}
+		if hl == "" || strings.ContainsAny(hl, " /@#:") {
+			return fmt.Errorf("host %q: want an exact host name such as api.github.com", h)
 		}
 	}
 	return nil

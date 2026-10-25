@@ -30,6 +30,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Enable KVM for the runner user
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -39,7 +42,37 @@ jobs:
       - name: Install e2fsprogs and the Tracekit 1.4.2 signer
         run: |
           sudo apt-get update -q && sudo apt-get install -y -q e2fsprogs
-          python3 -m pip install -q tracekit-ai==1.4.2
+          python -m pip install -q tracekit-ai==1.4.2
           tracekit init --dev --v2 --no-hooks
-          tracekit up
+          tracekit up --wait
       - run: make e2e
+
+  # The GitHub Action itself, from this checkout: a trivial command in a small image, applied, exported and verified.
+  action:
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run a command in a box with the action
+        id: box
+        uses: ./action
+        with:
+          agent: command
+          image: alpine:3.20
+          command: echo "written in a box" > tkbox-action-check.txt && uname -a
+          timeout: 5m
+          tkbox-version: source
+          artifact-name: tracekit-box-action-check
+      - name: Check the outputs and the applied file
+        env:
+          VERIFY: ${{ steps.box.outputs.verify }}
+          APPLIED: ${{ steps.box.outputs.applied }}
+          CODE: ${{ steps.box.outputs.agent-exit-code }}
+          FILES: ${{ steps.box.outputs.changed-files }}
+        run: |
+          echo "verify=$VERIFY applied=$APPLIED code=$CODE files=$FILES"
+          [ "$VERIFY" = VERIFIED ] && [ "$APPLIED" = true ] && [ "$CODE" = 0 ]
+          [ "$FILES" = tkbox-action-check.txt ]
+          grep -qx "written in a box" tkbox-action-check.txt

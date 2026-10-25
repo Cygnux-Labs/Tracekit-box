@@ -91,13 +91,14 @@ type Options struct {
 
 // Daemon manages boxes.
 type Daemon struct {
-	opts     Options
-	ctx      context.Context
-	cancel   context.CancelFunc
-	log      *log.Logger
-	ownUID   int
-	allowUID func(uid int) bool // tests: replaces the own-uid-or-root rule
-	eg       egressHooks
+	opts      Options
+	ctx       context.Context
+	cancel    context.CancelFunc
+	log       *log.Logger
+	ownUID    int
+	allowUID  func(uid int) bool // tests: replaces the own-uid-or-root rule
+	eg        egressHooks
+	hostAddrs hostAddrs // this host's own addresses, which no box may reach
 
 	mu        sync.Mutex
 	boxes     map[string]*box // by id

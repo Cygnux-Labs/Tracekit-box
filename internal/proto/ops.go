@@ -1,6 +1,9 @@
 package proto
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Operations on PortAgent. The first frame of every connection is a TypeJSON request whose "op" names one of these.
 const (
@@ -100,8 +103,19 @@ type FileInfo struct {
 type DiffRequest struct {
 	Op       string `json:"op"`
 	MaxBytes int64  `json:"max_bytes,omitempty"` // 0: 64 MiB; a larger patch is an error with CodeTooLarge
-	// ExcludeDirs are directory names skipped anywhere in the workspace (also when sizing), e.g. "node_modules".
+	// ExcludeDirs are directory names skipped anywhere in the workspace (e.g. "node_modules"): their contents are
+	// left out of the patch and of the size count. Each is a plain name (CheckExcludeDirs).
 	ExcludeDirs []string `json:"exclude_dirs,omitempty"`
+}
+
+// CheckExcludeDirs validates DiffRequest.ExcludeDirs: each a plain directory name, no "/", NUL, "." or "..".
+func CheckExcludeDirs(names []string) error {
+	for _, n := range names {
+		if n == "" || n == "." || n == ".." || strings.ContainsAny(n, "/\x00") {
+			return fmt.Errorf("exclude_dirs: %q is not a directory name", n)
+		}
+	}
+	return nil
 }
 
 // DiffSummary lists what changed in the workspace relative to the image it booted with.

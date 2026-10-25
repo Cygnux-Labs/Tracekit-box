@@ -270,6 +270,181 @@ func TestExecBusy(t *testing.T) {
 	wantCode(t, err, proto.CodeBusy)
 }
 
+// startUnreadStdin runs `sleep 30` behind a shell that prints its pid, with 2 MB of stdin it never reads, and returns
+// once the stdin stream has filled the guest's queue (the guest is then waiting on the child).
+func startUnreadStdin(t *testing.T, f *fixture, ctx context.Context, sigs chan string) (pid int, done chan error, es *proto.ExitStatus) {
+	t.Helper()
+	w := &lineWatcher{want: "\n", ready: make(chan struct{})}
+	done = make(chan error, 1)
+	es = new(proto.ExitStatus)
+	go func() {
+		var err error
+		*es, err = f.c.Exec(ctx, proto.ExecRequest{Argv: []string{"sh", "-c", "echo $$; exec sleep 30"}},
+			agentrpc.ExecIO{Stdin: bytes.NewReader(make([]byte, 2_000_000)), Stdout: w, Signals: sigs})
+		done <- err
+	}()
+	select {
+	case <-w.ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no pid")
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(w.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond) // let stdin back up behind the child
+	return pid, done, es
+}
+
+func waitGone(t *testing.T, pid int, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for syscall.Kill(pid, 0) == nil {
+		if time.Now().After(deadline) {
+			t.Fatalf("process %d still running after %s", pid, within)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestExecUnreadStdin: a child that never reads its stdin must not hide signals or the host going away behind the
+// stdin stream (it used to run until the exec timeout).
+func TestExecUnreadStdin(t *testing.T) {
+	f := newFixture(t, proto.GuestLimits{})
+	t.Run("signal", func(t *testing.T) {
+		sigs := make(chan string, 1)
+		_, done, es := startUnreadStdin(t, f, ctxT(t, 25*time.Second), sigs)
+		start := time.Now()
+		sigs <- "SIGINT"
+		select {
+		case err := <-done:
+			if err != nil || es.Signal != "SIGINT" {
+				t.Fatalf("%+v %v", *es, err)
+			}
+		case <-time.After(6 * time.Second):
+			t.Fatal("SIGINT not delivered behind the unread stdin")
+		}
+		t.Logf("SIGINT took %s", time.Since(start).Round(time.Millisecond))
+	})
+	t.Run("host gone", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		pid, done, _ := startUnreadStdin(t, f, ctx, nil)
+		start := time.Now()
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("want context.Canceled, got %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Exec did not return on cancel")
+		}
+		waitGone(t, pid, 6*time.Second)
+		t.Logf("killed %s after the host closed", time.Since(start).Round(time.Millisecond))
+	})
+}
+
+// TestExecSlowStdinReader: a child that takes its stdin late still gets every byte (the guest holds the host back
+// rather than dropping while the child makes progress).
+func TestExecSlowStdinReader(t *testing.T) {
+	f := newFixture(t, proto.GuestLimits{})
+	data := bytes.Repeat([]byte("0123456789abcdef"), 300000) // 4.8 MB
+	var out bytes.Buffer
+	es, err := f.c.Exec(ctxT(t, 30*time.Second), proto.ExecRequest{Argv: []string{"sh", "-c", "sleep 1; cat"}},
+		agentrpc.ExecIO{Stdin: bytes.NewReader(data), Stdout: &out})
+	if err != nil || es.Code != 0 || !bytes.Equal(out.Bytes(), data) {
+		t.Fatalf("%+v %v, %d of %d bytes back", es, err, out.Len(), len(data))
+	}
+}
+
+// TestExecSignalAheadOfStdin: against a guest slow to take stdin, a signal goes out ahead of the stdin still to be
+// written, and cancelling ctx closes the connection at once; against a guest that reads nothing, cancel still returns.
+func TestExecSignalAheadOfStdin(t *testing.T) {
+	stdinSeen := make(chan int, 4096)
+	sigAfter := make(chan int, 1)
+	closed := make(chan struct{})
+	c := hostile(func(conn net.Conn, req proto.Frame) {
+		n := 0
+		for {
+			fr, err := proto.ReadFrame(conn)
+			if err != nil {
+				close(closed)
+				return
+			}
+			switch fr.Type {
+			case proto.TypeStdin:
+				n++
+				stdinSeen <- n
+				time.Sleep(30 * time.Millisecond) // slow to take stdin
+			case proto.TypeSignal:
+				sigAfter <- n
+			}
+		}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigs := make(chan string, 1)
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Exec(ctx, proto.ExecRequest{Argv: []string{"x"}},
+			agentrpc.ExecIO{Stdin: io.LimitReader(zeroReader{}, 64<<20), Signals: sigs})
+		done <- err
+	}()
+	var at int
+	for at = range stdinSeen {
+		if at == 3 {
+			break
+		}
+	}
+	sigs <- "SIGINT"
+	select {
+	case n := <-sigAfter:
+		if n > at+2 {
+			t.Fatalf("the signal went out after %d stdin frames (sent after %d)", n, at)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("signal stuck behind stdin")
+	}
+	cancel()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the guest did not see the connection close")
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("want context.Canceled, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Exec did not return on cancel")
+	}
+
+	// a guest that reads nothing at all after the request: the stdin write is stuck, cancel still ends it
+	release := make(chan struct{})
+	c = hostile(func(conn net.Conn, req proto.Frame) { <-release })
+	defer close(release)
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	go func() {
+		_, err := c.Exec(ctx2, proto.ExecRequest{Argv: []string{"x"}},
+			agentrpc.ExecIO{Stdin: io.LimitReader(zeroReader{}, 64<<20), Signals: sigs})
+		done <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	sigs <- "SIGTERM"
+	time.Sleep(50 * time.Millisecond)
+	cancel2()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("want context.Canceled, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Exec did not return on cancel with a stuck write")
+	}
+}
+
 func TestFiles(t *testing.T) {
 	f := newFixture(t, proto.GuestLimits{})
 	ctx := ctxT(t, 10*time.Second)
@@ -331,6 +506,31 @@ func TestDiffAndShutdown(t *testing.T) {
 	}
 	_, err = f.c.Diff(ctx, 10, io.Discard)
 	wantCode(t, err, proto.CodeTooLarge)
+
+	// exclude_dirs: left out of the patch; names are checked on both sides
+	os.MkdirAll(filepath.Join(f.ws, "upper", "node_modules", "x"), 0o755)
+	os.WriteFile(filepath.Join(f.ws, "upper", "node_modules", "x", "i.js"), []byte("x\n"), 0o644)
+	if sum, err = f.c.Diff(ctx, 0, io.Discard); err != nil || len(sum.Files) != 3 {
+		t.Fatalf("diff %+v %v", sum, err)
+	}
+	patch.Reset()
+	sum, err = f.c.DiffWith(ctx, proto.DiffRequest{ExcludeDirs: []string{"node_modules"}}, &patch)
+	if err != nil || len(sum.Files) != 2 || strings.Contains(patch.String(), "node_modules") {
+		t.Fatalf("excluded diff %+v %v\n%s", sum, err, patch.String())
+	}
+	for _, bad := range []string{"", ".", "..", "a/b", "x\x00"} {
+		if _, err := f.c.DiffWith(ctx, proto.DiffRequest{ExcludeDirs: []string{bad}}, io.Discard); err == nil {
+			t.Fatalf("exclude %q accepted", bad)
+		}
+		a, b := net.Pipe()
+		go f.srv.ServeConn(b)
+		proto.WriteJSON(a, proto.TypeJSON, proto.DiffRequest{Op: proto.OpDiff, ExcludeDirs: []string{bad}})
+		fr, err := proto.ReadFrame(a)
+		a.Close()
+		if err != nil || fr.Type != proto.TypeError || fr.AsError().Code != proto.CodeBadRequest {
+			t.Fatalf("guest took exclude %q: %v %d %s", bad, err, fr.Type, fr.Payload)
+		}
+	}
 
 	if err := f.c.Shutdown(ctx); err != nil {
 		t.Fatal(err)

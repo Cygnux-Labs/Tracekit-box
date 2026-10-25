@@ -37,7 +37,8 @@ make lint       # gofmt, go vet (also with GOOS=linux)
 ```
 
 On macOS `bin/tkbox` is the CLI only: it can talk to a daemon over a socket but cannot run boxes. `tkbox` finds the
-guest agent next to its own binary, so keep `bin/tkbox-linux-<arch>` and `bin/tkbox-guest-linux-<arch>` together.
+guest agent next to its own binary (or in `tkbox daemon --guest-dir DIR`), so keep `bin/tkbox-linux-<arch>` and
+`bin/tkbox-guest-linux-<arch>` together.
 
 ## Unit tests
 
@@ -54,7 +55,8 @@ newer and need no Linux host.
 
 [`dev/lima.yaml`](../dev/lima.yaml) describes an Ubuntu 24.04 arm64 VM with nested virtualization, so Firecracker gets
 `/dev/kvm` inside it. Nested virtualization in Lima's `vz` driver needs an Apple M3 or newer and macOS 15 or newer. The
-VM mounts `~/tracekit-box` (writable) and `~/Tracekit` (read-only), so keep the checkout at `~/tracekit-box`.
+VM mounts `~/tracekit-box` writable, so keep the checkout there. Inside the VM it appears at the same path as on the
+Mac, `/Users/<you>/tracekit-box`, while your home directory in the VM is `/home/<you>.guest`.
 
 ```sh
 brew install lima
@@ -68,9 +70,10 @@ access to `/dev/kvm`):
 ```sh
 ls -l /dev/kvm                                     # must exist; if not, the host lacks nested virtualization
 # Go, at the version in go.mod
-curl -fsSL "https://go.dev/dl/go$(sed -n 's/^go //p' ~/tracekit-box/go.mod).linux-arm64.tar.gz" | sudo tar -C /usr/local -xz
+cd /Users/$USER/tracekit-box                       # the mounted checkout (HOME is /home/$USER.guest)
+curl -fsSL "https://go.dev/dl/go$(sed -n 's/^go //p' go.mod).linux-arm64.tar.gz" | sudo tar -C /usr/local -xz
 export PATH=/usr/local/go/bin:$PATH
-cd ~/tracekit-box && make
+make linux
 ```
 
 ### A dev signer
@@ -80,7 +83,7 @@ Box needs a Tracekit 1.4.2 signer. For development, a same-user dev signer is en
 
 ```sh
 python3 -m venv ~/.venv/tracekit && . ~/.venv/tracekit/bin/activate
-pip install tracekit-ai==1.4.2 && tracekit init --dev --v2 --no-hooks && tracekit up
+pip install tracekit-ai==1.4.2 && tracekit init --dev --v2 --no-hooks && tracekit up --wait
 tracekit status
 ```
 
@@ -89,14 +92,17 @@ tracekit status
 ### Running boxes
 
 ```sh
-bin/tkbox daemon &
-bin/tkbox run --image alpine:3.20 --name t
-bin/tkbox exec t -- uname -a
-bin/tkbox stop t && bin/tkbox export t -o t.tkb && tracekit verify t.tkb --trust t.trust.json
+bin/tkbox-linux-arm64 daemon > /tmp/tkbox-daemon.log 2>&1 &
+until bin/tkbox-linux-arm64 ls >/dev/null 2>&1; do sleep 1; done   # the first start downloads Firecracker and the kernel
+bin/tkbox-linux-arm64 run --image alpine:3.20 --name t
+bin/tkbox-linux-arm64 exec t -- uname -a
+bin/tkbox-linux-arm64 stop t && bin/tkbox-linux-arm64 export t -o /tmp/t.tkb && tracekit verify /tmp/t.tkb --trust /tmp/t.trust.json
 ```
 
+`tkbox` looks for the guest agent next to its own binary, which `make linux` puts there (`bin/tkbox-guest-linux-arm64`).
 The daemon keeps its state in `~/.local/state/tkbox` (images, boxes, `run/tkbox.sock`); each box's console output is
-in `boxes/<id>/console.log` and what happened at its doors in `boxes/<id>/events.ndjson`.
+in `boxes/<id>/console.log` and what happened at its doors in `boxes/<id>/events.ndjson` (`tkbox events <box>` prints
+it).
 
 ## End-to-end tests
 
@@ -107,7 +113,8 @@ make e2e        # builds, then go test -tags e2e ./e2e/... with TKBOX_BIN=bin/
 ```
 
 They boot real VMs, pull small public images and check every door against the signer's record, so they need outbound
-network access and take a few minutes. CI runs them on `ubuntu-latest` after enabling KVM for the runner user
+network access and take a few minutes. CI runs them on `ubuntu-latest` after enabling KVM for the runner user, and
+also runs the GitHub Action from the checkout (`uses: ./action`) with a trivial command
 ([.github/workflows/ci.yml](../.github/workflows/ci.yml)).
 
 ## Commits

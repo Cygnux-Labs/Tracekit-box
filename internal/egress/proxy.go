@@ -22,9 +22,12 @@ import (
 const (
 	maxResponseHeadBytes = 1 << 20         // an upstream response head
 	maxInterim           = 8               // 1xx responses before the final one
-	tlsPeekTimeout       = 5 * time.Second // waiting for a ClientHello on a tunnel Box would inspect
+	tlsPeekTimeout       = 5 * time.Second // waiting for a tunnel's TLS ClientHello
+	maxHelloBytes        = 96 << 10        // the most Box reads to see a ClientHello whole
 	lingerTimeout        = 250 * time.Millisecond
 	busyEventEvery       = time.Second // at most one egress.denied per second for MaxConns refusals
+	eventWindow          = time.Second // the window for the two limits below
+	deniedPerWindow      = 20          // egress.denied events recorded one by one per window; the rest are summed
 )
 
 var errClosed = errors.New("egress: proxy is closed")
@@ -35,10 +38,13 @@ type Proxy struct {
 	allow         patterns
 	models        patterns
 	secrets       []*secretRule
+	reqMatch      *matcher // placeholders and secret values, for request bodies
+	valMatch      *matcher // secret values, for responses and request heads
 	resolver      Resolver
 	blockPrefixes []netip.Prefix
 	allowPrivate  []netip.Prefix
 	sem           chan struct{}
+	lim           eventLimiter
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -133,6 +139,13 @@ func New(cfg Config) (*Proxy, error) {
 		names[r.Name], phs[r.lowerPH] = true, true
 		p.secrets = append(p.secrets, r)
 	}
+	vals := p.valuePatterns()
+	p.valMatch = newMatcher(vals)
+	reqPats := vals
+	for _, r := range p.secrets {
+		reqPats = append(reqPats, pattern{s: []byte(r.Placeholder), rule: r, kind: patPlaceholder})
+	}
+	p.reqMatch = newMatcher(reqPats)
 	if len(p.secrets) > 0 || cfg.Inspect == InspectAll {
 		if !cfg.CA.usable() {
 			return nil, errors.New("egress: Config.CA is required to swap secrets or inspect traffic (create one with NewCA)")
@@ -251,6 +264,7 @@ func (p *Proxy) Close() error {
 		s.closeAll()
 	}
 	p.wg.Wait()
+	p.lim.close(p) // record what the limits were still holding
 	return nil
 }
 
@@ -312,7 +326,7 @@ func (p *Proxy) serveBusy(s *session) {
 	}
 	s.raw.SetDeadline(time.Now().Add(2 * time.Second))
 	p.writeRefusal(s.raw, http.StatusServiceUnavailable, target{}, reason,
-		"Close idle connections or reuse keep-alive connections; the operator can raise max_conns.")
+		"Close idle connections or reuse keep-alive connections.")
 	s.linger(nil)
 }
 
@@ -378,6 +392,10 @@ func (p *Proxy) badHead(s *session, w io.Writer, hl *headLimiter, err error, t t
 			todo:   "Send well-formed requests and put placeholders only in the bound header."})
 		return
 	}
+	if f := p.findValues(string(hl.rec)); f != nil {
+		p.leak(s, w, t, "", "", valueLeak(f[0], "a malformed request", ""))
+		return
+	}
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || isTimeout(err) || errors.Is(err, net.ErrClosed) {
 		return
 	}
@@ -434,21 +452,35 @@ func (p *Proxy) emit(e Event) {
 	e.Path = p.redact(e.Path)
 	e.Method = p.redact(e.Method)
 	e.Reason = p.redact(e.Reason)
-	p.cfg.Sink.Emit(e)
+	switch e.Kind {
+	case EventDenied, EventSecretLeak:
+		p.lim.emit(p, e)
+	default:
+		p.cfg.Sink.Emit(e)
+	}
 }
 
 // serveConnect handles CONNECT host:port.
 func (p *Proxy) serveConnect(s *session, req *http.Request, br *bufio.Reader) {
 	raw := req.RequestURI
-	if f := p.find(raw, true); f != nil {
+	connectTarget := func() target {
 		t := target{host: raw}
 		if h, ps, err := net.SplitHostPort(raw); err == nil {
 			t.host = h
 			t.port, _ = parsePort(ps)
 		}
-		p.leak(s, s.client, t, "", "", &leakError{secret: f[0],
+		return t
+	}
+	if f := p.find(raw, true); f != nil {
+		p.leak(s, s.client, connectTarget(), "", "", &leakError{secret: f[0],
 			reason: fmt.Sprintf("a placeholder for secret %s is in the CONNECT host", f[0].Name),
 			todo:   "Never put a secret in a host name: the lookup alone would send it to that domain's DNS servers."})
+		s.linger(br)
+		return
+	}
+	if f := p.findValueTarget(raw); f != nil {
+		p.leak(s, s.client, connectTarget(), "", "", valueLeak(f[0], "the CONNECT host",
+			"Never put a secret in a host name: the lookup alone would send it to that domain's DNS servers."))
 		s.linger(br)
 		return
 	}
@@ -462,6 +494,15 @@ func (p *Proxy) serveConnect(s *session, req *http.Request, br *bufio.Reader) {
 	t := target{scheme: "https", host: host, addr: lit, port: port}
 	if req.ContentLength != 0 || len(req.TransferEncoding) > 0 {
 		p.deny(s, s.client, t, "", "", refusal{status: 400, reason: "a CONNECT request has a body", todo: "Send CONNECT without a body."})
+		s.linger(br)
+		return
+	}
+	if port == 80 {
+		// Inside a tunnel the guest would write the Host header and reach any site on that address. In absolute
+		// form Box writes Host itself.
+		p.deny(s, s.client, t, "", "", refusal{status: 403, reason: "port 80 tunnels are refused: send plain HTTP through the proxy",
+			todo: "Set http_proxy (HTTP_PROXY) to the proxy so clients send absolute-form requests (GET http://" + hostPort(host, 80) +
+				"/path); Box writes the Host header itself."})
 		s.linger(br)
 		return
 	}
@@ -487,16 +528,17 @@ func (p *Proxy) serveConnect(s *session, req *http.Request, br *bufio.Reader) {
 	}
 	s.track(up)
 	upm := &meteredConn{Conn: up, w: s.watch}
-	if inspect {
-		p.serveMITM(s, t, br, upm)
-		return
-	}
 	if _, err := io.WriteString(s.client, "HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {
 		p.emit(Event{Kind: EventClosed, Host: t.host, Port: t.port, Reason: s.endReason("the client went away")})
 		return
 	}
-	in, out := s.splice(br, s.client, upm, upm)
-	p.emit(Event{Kind: EventClosed, Host: t.host, Port: t.port, BytesIn: in, BytesOut: out, Reason: s.endReason("")})
+	// Only an allow entry that names the port lets something other than TLS through the tunnel.
+	rawOK := p.allow.matchExplicitPort(t.host, t.addr, t.port)
+	if inspect {
+		p.serveMITM(s, t, br, upm, rawOK)
+		return
+	}
+	p.serveTunnel(s, t, br, upm, rawOK)
 }
 
 // boundSecrets reports whether any secret is bound to host.
@@ -701,22 +743,25 @@ func (s *session) linger(br *bufio.Reader) {
 
 // splice copies both ways until both sides are done; a side that ends cleanly is half-closed on the other.
 func (s *session) splice(cr io.Reader, cw net.Conn, ur io.Reader, uw net.Conn) (in, out int64) {
-	half := func(dst net.Conn, src io.Reader) int64 {
+	inc := s.pipe(cw, ur)
+	out = <-s.pipe(uw, cr)
+	in = <-inc
+	s.closeAll()
+	return in, out
+}
+
+// pipe copies src to dst in the background and delivers the byte count when src ends; a clean end half-closes dst,
+// anything else closes the session.
+func (s *session) pipe(dst net.Conn, src io.Reader) <-chan int64 {
+	done := make(chan int64, 1)
+	go func() {
 		n, err := io.CopyBuffer(writerOnly{dst}, readerOnly{src}, make([]byte, 32<<10))
 		if err != nil || !closeWrite(dst) {
 			s.closeAll()
 		}
-		return n
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		out = half(uw, cr)
+		done <- n
 	}()
-	in = half(cw, ur)
-	<-done
-	s.closeAll()
-	return in, out
+	return done
 }
 
 type readerOnly struct{ io.Reader }
@@ -758,10 +803,10 @@ func (c *meteredConn) CloseWrite() error {
 	return errors.ErrUnsupported
 }
 
-// bufConn reads through a bufio.Reader that may hold bytes the client sent early (a pipelined ClientHello).
+// bufConn reads through a reader that may hold bytes the client sent early (a pipelined or peeked ClientHello).
 type bufConn struct {
 	net.Conn
-	r *bufio.Reader
+	r io.Reader
 }
 
 func (c *bufConn) Read(b []byte) (int, error) { return c.r.Read(b) }
@@ -905,7 +950,7 @@ func (p *Proxy) checkSNI(t target, sni string) error {
 	}
 	h, a, err := normalizeHost(sni)
 	if err != nil || h != t.host || a.IsValid() != t.addr.IsValid() {
-		return &sniError{msg: fmt.Sprintf("the TLS server name %q does not match the CONNECT host %s", printable(sni, 255), t.host)}
+		return &sniError{msg: fmt.Sprintf("the TLS server name %q is not the CONNECT host %s", printable(sni, 255), t.host)}
 	}
 	return nil
 }

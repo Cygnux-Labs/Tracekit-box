@@ -33,5 +33,7 @@ type Guest interface {
 	Stat(ctx context.Context, path string) (proto.FileInfo, error)
 	// Diff writes the workspace patch (git format, with binary patches) to w and returns its summary.
 	Diff(ctx context.Context, maxBytes int64, w io.Writer) (proto.DiffSummary, error)
+	// DiffWith is Diff with the whole request: req.MaxBytes as maxBytes, req.ExcludeDirs left out of the patch.
+	DiffWith(ctx context.Context, req proto.DiffRequest, w io.Writer) (proto.DiffSummary, error)
 	Shutdown(ctx context.Context) error
 }
