@@ -16,6 +16,7 @@ import (
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
 	"github.com/Cygnux-Labs/tracekit-box/internal/config"
+	"github.com/Cygnux-Labs/tracekit-box/internal/daemon"
 )
 
 // MCP over stdio: JSON-RPC 2.0, one message per line.
@@ -121,28 +122,31 @@ func (s *mcpServer) runRequest(a mcpRunArgs) (api.CreateBoxRequest, error) {
 			return api.CreateBoxRequest{}, mcpRefused("tkbox_run may not add %q to the allowlist: it is not in the operator's (%s)", h, orNone(baseAllow))
 		}
 	}
+	workspace := ""
 	if a.Workspace != "" {
-		if err := s.checkWorkspace(a.Workspace); err != nil {
+		// the path checked is the path used: symlinks resolved once, here, so it can't change between the two
+		real, err := s.checkWorkspace(a.Workspace)
+		if err != nil {
 			return api.CreateBoxRequest{}, err
 		}
+		workspace = real
 	}
-	if s.base != nil {
-		l := s.base.Limits
-		switch {
-		case l.CPUs != 0 && a.CPUs > l.CPUs:
-			return api.CreateBoxRequest{}, mcpRefused("cpus %d is over the operator's %d", a.CPUs, l.CPUs)
-		case l.Memory != 0 && a.Memory != "":
-			if m, err := config.ParseSize(a.Memory); err == nil && m > int(l.Memory) {
-				return api.CreateBoxRequest{}, mcpRefused("memory %s is over the operator's %dMiB", a.Memory, int(l.Memory))
-			}
-		}
-		if l.Timeout != 0 && a.Timeout != "" {
-			if d, err := config.ParseDuration(a.Timeout); err == nil && d > time.Duration(l.Timeout) {
-				return api.CreateBoxRequest{}, mcpRefused("timeout %s is over the operator's %s", a.Timeout, time.Duration(l.Timeout))
-			}
+	// each limit may only go down from the operator's; one the config leaves unset is the daemon's default
+	l := s.limits()
+	if a.CPUs > l.CPUs {
+		return api.CreateBoxRequest{}, mcpRefused("cpus %d is over the operator's %d", a.CPUs, l.CPUs)
+	}
+	if a.Memory != "" {
+		if m, err := config.ParseSize(a.Memory); err == nil && m > int(l.Memory) {
+			return api.CreateBoxRequest{}, mcpRefused("memory %s is over the operator's %dMiB", a.Memory, int(l.Memory))
 		}
 	}
-	req, err := config.Request(s.base, config.Flags{Image: image, Name: a.Name, Workspace: a.Workspace,
+	if a.Timeout != "" {
+		if d, err := config.ParseDuration(a.Timeout); err == nil && d > time.Duration(l.Timeout) {
+			return api.CreateBoxRequest{}, mcpRefused("timeout %s is over the operator's %s", a.Timeout, time.Duration(l.Timeout))
+		}
+	}
+	req, err := config.Request(s.base, config.Flags{Image: image, Name: a.Name, Workspace: workspace,
 		CPUs: a.CPUs, Memory: a.Memory, Timeout: a.Timeout, Task: a.Task, Agent: "mcp"}, config.Resolver{})
 	if err != nil {
 		return api.CreateBoxRequest{}, err
@@ -153,28 +157,53 @@ func (s *mcpServer) runRequest(a mcpRunArgs) (api.CreateBoxRequest, error) {
 	return req, nil
 }
 
+// limits are the most a tkbox_run may ask for: the operator's config limits, and the daemon's defaults for any the
+// config leaves unset (never the global maximum).
+func (s *mcpServer) limits() config.Limits {
+	l := config.Limits{CPUs: daemon.DefaultCPUs, Memory: config.Size(daemon.DefaultMemoryMiB),
+		Timeout: config.Duration(daemon.DefaultTimeout), ExecTimeout: config.Duration(daemon.DefaultExecTimeout)}
+	if s.base == nil {
+		return l
+	}
+	b := s.base.Limits
+	if b.CPUs != 0 {
+		l.CPUs = b.CPUs
+	}
+	if b.Memory != 0 {
+		l.Memory = b.Memory
+	}
+	if b.Timeout != 0 {
+		l.Timeout = b.Timeout
+	}
+	if b.ExecTimeout != 0 {
+		l.ExecTimeout = b.ExecTimeout
+	}
+	return l
+}
+
 // checkWorkspace allows a workspace only inside an operator root (--workspace-root), or the config's own workspace.
-func (s *mcpServer) checkWorkspace(ws string) error {
+// It returns the resolved path (symlinks evaluated): the one that was checked is the one the box must use.
+func (s *mcpServer) checkWorkspace(ws string) (string, error) {
 	if !filepath.IsAbs(ws) {
-		return &api.ErrorDetail{Code: api.CodeBadRequest, Message: "workspace must be an absolute path"}
+		return "", &api.ErrorDetail{Code: api.CodeBadRequest, Message: "workspace must be an absolute path"}
 	}
 	real, err := filepath.EvalSymlinks(filepath.Clean(ws))
 	if err != nil {
-		return &api.ErrorDetail{Code: api.CodeBadRequest, Message: fmt.Sprintf("workspace %s: %v", ws, err)}
+		return "", &api.ErrorDetail{Code: api.CodeBadRequest, Message: fmt.Sprintf("workspace %s: %v", ws, err)}
 	}
 	if len(s.roots) == 0 && s.base != nil {
 		if cw := s.base.WorkspacePath(); cw != "" {
 			if rr, err := filepath.EvalSymlinks(cw); err == nil && rr == real {
-				return nil // exactly the config's workspace
+				return real, nil // exactly the config's workspace
 			}
 		}
 	}
 	for _, r := range s.roots {
 		if real == r || strings.HasPrefix(real, r+string(filepath.Separator)) {
-			return nil
+			return real, nil
 		}
 	}
-	return mcpRefused("workspace %s is outside the dirs the operator allows (tkbox mcp --workspace-root)", ws)
+	return "", mcpRefused("workspace %s is outside the dirs the operator allows (tkbox mcp --workspace-root)", ws)
 }
 
 type mcpRunArgs struct {
@@ -402,6 +431,9 @@ func (s *mcpServer) call(ctx context.Context, name string, raw json.RawMessage) 
 			if err != nil {
 				return "", true, &api.ErrorDetail{Code: api.CodeBadRequest, Message: "timeout: want e.g. 10m"}
 			}
+			if max := time.Duration(s.limits().ExecTimeout); d > max {
+				return "", true, mcpRefused("timeout %s is over the operator's exec timeout %s", a.Timeout, max)
+			}
 			req.Timeout = api.Duration(d)
 		}
 		stdout, stderr := &capWriter{n: mcpMaxOutput}, &capWriter{n: mcpMaxOutput}
@@ -430,7 +462,9 @@ func (s *mcpServer) call(ctx context.Context, name string, raw json.RawMessage) 
 		}
 		code := execExitCode(st, nil, &cliEnv{stderr: io.Discard})
 		fmt.Fprintf(&b, "exit code %d", code)
-		if st.TimedOut {
+		if st.StdinTruncated {
+			b.WriteString(" (" + strings.TrimPrefix(stdinTruncatedMsg(st), "tkbox: ") + ")")
+		} else if st.TimedOut {
 			b.WriteString(" (timed out)")
 		} else if st.Signal != "" {
 			b.WriteString(" (killed by " + st.Signal + ")")

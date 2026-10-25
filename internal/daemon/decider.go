@@ -26,6 +26,12 @@ const (
 // maxPendingApprovals caps the Box approvals one box may hold open at once.
 const maxPendingApprovals = 16
 
+// maxNewApprovals caps the Box approvals one box may open per approvalWindow (opened then withdrawn ones count).
+const (
+	maxNewApprovals = 30
+	approvalWindow  = time.Minute
+)
+
 // approval is a Box approval: an egress host off the allowlist, held until a person answers on the host.
 type approval struct {
 	api.Approval // guarded by Daemon.mu
@@ -104,6 +110,9 @@ func (bd *boxDecider) Decide(ctx context.Context, req egress.Request) (egress.Ve
 	case state == approvalLimit:
 		complete("error", map[string]any{"allowed": false, "decision": "too many pending approvals"})
 		return egress.Verdict{Reason: fmt.Sprintf("too many pending approvals in this box (%d): egress to %s refused at once; answer the pending ones with `tkbox approvals`, or start the box with `--allow %s`", maxPendingApprovals, req.URL, allowHint)}, nil
+	case state == approvalRate:
+		complete("error", map[string]any{"allowed": false, "decision": "too many new approvals"})
+		return egress.Verdict{Reason: fmt.Sprintf("this box opened %d approvals in the last %s: egress to %s refused at once without asking anyone; start the box with `--allow %s` if it needs that host", maxNewApprovals, approvalWindow, req.URL, allowHint)}, nil
 	default:
 		complete("error", map[string]any{"allowed": false, "approval_id": id, "decision": state})
 		if id == "" {
@@ -114,8 +123,12 @@ func (bd *boxDecider) Decide(ctx context.Context, req egress.Request) (egress.Ve
 	}
 }
 
-// approvalLimit is awaitApproval's answer when the box already holds maxPendingApprovals.
-const approvalLimit = "limit"
+// approvalLimit is awaitApproval's answer when the box already holds maxPendingApprovals; approvalRate when it opened
+// maxNewApprovals within approvalWindow.
+const (
+	approvalLimit = "limit"
+	approvalRate  = "rate"
+)
 
 // awaitApproval opens (or joins) the pending approval for req's target and waits for its answer. A connection that
 // gives up first gets "expired"; when no connection waits on an approval any more it is withdrawn, so no one
@@ -144,12 +157,25 @@ func (d *Daemon) awaitApproval(ctx context.Context, b *box, req egress.Request, 
 			d.mu.Unlock()
 			return approvalLimit, "", nil
 		}
+		now := d.now()
+		recent := b.approvalTimes[:0]
+		for _, t := range b.approvalTimes {
+			if now.Sub(t) < approvalWindow {
+				recent = append(recent, t)
+			}
+		}
+		b.approvalTimes = recent
+		if len(recent) >= maxNewApprovals {
+			d.mu.Unlock()
+			return approvalRate, "", nil
+		}
+		b.approvalTimes = append(b.approvalTimes, now)
 		d.pruneApprovals()
 		id := ""
 		for id == "" || d.approvals[id] != nil {
 			id = "apr-" + randHex(4)
 		}
-		now := d.now().UTC()
+		now = now.UTC()
 		a = &approval{Approval: api.Approval{ID: id, BoxID: b.id, BoxName: b.name(), Kind: "egress", Target: req.URL,
 			State: approvalPending, CreatedAt: now, ExpiresAt: now.Add(d.opts.ApprovalTimeout)},
 			box: b, hostPort: hostPort, decided: make(chan struct{})}
@@ -228,6 +254,9 @@ func (d *Daemon) finish(a *approval, state, by, scope string) bool {
 	d.mu.Lock()
 	a.recordErr = recErr
 	close(a.decided)
+	if state == approvalWithdrawn && d.approvals[view.ID] == a {
+		delete(d.approvals, view.ID) // no one waits on it: it holds nothing worth keeping
+	}
 	d.mu.Unlock()
 	summary := fmt.Sprintf("approval %s for %s: %s", view.ID, view.Target, state)
 	if by != "" {

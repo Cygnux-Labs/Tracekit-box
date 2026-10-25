@@ -145,7 +145,7 @@ notices on stderr as `tkbox: …` lines.
 
 | Flag | Meaning |
 |---|---|
-| `-i` | Send this terminal's stdin to the command (there is no TTY). The daemon holds up to 4 MiB the process has not read yet; past that the process's stdin is closed and a notice says so |
+| `-i` | Send this terminal's stdin to the command (there is no TTY). The daemon holds up to 4 MiB the process has not read yet (the guest 1 MiB more, while the process keeps reading). A process that does not take its stdin fast enough is never handed a false end of input: it is killed, and `tkbox exec` prints `tkbox: stdin was not consumed fast enough (N bytes dropped); the command was stopped: write large input to a file in /workspace and read it from there` and exits 125 |
 | `--timeout` | This exec's time limit, 1s to 24h (default: the box's exec timeout, 30m) |
 | `--env` | Repeatable `K=V` for this exec only. `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `BASH_ENV`, `ENV` and `PROMPT_COMMAND` are refused (`env LD_PRELOAD can't be set per command`), as are the proxy and CA variables Box sets |
 | `--cwd` | The working directory in the box (default `/workspace`) |
@@ -158,7 +158,7 @@ may still run in the box (`tkbox stop` stops the box). If the connection to the 
 command.
 
 Notices `tkbox exec` may print: the process was killed by SIGKILL (maybe out of memory), output past 256 MiB was
-dropped, the exec timeout killed the command, the command was too long to record (over 1 MiB), stdin overflowed, an
+dropped, the exec timeout killed the command, the command was too long to record (over 1 MiB), the command was stopped because it did not take its stdin, an
 egress connection failed or was refused (for example 502 when the host did not accept the connection), an approval to
 give, expired or withdrawn, a secret blocked on its way to the wrong host. The texts are in [limits.md](limits.md).
 
@@ -169,7 +169,7 @@ Exit codes:
 | the process's | The command ran; its own exit code (0 to 255) |
 | 128 + n | The command was killed by signal n, 1 to 64 (137 for SIGKILL, for example after running out of memory; 143 for SIGTERM) |
 | 124 | The command reached its exec timeout and was killed |
-| 125 | tkbox error: no daemon, no such box, the box is not running or stopped during the command, a limit, the signer unavailable, or the command was cancelled before it started |
+| 125 | tkbox error: no daemon, no such box, the box is not running or stopped during the command, a limit, the signer unavailable, the command was cancelled before it started, or it was stopped because it did not take its stdin fast enough (`-i`) |
 | 126 | The signer or a person denied the command, or its approval expired; it did not run |
 | 127 | The executable was not found in the box |
 | 2 | Usage error (including a bad flag or a `--timeout` outside 1s..24h) |
@@ -203,7 +203,9 @@ tkbox rm <box>
 ```
 
 Stops a running box, closes its Tracekit run, then deletes its state (disks, logs, the saved patch). Export the bundle
-first if you need it; the record itself stays in the signer.
+first if you need it; the record itself stays in the signer. While the box still has a decision in flight (an apply
+waiting for approval, say) it waits up to 10 s, then refuses and deletes nothing: `box demo still has 1 call in flight
+(an apply waiting for approval?); wait or answer it`.
 
 ## tkbox diff
 
@@ -234,15 +236,24 @@ stopped box, from the patch saved at stop, while the box's Tracekit run is open:
 `tkbox export` or `tkbox rm`, and not on a box from before a daemon restart. On a running box it is refused (`box demo
 is running`, hint ``stop the box first so the patch can't change under you: `tkbox stop demo` ``).
 
-- Every path is validated (relative, no `..`, no `.git`, inside `DIR`, no writes through symlinks). Copy and rename
-  sections are refused.
+- Every path is validated (relative, no `..`, no `.git` in any case or spelling a file system reads as `.git`, inside
+  `DIR`, no writes through symlinks). Copy and rename sections are refused, and so is a section whose old and new names
+  differ without a rename header (`git apply` would delete the old file). Every path `git apply` touches, old and new,
+  is decided.
 - Changes to files the checkout's `.gitignore` ignores are refused (ignored files never reach the box). New files the
   checkout ignores are left out of the apply and listed: `tkbox: left out 2 new files the checkout ignores
-  (.gitignore): …`.
-- Writes inside the checkout's `core.hooksPath` are refused.
-- Changes to `.gitignore`, `.gitattributes`, `.gitmodules`, `tkbox.yaml`, `tkbox.yml`, `.envrc` and
-  `.pre-commit-config.yaml` (in any directory), and to anything under `.husky/` or `.github/workflows/`, steer the next
-  run or host automation. They are refused unless you pass `--allow-sensitive`, and listed after a successful apply.
+  (.gitignore): …`. When the box's workspace was a git work tree and `DIR` is not one (or git fails there), the apply
+  is refused: what `DIR` ignores can't be checked.
+- Writes inside the checkout's git dir or hooks dir are refused. The hooks dir is the one git itself would use
+  (`git rev-parse --git-path hooks` with the repo's, global and system config, running no other program), compared
+  without regard to case.
+- Changes to `.gitignore`, `.gitattributes`, `.gitmodules`, `tkbox.yaml`, `tkbox.yml`, `.envrc`,
+  `.pre-commit-config.yaml`, `.gitlab-ci.yml`, `.yarnrc.yml` and `lefthook.yml` (in any directory), to
+  `.vscode/tasks.json` and `.cargo/config.toml`, to anything under `.husky/`, `.github/workflows/`, `.github/actions/`,
+  `.circleci/` or `.devcontainer/`, and to credential files (`.npmrc`, `.netrc`, `.pypirc`, `*.pem`, `*.key`, … the
+  files a workspace never copies into a box, see [limits.md](limits.md#behaviour)) steer the next run or host
+  automation. They are refused unless you pass `--allow-sensitive`, and listed after a successful apply.
+- Two applies of the same box run one after the other.
 - The signer decides every file as a `Write` with the arguments `{file_path, sha256, mode, symlink, deleted,
   patch_sha256}` (plus `sensitive: true` for the files above) before anything is written. If the signer denies any
   file, nothing is applied and the denied paths are listed (`tkbox: denied by the signer: <path>`). If the signer holds
@@ -250,6 +261,8 @@ is running`, hint ``stop the box first so the patch can't change under you: `tkb
 - `git apply --binary` runs with a fresh, empty bare git dir and with `GIT_CONFIG_GLOBAL=/dev/null`,
   `GIT_CONFIG_NOSYSTEM=1` and `GIT_ATTR_NOSYSTEM=1`, so neither the checkout's `.git/config` nor the host's global or
   system git config or attributes are read: no filter drivers, hooks or LFS run.
+  Once every file is decided it runs to the end (at most 2 minutes) even if the client goes away. If it fails after
+  writing some files, they are named (`git apply failed after writing 1 file: a.txt: …`).
 - Afterwards every written file is checked against what the signer decided; a file that differs is reported
   (`applied, but … differ from what was decided: …`).
 
@@ -265,7 +278,9 @@ tkbox export <box> -o FILE.tkb
 Closes the box's Tracekit run, waits until the run is final in the signer, then writes the bundle (`tracekit export
 --v2`) and the signer's trust file next to it: `run.tkb` gets `run.trust.json`. The box must be stopped, the output
 directory must exist, and an unrecorded box cannot be exported. After export, `tkbox apply` is refused. A box whose run
-was left open by a daemon that crashed cannot be exported (see [tkbox daemon](#tkbox-daemon)). It prints:
+was left open by a daemon that crashed cannot be exported (see [tkbox daemon](#tkbox-daemon)). While the box still has a
+decision in flight (an apply waiting for approval, say), export waits up to 10 s, then refuses without closing the run:
+`box demo still has 1 call in flight (an apply waiting for approval?); wait or answer it`. It prints:
 
 ```
 bundle: /path/run.tkb
@@ -284,7 +299,8 @@ Prints the box's events from `<state dir>/boxes/<id>/events.ndjson`, one line ea
 the raw NDJSON lines instead. `-f` keeps printing new events while the box is alive. On a terminal, control and bidi
 characters are escaped as in `tkbox diff`. The file is capped at 64 MiB: past that one `events.capped` line is written
 and egress and signer-problem lines are dropped, while lifecycle, exec, secret, approval, containment and apply lines are
-still written. This file is Box's local log; the signed record is the Tracekit run (see
+still written. At 256 MiB nothing more is written (beyond the box's own stop lines) and the box is stopped with the
+reason `events log over its hard cap`. This file is Box's local log; the signed record is the Tracekit run (see
 [limits.md](limits.md#commands-approvals-and-changes) for what happens when a record Box must keep cannot be sent to the
 signer).
 
@@ -308,9 +324,9 @@ tkbox reject <id>
 Box approvals are connections to hosts off a box's allowlist, held until a person on the host answers (2 minutes, the
 daemon's `--approval-timeout`, then refused). `tkbox approvals` lists them as `ID  BOX  KIND  TARGET  EXPIRES IN`, with
 ids like `apr-…` and targets like `https://example.com:443`; `--json` adds each approval's state and `waiters`, the
-connections waiting on it now. A box can have at most 16 pending approvals; a connection that would need another is
-refused at once. When the last connection waiting on an approval goes away, the approval is withdrawn (state
-`withdrawn`) and can no longer be approved. `approve` lets the waiting connections through; `--box` approves the host
+connections waiting on it now. A box can have at most 16 pending approvals, and may open at most 30 a minute; a
+connection that would need another is refused at once. When the last connection waiting on an approval goes away, the
+approval is withdrawn and dropped: it leaves the list and can no longer be approved. `approve` lets the waiting connections through; `--box` approves the host
 for the rest of the box's life. Each answer is recorded as `tkbox.approval` with who answered; an approval is recorded
 in the signer before any connection uses it, and one that cannot be recorded allows nothing.
 
@@ -342,8 +358,10 @@ env and limits. A `tkbox_run` call can only narrow those settings:
 - `image`: the config's `image` (the default) or one passed with `--image` (repeatable). With neither, `tkbox_run` is
   refused.
 - `workspace`: a directory inside a `--workspace-root DIR` (repeatable, symlinks resolved); without any
-  `--workspace-root`, only the config's own `workspace`.
-- `cpus`, `memory`, `timeout`: at most the config's values, when the config sets them.
+  `--workspace-root`, only the config's own `workspace`. The box gets the resolved path, the one that was checked.
+- `cpus`, `memory`, `timeout`: at most the config's values; a value the config leaves unset (or no `--config`) caps
+  at the daemon's default (2 cpus, 2GiB, 1h), never the maximum.
+- `tkbox_exec`'s `timeout`: at most the config's `exec_timeout` (default 30m).
 - `env`: refused. The box gets the config's `env` and `secrets`; a call can add to neither.
 
 A refused call says what it would have widened, with the hint ``an MCP client may only narrow what the operator set up

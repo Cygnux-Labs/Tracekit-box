@@ -103,6 +103,13 @@ func (d *Daemon) Apply(ctx context.Context, ref string, req api.ApplyRequest) (a
 	if err != nil {
 		return api.ApplyResult{}, err
 	}
+	// one apply of a box at a time: a second waits for the first (which may be waiting for an approval)
+	select {
+	case b.applySem <- struct{}{}:
+		defer func() { <-b.applySem }()
+	case <-ctx.Done():
+		return api.ApplyResult{}, errf(api.CodeCancelled, "", "gave up waiting for another apply of box %s to finish", ref)
+	}
 	b.calls.begin()
 	defer b.calls.end()
 	v := b.view()
@@ -180,8 +187,13 @@ func (d *Daemon) Apply(ctx context.Context, ref string, req api.ApplyRequest) (a
 	for _, f := range files {
 		all = append(all, f.Names...)
 	}
-	ignored, err := checkIgnored(ctx, dir, all)
+	ignored, err := checkIgnored(ctx, dir, all, workspaceWasGit(v))
 	if err != nil {
+		var ae *api.ErrorDetail
+		if errors.As(err, &ae) {
+			b.event(api.EventApplyDecided, "apply", "apply refused: "+ae.Message, map[string]any{"dir": dir})
+			return api.ApplyResult{}, ae
+		}
 		return api.ApplyResult{}, errf(api.CodeInternal, "check the checkout with `git status`; nothing was applied", "%v", err)
 	}
 	var kept []*patchFile
@@ -207,11 +219,13 @@ func (d *Daemon) Apply(ctx context.Context, ref string, req api.ApplyRequest) (a
 	if err != nil {
 		return api.ApplyResult{}, asAPIError(err)
 	}
-	if hooks := hooksPath(ctx, dir); hooks != "" {
-		for _, p := range paths {
-			if abs := filepath.Join(realDir, p); abs == hooks || strings.HasPrefix(abs, hooks+string(filepath.Separator)) {
-				return refuse("the patch writes %q, inside the checkout's git hooks dir (core.hooksPath %s)", p, hooks)
-			}
+	gitDir, hooks := gitDirs(ctx, dir)
+	for _, p := range paths {
+		if into := insideDir(realDir, p, hooks); into {
+			return refuse("the patch writes %q, inside the checkout's git hooks dir (%s)", p, hooks)
+		}
+		if into := insideDir(realDir, p, gitDir); into {
+			return refuse("the patch writes %q, inside the checkout's git dir (%s)", p, gitDir)
 		}
 	}
 	for _, p := range paths {
@@ -232,11 +246,20 @@ func (d *Daemon) Apply(ctx context.Context, ref string, req api.ApplyRequest) (a
 	}
 	sum := sha256.Sum256([]byte(filtered.String()))
 	res.SHA256 = hex.EncodeToString(sum[:])
-	applyPath := filepath.Join(b.dir, "apply.patch")
-	if err := os.WriteFile(applyPath, []byte(filtered.String()), 0o600); err != nil {
+	// each apply has its own copy of the patch it decides and applies
+	pf, err := os.CreateTemp(b.dir, ".apply-*.patch")
+	if err != nil {
 		return api.ApplyResult{}, asAPIError(err)
 	}
+	applyPath := pf.Name()
 	defer os.Remove(applyPath)
+	_, err = pf.WriteString(filtered.String())
+	if cerr := pf.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return api.ApplyResult{}, asAPIError(err)
+	}
 	want, out, err := previewApply(ctx, dir, b.dir, kept, paths, applyPath)
 	if err != nil {
 		b.event(api.EventApplyDecided, "apply", "apply refused: the patch does not apply: "+out, map[string]any{"dir": dir})
@@ -289,9 +312,29 @@ func (d *Daemon) Apply(ctx context.Context, ref string, req api.ApplyRequest) (a
 			map[string]any{"dir": dir, "paths": paths, "check": true, "sha256": res.SHA256})
 		return res, nil
 	}
-	if out, err := gitApply(ctx, dir, b.dir, applyPath); err != nil {
-		completeWrites(d, b, run, allowed, "error", map[string]any{"written": false, "error": out})
-		b.event(api.EventApplyDecided, "apply", "git apply failed: "+out, map[string]any{"dir": dir})
+	// once decided, the patch is applied whatever the client does: under the daemon's context (gitApply has its own
+	// timeout), not the request's
+	before := map[string]fileState{}
+	for _, p := range paths {
+		if st, err := statFile(filepath.Join(dir, p)); err == nil {
+			before[p] = st
+		}
+	}
+	if out, err := gitApply(d.ctx, dir, b.dir, applyPath); err != nil {
+		// git apply checks every hunk before it writes, but a failure while writing (a full disk, a permission) can
+		// leave some files written: say which
+		var written []string
+		for _, p := range paths {
+			if got, serr := statFile(filepath.Join(dir, p)); serr != nil || got != before[p] {
+				written = append(written, p)
+			}
+		}
+		completeWrites(d, b, run, allowed, "error", map[string]any{"written": len(written) > 0, "written_paths": written, "error": out})
+		b.event(api.EventApplyDecided, "apply", "git apply failed: "+out, map[string]any{"dir": dir, "written": written})
+		if len(written) > 0 {
+			return api.ApplyResult{}, errf(api.CodeConflict, "review the checkout with `git status` and `git diff` (the patch is at "+patchPath+")",
+				"git apply failed after writing %s: %s: %s", plural(len(written), "file"), strings.Join(written, ", "), firstLine(out, err))
+		}
 		return api.ApplyResult{}, errf(api.CodeConflict, "the checkout changed since the box started; nothing was applied (the patch is at "+patchPath+")",
 			"git apply failed: %s", firstLine(out, err))
 	}
@@ -503,15 +546,34 @@ func gitApply(ctx context.Context, dir, scratch, patchPath string) (string, erro
 }
 
 // checkIgnored reports which of paths the checkout at dir ignores (.gitignore, .git/info/exclude, the global
-// excludes file), as `git ls-files --exclude-standard` does when the workspace is built. A dir that is not a git work
-// tree ignores nothing.
-func checkIgnored(ctx context.Context, dir string, paths []string) (map[string]bool, error) {
+// excludes file), as `git ls-files --exclude-standard` does when the workspace is built. When the box's workspace was
+// not a git work tree nothing was left out of it, so nothing counts as ignored. Otherwise it fails closed: a dir
+// that is not a git work tree (or where git fails) can't say which files never reached the box, so the apply is
+// refused (an *api.ErrorDetail).
+func checkIgnored(ctx context.Context, dir string, paths []string, wsWasGit bool) (map[string]bool, error) {
 	out := map[string]bool{}
-	if len(paths) == 0 || !gitWorkTree(dir) {
+	if len(paths) == 0 || !wsWasGit {
 		return out, nil
 	}
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
+	rp := exec.CommandContext(cctx, "git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+		"rev-parse", "--is-inside-work-tree")
+	rp.Dir = dir
+	rp.Env = gitEnv(false)
+	var rpErr bytes.Buffer
+	rp.Stderr = &rpErr
+	if o, err := rp.Output(); err != nil || strings.TrimSpace(string(o)) != "true" {
+		why := strings.TrimSpace(rpErr.String())
+		if why == "" && err != nil {
+			why = err.Error()
+		}
+		if why == "" {
+			why = "not inside a work tree"
+		}
+		return nil, errf(api.CodeConflict, "apply to a git checkout (--dir), or fix git there (`git status`); nothing was applied",
+			"%s is not a git work tree (%s), but the box's workspace was one: which files git ignores there (and so never reached the box) can't be checked", dir, strings.SplitN(why, "\n", 2)[0])
+	}
 	cmd := exec.CommandContext(cctx, "git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
 		"check-ignore", "--stdin", "-z")
 	cmd.Dir = dir
@@ -535,38 +597,99 @@ func checkIgnored(ctx context.Context, dir string, paths []string) (map[string]b
 	return out, nil
 }
 
-// hooksPath is the checkout's core.hooksPath (its own config only), resolved against its top level; "" when unset.
-func hooksPath(ctx context.Context, dir string) string {
-	run := func(args ...string) string {
-		cmd := exec.CommandContext(ctx, "git", append([]string{"-c", "core.fsmonitor=false"}, args...)...)
-		cmd.Dir = dir
-		cmd.Env = gitEnv(true)
-		out, err := cmd.Output()
-		if err != nil {
+// gitDirs are the checkout's git dir and hooks dir as git itself resolves them: `git rev-parse --absolute-git-dir
+// --git-path hooks` with the real config (the repo's, global and system: core.hooksPath may be set in any), GIT_*
+// variables dropped and fsmonitor off (rev-parse runs no other program). Both are absolute, symlinks resolved where
+// they exist; "" when dir is not in a git repository.
+func gitDirs(ctx context.Context, dir string) (gitDir, hooks string) {
+	cctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "git", "-c", "core.fsmonitor=false", "rev-parse", "--path-format=absolute",
+		"--absolute-git-dir", "--git-path", "hooks")
+	cmd.Dir = dir
+	cmd.Env = gitEnv(false)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", ""
+	}
+	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	if len(lines) < 2 {
+		return "", ""
+	}
+	lines = lines[len(lines)-2:] // a git without --path-format echoes it first
+	abs := func(p string) string {
+		if p == "" {
 			return ""
 		}
-		return strings.TrimSpace(string(out))
+		if strings.HasPrefix(p, "~/") {
+			if home, err := os.UserHomeDir(); err == nil {
+				p = filepath.Join(home, p[2:])
+			}
+		}
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(dir, p) // --git-path answers relative to the command's dir
+		}
+		return resolveExisting(filepath.Clean(p))
 	}
-	hp := run("config", "--get", "core.hooksPath")
-	if hp == "" {
-		return ""
+	return abs(lines[0]), abs(lines[1])
+}
+
+// resolveExisting resolves the symlinks of p's longest existing ancestor (p itself may not exist yet).
+func resolveExisting(p string) string {
+	rest := ""
+	for cur := p; ; {
+		if r, err := filepath.EvalSymlinks(cur); err == nil {
+			return filepath.Join(r, rest)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return p
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
 	}
-	if strings.HasPrefix(hp, "~/") {
-		if home, err := os.UserHomeDir(); err == nil {
-			hp = filepath.Join(home, hp[2:])
+}
+
+// insideDir reports whether writing rel under root (symlinks resolved) lands in target or below it. It compares
+// case-insensitively, component by component (a case-insensitive file system writes GitHooks/x into githooks/), and,
+// where they exist, by identity (os.SameFile) of target and each existing parent of rel.
+func insideDir(root, rel, target string) bool {
+	if target == "" {
+		return false
+	}
+	abs := filepath.Join(root, filepath.FromSlash(rel))
+	if r, err := filepath.Rel(root, target); err == nil && r != ".." && !strings.HasPrefix(r, ".."+string(filepath.Separator)) {
+		tc := strings.Split(r, string(filepath.Separator))
+		pc := strings.Split(filepath.FromSlash(rel), string(filepath.Separator))
+		if r == "." {
+			return true
+		}
+		if len(pc) >= len(tc) {
+			match := true
+			for i := range tc {
+				if !strings.EqualFold(tc[i], pc[i]) {
+					match = false
+					break
+				}
+			}
+			if match {
+				return true
+			}
 		}
 	}
-	if !filepath.IsAbs(hp) {
-		top := run("rev-parse", "--show-toplevel")
-		if top == "" {
-			return ""
+	tfi, err := os.Stat(target)
+	if err != nil {
+		return false
+	}
+	for p := abs; ; {
+		if fi, err := os.Lstat(p); err == nil && os.SameFile(fi, tfi) {
+			return true
 		}
-		hp = filepath.Join(top, hp)
+		if p == root || len(p) <= len(root) {
+			return false
+		}
+		p = filepath.Dir(p)
 	}
-	if r, err := filepath.EvalSymlinks(hp); err == nil {
-		hp = r
-	}
-	return filepath.Clean(hp)
 }
 
 // Export writes the box's Tracekit bundle and trust file. Refused while the box is alive or when it was unrecorded.
@@ -603,6 +726,10 @@ func (d *Daemon) Export(ctx context.Context, ref string, req api.ExportRequest) 
 		return api.ExportResult{}, errf(api.CodeBadRequest, "create the directory first, or pass -o in an existing one", "the directory of %s does not exist", out)
 	}
 	if err := b.closeRun(ctx, "export"); err != nil {
+		var inflight errCallsInFlight
+		if errors.As(err, &inflight) {
+			return api.ExportResult{}, callsInFlightErr(ref, inflight.n)
+		}
 		return api.ExportResult{}, errf(api.CodeUnavailable, "check the signer (`tracekit status`) and export again",
 			"could not close the Tracekit run of box %s: %v", ref, err)
 	}

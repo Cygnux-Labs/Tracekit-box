@@ -155,6 +155,13 @@ var (
 	envTemplates       = map[string]bool{"example": true, "sample": true, "template": true, "dist": true}
 )
 
+// IsCredentialPath reports whether rel (a slash-separated path relative to a workspace) is a credential file or lies
+// in a credential dir: a file a workspace never copies into a box.
+func IsCredentialPath(rel string) bool {
+	comps := strings.Split(strings.Trim(rel, "/"), "/")
+	return len(comps) > 0 && comps[0] != "" && credentialPath(comps)
+}
+
 // credentialPath reports whether a workspace path is a credential file or lies in a credential dir.
 func credentialPath(comps []string) bool {
 	for i, c := range comps {

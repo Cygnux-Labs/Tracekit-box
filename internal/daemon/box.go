@@ -63,7 +63,9 @@ type box struct {
 	signerTrouble bool
 	failedClosed  bool // a must-record observe was lost: the box is being stopped
 	tearingDown   bool
-	persistMu     sync.Mutex // one box.json writer at a time
+	persistMu     sync.Mutex    // one box.json writer at a time
+	applySem      chan struct{} // one apply at a time (cap 1)
+	approvalTimes []time.Time   // when this box's recent approvals were opened (guarded by Daemon.mu)
 
 	scrubP   atomic.Pointer[scrubber]
 	events   *eventLog
@@ -79,8 +81,12 @@ type box struct {
 func newBox(d *Daemon, info api.Box, dir string, cid uint32) *box {
 	b := &box{d: d, id: info.ID, dir: dir, cid: cid, info: info, approvedHosts: map[string]bool{},
 		sessions: map[*execSession]struct{}{}, events: openEventLog(dir), stopCh: make(chan struct{}),
-		done: make(chan struct{}), pollNow: make(chan chan struct{})}
+		done: make(chan struct{}), pollNow: make(chan chan struct{}), applySem: make(chan struct{}, 1)}
 	b.scrubP.Store(&scrubber{})
+	b.events.onHardCap = func() {
+		b.d.log.Printf("%s: events.ndjson reached its hard cap of %d MiB: stopping the box", b.id, b.events.hardMax>>20)
+		b.stop(context.Background(), eventLogHardCapReason, false)
+	}
 	return b
 }
 
@@ -169,7 +175,7 @@ func (d *Daemon) Create(ctx context.Context, req api.CreateBoxRequest) (api.Box,
 	s.blockPrefixes = prefixes
 	var notices []string
 	if ws := s.req.Workspace; ws != "" && !gitWorkTree(ws) {
-		notices = append(notices, ws+" is not a git work tree: copying every file except credential files")
+		notices = append(notices, ws+notGitNotice)
 	}
 	if req.ValidateOnly {
 		names := make([]string, 0, len(s.secrets))
@@ -291,6 +297,24 @@ type guestError struct {
 }
 
 func (e *guestError) Error() string { return e.msg }
+
+// notGitNotice follows the workspace path in the notice of a box whose workspace was not a git work tree (so nothing
+// was left out of it as git-ignored; apply relies on it, see checkIgnored).
+const notGitNotice = " is not a git work tree: copying every file except credential files"
+
+// workspaceWasGit reports whether the box's workspace was a git work tree when it was created: false for a box
+// without a workspace (an empty one) or with the not-a-git-work-tree notice.
+func workspaceWasGit(v api.Box) bool {
+	if v.Workspace == "" {
+		return false
+	}
+	for _, n := range v.Notices {
+		if n == v.Workspace+notGitNotice {
+			return false
+		}
+	}
+	return true
+}
 
 // gitWorkTree reports whether dir is inside a git work tree (git's own config and hooks stay out of it).
 func gitWorkTree(dir string) bool {
@@ -953,13 +977,29 @@ func (b *box) teardown(ctx context.Context, reason, detail string, kill, failed 
 		b.diffNotSaved("the box failed (" + reason + "), so its workspace diff was not saved")
 	}
 	if run != nil {
-		fctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		b.flushObserver(fctx)
+		fctx, cancel := context.WithTimeout(context.Background(), observerFlushWait)
+		stopped := b.flushObserver(fctx)
 		cancel()
-		// must-record observes that never reached the signer are recorded as a gap; if even that fails the run is
-		// closed now with what was lost as its reason (no apply can then be recorded as if nothing was missing)
+		// must-record observes that never reached the signer are recorded as a gap; if even that fails, or the
+		// observer never stopped counting (so the gap may not cover everything), the run is closed now with what was
+		// lost as its reason (no apply or export can then go on as if nothing was missing)
 		fctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
 		lostReason := b.recordGaps(fctx, run)
+		if !stopped {
+			why := fmt.Sprintf("records lost: the observer did not stop within %s of giving up on the signer, so the tkbox.gap record may not count every lost record", observerStopWait)
+			if n := b.lostSince(); n > 0 {
+				why += fmt.Sprintf(" (%d more were lost after it was written)", n)
+			}
+			if lostReason != "" {
+				lostReason += "; "
+			}
+			lostReason += why
+		} else if n := b.lostSince(); n > 0 {
+			if lostReason != "" {
+				lostReason += "; "
+			}
+			lostReason += fmt.Sprintf("records lost: %d records were lost after the tkbox.gap record was written", n)
+		}
 		event := "stopped"
 		if failed {
 			event = "failed"
@@ -1014,13 +1054,24 @@ func (b *box) teardown(ctx context.Context, reason, detail string, kill, failed 
 	b.closeDone()
 }
 
-// runCloseWait bounds how long closing a run waits for the box's in-flight gated calls to complete.
+// runCloseWait bounds how long closing a run (daemon shutdown, a failed or quarantined box) waits for the box's
+// in-flight gated calls to complete before it closes the run anyway.
 var runCloseWait = 15 * time.Second
 
+// inFlightGrace is how long export and rm wait for in-flight calls (an exec completing as its box stopped) before
+// they refuse.
+var inFlightGrace = 10 * time.Second
+
+// errCallsInFlight is closeRun's refusal for export and rm while gated calls are in flight.
+type errCallsInFlight struct{ n int }
+
+func (e errCallsInFlight) Error() string { return fmt.Sprintf("%d calls in flight", e.n) }
+
 // closeRun closes the box's Tracekit run once, with the reason the box stopped, after the box's in-flight gated
-// calls (exec, egress, apply) completed (at most runCloseWait). A stopped box keeps its run open so `tkbox apply`
-// records its Write decisions in the same run (one bundle per job); export, rm and daemon shutdown close it. by says
-// who closed it ("export", "failed", "quarantine", "shutdown", "rm").
+// calls (exec, egress, apply) completed. A stopped box keeps its run open so `tkbox apply` records its Write decisions
+// in the same run (one bundle per job); export, rm and daemon shutdown close it. by says who closed it ("export",
+// "failed", "quarantine", "shutdown", "rm"). Export and rm never close the run under in-flight calls (an apply waiting
+// for an approval): after inFlightGrace they return errCallsInFlight. Everyone else waits at most runCloseWait.
 func (b *box) closeRun(ctx context.Context, by string) error {
 	b.mu.Lock()
 	run := b.run
@@ -1029,7 +1080,11 @@ func (b *box) closeRun(ctx context.Context, by string) error {
 		return nil
 	}
 	b.mu.Unlock()
-	if !b.calls.wait(runCloseWait) {
+	if by == "export" || by == "rm" {
+		if !b.calls.wait(inFlightGrace) {
+			return errCallsInFlight{b.calls.inFlight()}
+		}
+	} else if !b.calls.wait(runCloseWait) {
 		b.event(api.EventSignerProblem, "lifecycle", fmt.Sprintf("closing the Tracekit run while gated calls are still in flight (they did not finish within %s)", runCloseWait), nil)
 	}
 	b.mu.Lock()
@@ -1054,6 +1109,12 @@ func (b *box) closeRun(ctx context.Context, by string) error {
 	b.mu.Unlock()
 	b.persist()
 	return nil
+}
+
+// callsInFlightErr is export's and rm's refusal while the box still has gated calls in flight.
+func callsInFlightErr(ref string, n int) *api.ErrorDetail {
+	return errf(api.CodeConflict, "wait for it to finish, or answer the pending approval (`tracekit approvals`), then try again",
+		"box %s still has %s in flight (an apply waiting for approval?); wait or answer it", ref, plural(n, "call"))
 }
 
 // Stop stops a box (see box.stop) and returns it.
@@ -1084,6 +1145,10 @@ func (d *Daemon) Remove(ctx context.Context, ref string) error {
 		return errf(api.CodeConflict, "try again, or `tkbox stop --kill "+ref+"`", "box %s is still going down", ref)
 	}
 	if err := b.closeRun(ctx, "rm"); err != nil {
+		var inflight errCallsInFlight
+		if errors.As(err, &inflight) {
+			return callsInFlightErr(ref, inflight.n)
+		}
 		return errf(api.CodeUnavailable, "check the signer (`tracekit status`) and run `tkbox rm "+ref+"` again",
 			"could not close the Tracekit run of box %s: %v", ref, err)
 	}

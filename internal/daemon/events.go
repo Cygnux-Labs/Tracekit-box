@@ -24,6 +24,15 @@ const maxEventLog = 64 << 20
 // EventLogCapped is the kind of the one line written when events.ndjson reaches maxEventLog.
 const eventLogCapped = "events.capped"
 
+// maxEventLogHard caps events.ndjson as a whole: past it no line is written except what stopping the box writes
+// (at most eventLogReserve more), and the box is stopped ("events log over its hard cap"). A var for tests.
+var maxEventLogHard int64 = 256 << 20
+
+const eventLogReserve = 1 << 20
+
+// eventLogHardCapReason is the stop reason of a box whose events.ndjson reached maxEventLogHard.
+const eventLogHardCapReason = "events log over its hard cap"
+
 // bulkEventKinds are the event kinds a guest can produce at will; they are the first to go when a cap is reached.
 var bulkEventKinds = map[string]bool{api.EventEgressAllowed: true, api.EventEgressDenied: true,
 	api.EventEgressClosed: true, api.EventSignerProblem: true}
@@ -40,10 +49,13 @@ type eventLog struct {
 	transient bool          // the box is down: open the file per write instead of holding it
 	notify    chan struct{} // closed and replaced on every write (followers wait on it)
 	max       int64
+	hardMax   int64
+	hardHit   bool   // hardMax reached: only the reserve is left
+	onHardCap func() // called once (on its own goroutine) when hardMax is reached
 }
 
 func openEventLog(dir string) *eventLog {
-	return &eventLog{path: filepath.Join(dir, "events.ndjson"), notify: make(chan struct{}), max: maxEventLog}
+	return &eventLog{path: filepath.Join(dir, "events.ndjson"), notify: make(chan struct{}), max: maxEventLog, hardMax: maxEventLogHard}
 }
 
 func (l *eventLog) write(e api.Event) error {
@@ -70,7 +82,21 @@ func (l *eventLog) write(e api.Event) error {
 	if l.transient {
 		defer func() { l.f.Close(); l.f = nil }()
 	}
-	if l.size+int64(len(b)) > l.max && bulkEventKinds[e.Kind] {
+	if l.hardMax > 0 && l.size+int64(len(b)) > l.hardMax {
+		if l.hardHit {
+			if bulkEventKinds[e.Kind] || l.size+int64(len(b)) > l.hardMax+eventLogReserve {
+				return nil // the reserve is for the box's stop lines
+			}
+		} else {
+			l.hardHit = true
+			capLine, _ := json.Marshal(api.Event{Time: e.Time, BoxID: e.BoxID, Kind: eventLogCapped, Door: "lifecycle",
+				Summary: fmt.Sprintf("events.ndjson reached its hard cap of %d MiB: no more lines are written and the box is stopped", l.hardMax>>20)})
+			b = append(capLine, '\n')
+			if l.onHardCap != nil {
+				go l.onHardCap()
+			}
+		}
+	} else if l.size+int64(len(b)) > l.max && bulkEventKinds[e.Kind] {
 		if l.capped {
 			return nil
 		}
@@ -462,9 +488,16 @@ func (b *box) recordGaps(ctx context.Context, run tracekit.Run) string {
 	return "records lost and the loss could not be recorded: " + strings.Join(unrecorded, "; ")
 }
 
-// flushObserver stops taking observes and waits until the queued ones reached the signer, or ctx ends (then the rest
-// is dropped and the observer stops at once).
-func (b *box) flushObserver(ctx context.Context) {
+// observerFlushWait bounds how long a stopping box waits for the signer to take the observes still queued.
+var observerFlushWait = 30 * time.Second
+
+// observerStopWait bounds how long a flush that gave up waits for the observer to stop counting what it drops.
+var observerStopWait = 5 * time.Second
+
+// flushObserver stops taking observes and waits until the queued ones reached the signer, or ctx ends: then the rest
+// is dropped (each one counted for the tkbox.gap record) and it waits, at most observerStopWait, for the observer to
+// stop. It reports whether the observer stopped: only then is every loss counted.
+func (b *box) flushObserver(ctx context.Context) bool {
 	b.mu.Lock()
 	o := b.obs
 	already := b.obsClosed
@@ -474,12 +507,35 @@ func (b *box) flushObserver(ctx context.Context) {
 	}
 	b.mu.Unlock()
 	if o == nil {
-		return
+		return true
 	}
 	select {
 	case <-o.done:
+		return true
 	case <-ctx.Done():
-		o.cancel()
-		b.event(api.EventSignerProblem, "lifecycle", "the signer did not take the last records in time; they were dropped", nil)
 	}
+	o.cancel()
+	b.event(api.EventSignerProblem, "lifecycle", "the signer did not take the last records in time; they were dropped", nil)
+	t := time.NewTimer(observerStopWait)
+	defer t.Stop()
+	select {
+	case <-o.done:
+		return true
+	case <-t.C:
+		b.event(api.EventSignerProblem, "lifecycle", fmt.Sprintf("the observer did not stop within %s of giving up on the signer: how many records were lost is not known", observerStopWait), nil)
+		return false
+	}
+}
+
+// lostSince counts the must-record observes lost since recordGaps took the gaps (the observer was still running).
+func (b *box) lostSince() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := 0
+	if b.obs != nil {
+		for _, g := range b.obs.gaps {
+			n += g.dropped
+		}
+	}
+	return n
 }

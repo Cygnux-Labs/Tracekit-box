@@ -318,7 +318,9 @@ func TestExecUnreadStdin(t *testing.T) {
 		sigs <- "SIGINT"
 		select {
 		case err := <-done:
-			if err != nil || es.Signal != "SIGINT" {
+			// the guest's reader may be held (up to stdinStall) behind the full stdin queue: by then the child that
+			// took none of its stdin is killed for it (StdinTruncated) instead; either way it never runs on
+			if err != nil || (es.Signal != "SIGINT" && !(es.Signal == "SIGKILL" && es.StdinTruncated)) {
 				t.Fatalf("%+v %v", *es, err)
 			}
 		case <-time.After(6 * time.Second):
@@ -343,6 +345,22 @@ func TestExecUnreadStdin(t *testing.T) {
 		waitGone(t, pid, 6*time.Second)
 		t.Logf("killed %s after the host closed", time.Since(start).Round(time.Millisecond))
 	})
+}
+
+// N3: a child that takes none of its stdin for stdinStall while the guest's queue is full is never handed a false
+// EOF (it would finish as if it had read everything and exit 0): it is killed and the exit status says stdin was
+// dropped.
+func TestExecStdinNotConsumedIsNotEOF(t *testing.T) {
+	f := newFixture(t, proto.GuestLimits{})
+	var out bytes.Buffer
+	es, err := f.c.Exec(ctxT(t, 30*time.Second), proto.ExecRequest{Argv: []string{"sh", "-c", "sleep 4; cat >/dev/null; echo read-it-all"}},
+		agentrpc.ExecIO{Stdin: bytes.NewReader(make([]byte, 3<<20)), Stdout: &out})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !es.StdinTruncated || es.StdinDroppedBytes <= 0 || es.Signal != "SIGKILL" || es.Code == 0 || strings.Contains(out.String(), "read-it-all") {
+		t.Fatalf("a stalled stdin must stop the command, not fake EOF: %+v, stdout %q", es, out.String())
+	}
 }
 
 // TestExecSlowStdinReader: a child that takes its stdin late still gets every byte (the guest holds the host back
