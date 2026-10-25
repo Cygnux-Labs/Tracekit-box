@@ -72,6 +72,13 @@ func (b *builder) copyWorkspace(ctx context.Context, src, staging string) (Works
 		return Workspace{}, nil, err
 	}
 	var ws Workspace
+	var skipped []string // credential files left out
+	defer func() {
+		if len(skipped) > 0 {
+			b.logf("tkbox: workspace %s: left out %d credential file(s) the box must not see: %s", src, len(skipped),
+				strings.Join(skipped[:min(len(skipped), 5)], ", "))
+		}
+	}()
 	entries := 0 // files and symlinks, for the cap
 	meta := map[string]entryMeta{}
 	for _, name := range names {
@@ -80,6 +87,10 @@ func (b *builder) copyWorkspace(ctx context.Context, src, staging string) (Works
 		}
 		comps, ok := workspaceComps(name)
 		if !ok {
+			continue
+		}
+		if credentialPath(comps) {
+			skipped = append(skipped, strings.Join(comps, "/"))
 			continue
 		}
 		fi, ok, err := lstatNoFollow(src, comps)
@@ -131,6 +142,47 @@ func (b *builder) copyWorkspace(ctx context.Context, src, staging string) (Works
 		meta[rel] = entryMeta{mode: uint32(fi.Mode().Perm()) | 0o400}
 	}
 	return ws, meta, nil
+}
+
+// Credential files never enter a workspace, git-ignored or not: an apply that edits .gitignore must not be able to
+// pull them into the next box. Names are compared case-insensitively.
+var (
+	credentialDirs  = map[string]bool{".ssh": true, ".aws": true, ".gnupg": true, ".kube": true, ".docker": true, ".azure": true}
+	credentialNames = map[string]bool{".netrc": true, "_netrc": true, ".npmrc": true, ".pypirc": true,
+		".git-credentials": true, ".pgpass": true, ".htpasswd": true, ".dockercfg": true}
+	credentialPrefixes = []string{"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
+	credentialSuffixes = []string{".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".tfstate", ".tfstate.backup", ".tfvars"}
+	envTemplates       = map[string]bool{"example": true, "sample": true, "template": true, "dist": true}
+)
+
+// credentialPath reports whether a workspace path is a credential file or lies in a credential dir.
+func credentialPath(comps []string) bool {
+	for i, c := range comps {
+		lc := strings.ToLower(c)
+		if i < len(comps)-1 {
+			if credentialDirs[lc] || (lc == ".config" && strings.EqualFold(comps[i+1], "gcloud")) {
+				return true
+			}
+			continue
+		}
+		if credentialDirs[lc] || credentialNames[lc] {
+			return true
+		}
+		if lc == ".env" || (strings.HasPrefix(lc, ".env.") && !envTemplates[strings.TrimPrefix(lc, ".env.")]) {
+			return true
+		}
+		for _, p := range credentialPrefixes {
+			if strings.HasPrefix(lc, p) {
+				return true
+			}
+		}
+		for _, sfx := range credentialSuffixes {
+			if strings.HasSuffix(lc, sfx) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // workspaceComps splits a listed name, dropping anything absolute, with "..", or with a .git component.

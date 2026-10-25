@@ -179,3 +179,18 @@ func TestWorkspaceExt4(t *testing.T) {
 		t.Errorf("leftovers: %v", left)
 	}
 }
+
+func TestCredentialPath(t *testing.T) {
+	for name, want := range map[string]bool{
+		".env": true, "app/.env.local": true, ".ENV.production": true, ".env.example": false, "config/.env.sample": false,
+		"deploy/key.pem": true, "certs/server.KEY": true, "home/.ssh/config": true, ".aws/credentials": true,
+		".config/gcloud/creds.db": true, ".npmrc": true, "sub/.git-credentials": true, "id_ed25519.pub": true,
+		"infra/prod.tfstate": true, "infra/main.tf": false, "src/keyboard.go": false, "README.md": false,
+		".docker/config.json": true, "docs/environment.md": false,
+	} {
+		comps, _ := workspaceComps(name)
+		if got := credentialPath(comps); got != want {
+			t.Errorf("credentialPath(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
