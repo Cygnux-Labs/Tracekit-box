@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
+	"github.com/Cygnux-Labs/tracekit-box/internal/image"
 	"github.com/Cygnux-Labs/tracekit-box/internal/proto"
 )
 
@@ -372,11 +373,25 @@ func checkRelPath(p string) error {
 		if c == ".." || c == "." {
 			return fmt.Errorf("%q leaves the checkout", p)
 		}
-		if strings.EqualFold(strings.TrimRight(c, ". "), ".git") {
+		if gitLike(c) {
 			return fmt.Errorf("%q touches .git", p)
 		}
 	}
 	return nil
+}
+
+// gitLike reports whether a path component is, or on some file system resolves to, .git: any case, trailing dots and
+// spaces (NTFS), code points HFS+ ignores when it compares names, and the NTFS short name GIT~1.
+func gitLike(c string) bool {
+	c = strings.Map(func(r rune) rune {
+		switch {
+		case r == 0x200b, r >= 0x200c && r <= 0x200f, r >= 0x202a && r <= 0x202e, r >= 0x206a && r <= 0x206f, r == 0xfeff:
+			return -1
+		}
+		return r
+	}, c)
+	c = strings.TrimRight(c, ". ")
+	return strings.EqualFold(c, ".git") || strings.EqualFold(c, "git~1")
 }
 
 // checkPatch validates every path of a parsed patch against dir and returns the paths it writes (sorted, unique).
@@ -393,11 +408,18 @@ func checkPatch(files []*patchFile, dir string) ([]string, []string) {
 		if len(problems) > 0 {
 			continue
 		}
+		// a section that names two different files without saying it renames or copies one is read by git apply as
+		// a rename: the old file would be deleted with no decision about it
+		if f.Old != "" && f.New != "" && f.Old != f.New && !f.Rename && !f.Copy {
+			problems = append(problems, fmt.Sprintf("a section changes %q into %q without a rename or copy header (git apply would delete %q); a box never makes such patches", f.Old, f.New, f.Old))
+			continue
+		}
+		// every path git apply touches is a target: the new path, and the old one unless it is only read (copy)
 		targets := []string{}
 		if f.New != "" {
 			targets = append(targets, f.New)
 		}
-		if f.Old != "" && (f.Deleted || f.Rename) {
+		if f.Old != "" && !f.Copy {
 			targets = append(targets, f.Old)
 		}
 		for _, t := range targets {
@@ -488,7 +510,7 @@ func checkSymlink(f *patchFile, dir string) error {
 		return fmt.Errorf("%q: symlink %q points outside the checkout", f.New, target)
 	}
 	for _, c := range strings.Split(resolved, "/") {
-		if strings.EqualFold(strings.TrimRight(c, ". "), ".git") {
+		if gitLike(c) {
 			return fmt.Errorf("%q: symlink %q points into .git", f.New, target)
 		}
 	}
@@ -528,21 +550,38 @@ func summarize(patch []byte) api.DiffSummary {
 }
 
 // isSensitive reports whether a path steers the next run or host automation: git's own trust inputs (.gitignore,
-// .gitattributes, .gitmodules), tkbox.yaml, and files tools run on the host (.husky/, .github/workflows/, .envrc,
-// .pre-commit-config.yaml). Case-insensitive, at any depth.
+// .gitattributes, .gitmodules), tkbox.yaml, files tools run on the host (.husky/, .github/workflows/,
+// .github/actions/, .circleci/, .devcontainer/, .gitlab-ci.yml, .envrc, .pre-commit-config.yaml, lefthook.yml,
+// .vscode/tasks.json, .cargo/config.toml, .yarnrc.yml), and credential files (.npmrc, .netrc, *.pem, *.key, …: the
+// ones a workspace never copies into a box). Case-insensitive, at any depth.
 func isSensitive(p string) bool {
+	if image.IsCredentialPath(p) {
+		return true
+	}
 	lower := strings.ToLower(p)
 	switch path.Base(lower) {
-	case ".gitignore", ".gitattributes", ".gitmodules", "tkbox.yaml", "tkbox.yml", ".envrc", ".pre-commit-config.yaml":
+	case ".gitignore", ".gitattributes", ".gitmodules", "tkbox.yaml", "tkbox.yml", ".envrc", ".pre-commit-config.yaml",
+		".pre-commit-config.yml", ".gitlab-ci.yml", ".gitlab-ci.yaml", ".yarnrc.yml", ".yarnrc.yaml", ".yarnrc",
+		"lefthook.yml", "lefthook.yaml", ".lefthook.yml", ".lefthook.yaml", "lefthook-local.yml", "lefthook-local.yaml":
 		return true
 	}
 	comps := strings.Split(lower, "/")
 	for i, c := range comps[:len(comps)-1] {
-		if c == ".husky" {
+		switch c {
+		case ".husky", ".circleci", ".devcontainer":
 			return true
 		}
-		if c == ".github" && i+1 < len(comps)-1 && comps[i+1] == "workflows" {
+		next := comps[i+1]
+		if c == ".github" && i+1 < len(comps)-1 && (next == "workflows" || next == "actions") {
 			return true
+		}
+		if i+1 == len(comps)-1 {
+			if c == ".vscode" && next == "tasks.json" {
+				return true
+			}
+			if c == ".cargo" && (next == "config.toml" || next == "config") {
+				return true
+			}
 		}
 	}
 	return false

@@ -180,6 +180,50 @@ func TestWorkspaceExt4(t *testing.T) {
 	}
 }
 
+// S5: credential files stay out of a workspace even when git does not ignore them (tracked or untracked) and when the
+// dir is not a git work tree at all: an apply that edits .gitignore can't pull them into the next box.
+func TestCredentialFilesSkippedUnlessIgnored(t *testing.T) {
+	creds := map[string]string{".npmrc": "//registry/:_authToken=x", ".netrc": "machine m", ".pypirc": "[pypi]",
+		"deploy/key.pem": "pem", "certs/server.key": "key", ".ssh/id_rsa": "rsa", ".aws/credentials": "aws", "id_ed25519": "k"}
+	files := map[string]string{"src/main.go": "package main"}
+	for k, v := range creds {
+		files[k] = v
+	}
+	check := func(t *testing.T, dir string) {
+		t.Helper()
+		b := newTestBuilder(t, nil, nil)
+		staging := t.TempDir()
+		if _, _, err := b.copyWorkspace(t.Context(), dir, staging); err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(stagedNames(t, staging), ","); got != "src/main.go" {
+			t.Errorf("staged %s, want only src/main.go", got)
+		}
+	}
+	t.Run("outside git", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFiles(t, dir, files)
+		if inGitWorkTree(dir) {
+			t.Skip("the temp dir is inside a git work tree")
+		}
+		check(t, dir)
+	})
+	t.Run("git, not ignored", func(t *testing.T) {
+		if _, err := exec.LookPath("git"); err != nil {
+			t.Skip("needs git")
+		}
+		dir := t.TempDir()
+		writeFiles(t, dir, files)
+		for _, args := range [][]string{{"init", "-q"}, {"add", "-A"}, // tracked, and nothing is ignored
+			{"-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "-m", "init"}} {
+			if out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput(); err != nil {
+				t.Fatalf("git %v: %v\n%s", args, err, out)
+			}
+		}
+		check(t, dir)
+	})
+}
+
 func TestCredentialPath(t *testing.T) {
 	for name, want := range map[string]bool{
 		".env": true, "app/.env.local": true, ".ENV.production": true, ".env.example": false, "config/.env.sample": false,

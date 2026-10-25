@@ -68,6 +68,11 @@ type ExitStatus struct {
 	TimedOut   bool   `json:"timed_out,omitempty"`   // killed because TimeoutMS passed
 	DurationMS int64  `json:"duration_ms,omitempty"` // wall time of the process
 	Truncated  bool   `json:"truncated,omitempty"`   // output beyond BootConfig.Limits.MaxOutputBytes was dropped
+	// StdinTruncated: stdin was dropped because the process did not take it fast enough (the guest's queue stayed
+	// full, or the daemon's buffer overflowed), so the process group was killed (SIGKILL) rather than given a false
+	// EOF. StdinDroppedBytes is how much was dropped (at least).
+	StdinTruncated    bool  `json:"stdin_truncated,omitempty"`
+	StdinDroppedBytes int64 `json:"stdin_dropped_bytes,omitempty"`
 }
 
 // Signal asks the guest to deliver a signal to a running exec's process group.

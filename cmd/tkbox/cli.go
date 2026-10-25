@@ -262,8 +262,14 @@ func cmdExec(args []string, env *cliEnv) int {
 	return execExitCode(st, err, env)
 }
 
+// stdinTruncatedMsg is what tkbox says when a command was stopped because it did not take its stdin.
+func stdinTruncatedMsg(st proto.ExitStatus) string {
+	return fmt.Sprintf("tkbox: stdin was not consumed fast enough (%d bytes dropped); the command was stopped: write large input to a file in /workspace and read it from there", st.StdinDroppedBytes)
+}
+
 // execExitCode maps an exec outcome to tkbox exec's exit code: the process's own, 128+n when a signal killed it,
-// 124 timed out, 126 denied, 127 not found, 125 a tkbox error (including a command cancelled before it started).
+// 124 timed out, 126 denied, 127 not found, 125 a tkbox error (including a command cancelled before it started, and
+// one stopped because it did not take its stdin fast enough).
 func execExitCode(st proto.ExitStatus, err error, env *cliEnv) int {
 	if err != nil {
 		printErr(env.stderr, err)
@@ -284,6 +290,9 @@ func execExitCode(st proto.ExitStatus, err error, env *cliEnv) int {
 		fmt.Fprintf(env.stderr, "tkbox: output past %d MiB was dropped; write large output to a file and read the part you need\n", proto.DefaultMaxOutputBytes>>20)
 	}
 	switch {
+	case st.StdinTruncated:
+		fmt.Fprintln(env.stderr, stdinTruncatedMsg(st))
+		return exitTkbox
 	case st.TimedOut:
 		fmt.Fprintln(env.stderr, "tkbox: the command was killed by its exec timeout; pass a longer --timeout (up to 24h) or set limits.exec_timeout")
 		return exitTimedOut

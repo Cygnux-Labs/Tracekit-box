@@ -22,8 +22,8 @@ import (
 
 const (
 	// maxStdinBuffer is how much stdin the daemon holds for a process that has not read it yet. The frame reader
-	// never blocks on stdin (signals and a closed connection must get through); past this the process's stdin is
-	// closed and the rest dropped, with a notice.
+	// never blocks on stdin (signals and a closed connection must get through); past this the rest is dropped and the
+	// process killed (never handed a false EOF): its exit status says so (StdinTruncated).
 	maxStdinBuffer = 4 << 20
 	// clientWriteGrace is how long a client may take to read the last frames once the exec is cancelled or the box
 	// stops; a client that stalls longer is cut off so the exec can finish and be completed.
@@ -133,7 +133,9 @@ type stdinQueue struct {
 	max      int
 	closed   bool
 	err      error
-	overflow bool
+	overflow bool  // more than max waited: the rest is dropped, and Read never reports EOF (the process is killed)
+	dropped  int64 // bytes dropped since the overflow
+	ended    bool  // the exec is over
 }
 
 func newStdinQueue(max int) *stdinQueue {
@@ -142,21 +144,34 @@ func newStdinQueue(max int) *stdinQueue {
 	return q
 }
 
-// write queues p; it reports false the first time the queue overflows (stdin is then closed after what is queued).
+// write queues p; it reports false the first time the queue overflows. From then on every byte is dropped (counted)
+// and no EOF is ever delivered: the caller kills the process instead.
 func (q *stdinQueue) write(p []byte) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.overflow {
+		q.dropped += int64(len(p))
+		return true
+	}
 	if q.closed {
 		return true
 	}
 	if q.buf.Len()+len(p) > q.max {
-		q.overflow, q.closed = true, true
+		q.overflow = true
+		q.dropped += int64(len(p))
 		q.cond.Broadcast()
 		return false
 	}
 	q.buf.Write(p)
 	q.cond.Broadcast()
 	return true
+}
+
+// truncated reports whether stdin overflowed and how many bytes were dropped.
+func (q *stdinQueue) truncated() (bool, int64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.overflow, q.dropped
 }
 
 func (q *stdinQueue) closeWith(err error) {
@@ -168,10 +183,19 @@ func (q *stdinQueue) closeWith(err error) {
 	q.cond.Broadcast()
 }
 
+// end is called once the exec is over: a Read still waiting returns.
+func (q *stdinQueue) end() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.ended, q.closed = true, true
+	q.cond.Broadcast()
+}
+
 func (q *stdinQueue) Read(p []byte) (int, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	for q.buf.Len() == 0 && !q.closed {
+	// after an overflow no EOF is delivered while the exec runs: the process is being killed
+	for q.buf.Len() == 0 && (!q.closed || q.overflow) && !q.ended {
 		q.cond.Wait()
 	}
 	if q.buf.Len() == 0 {
@@ -275,7 +299,7 @@ func (b *box) runExec(parent context.Context, conn net.Conn, r io.Reader, w io.W
 	// client → daemon: stdin, stdin EOF, signals. This loop never blocks, so a signal or a closed connection is
 	// seen at once whatever the process does with its stdin.
 	stdin := newStdinQueue(maxStdinBuffer)
-	defer stdin.closeWith(io.EOF)
+	defer stdin.end()
 	go func() {
 		for {
 			f, err := proto.ReadFrame(r)
@@ -287,10 +311,24 @@ func (b *box) runExec(parent context.Context, conn net.Conn, r io.Reader, w io.W
 			switch f.Type {
 			case proto.TypeStdin:
 				if req.Stdin && !stdin.write(f.Payload) {
+					// the process can't get its whole input; a false EOF would let it finish as if it had: it is
+					// stopped instead (not started at all if it has not started yet)
+					if !sess.started.Load() {
+						dcancel()
+						if !sess.started.Load() {
+							continue
+						}
+					}
 					select {
-					case sess.notices <- fmt.Sprintf("stdin: more than %d MiB waited for the process to read it; its stdin was closed and the rest dropped (write large input to a file in /workspace instead)", maxStdinBuffer>>20):
+					case sess.notices <- fmt.Sprintf("stdin: more than %d MiB waited for the process to read it; the rest is dropped and the command is being stopped", maxStdinBuffer>>20):
 					default:
 					}
+					go func() {
+						select {
+						case sess.sigs <- "SIGKILL":
+						case <-sess.execDone:
+						}
+					}()
 				}
 			case proto.TypeStdinEOF:
 				stdin.closeWith(nil)
@@ -320,6 +358,14 @@ func (b *box) runExec(parent context.Context, conn net.Conn, r io.Reader, w io.W
 	}
 	line := tracekit.ShellQuote(req.Argv)
 	cancelled := func() {
+		if over, n := stdin.truncated(); over {
+			b.event(api.EventExecDecided, "exec", "exec not started, stdin overflowed before it started: "+line,
+				map[string]any{"command": line, "decision": "cancelled", "stdin_dropped_bytes": n})
+			final(proto.TypeError, api.ErrorDetail{Code: api.CodeLimit,
+				Message: fmt.Sprintf("more than %d MiB of stdin arrived before the command started, so it was not started (nothing ran)", maxStdinBuffer>>20),
+				Hint:    "write large input to a file in /workspace and read it from there"})
+			return
+		}
 		b.event(api.EventExecDecided, "exec", "exec cancelled before it started: "+line, map[string]any{"command": line, "decision": "cancelled"})
 		if isClosed(b.stopCh) {
 			final(proto.TypeError, api.ErrorDetail{Code: api.CodeConflict, Message: "the box stopped before the command started",
@@ -449,14 +495,24 @@ func (b *box) runExec(parent context.Context, conn net.Conn, r io.Reader, w io.W
 		final(proto.TypeError, api.ErrorDetail{Code: code, Message: m2, Hint: hint})
 		return
 	}
+	if over, n := stdin.truncated(); over {
+		es.StdinTruncated = true
+		es.StdinDroppedBytes += n
+	}
 	status := "ok"
-	if es.Code != 0 {
+	if es.Code != 0 || es.StdinTruncated {
 		status = "error"
 	}
 	result := map[string]any{"exit_code": es.Code, "signal": es.Signal, "timed_out": es.TimedOut, "duration_ms": es.DurationMS}
+	data := map[string]any{"command": line, "exit_code": es.Code, "signal": es.Signal, "timed_out": es.TimedOut, "duration_ms": es.DurationMS}
+	summary := fmt.Sprintf("exec exited %d: %s", es.Code, line)
+	if es.StdinTruncated {
+		result["stdin_truncated"], result["stdin_dropped_bytes"] = true, es.StdinDroppedBytes
+		data["stdin_truncated"], data["stdin_dropped_bytes"] = true, es.StdinDroppedBytes
+		summary = fmt.Sprintf("exec stopped, its stdin was not consumed fast enough (%d bytes dropped): %s", es.StdinDroppedBytes, line)
+	}
 	complete(status, result)
-	b.event(api.EventExecExited, "exec", fmt.Sprintf("exec exited %d: %s", es.Code, line), map[string]any{"command": line,
-		"exit_code": es.Code, "signal": es.Signal, "timed_out": es.TimedOut, "duration_ms": es.DurationMS})
+	b.event(api.EventExecExited, "exec", summary, data)
 	final(proto.TypeExit, es)
 }
 
@@ -523,6 +579,13 @@ func (c *callTracker) end() {
 	if c.n == 0 {
 		close(c.idle)
 	}
+}
+
+// inFlight is how many calls are in flight now.
+func (c *callTracker) inFlight() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
 }
 
 // wait waits until no call is in flight, at most d. It reports whether they all finished.

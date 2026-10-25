@@ -115,6 +115,7 @@ func (s *Server) handleExec(c net.Conn, f proto.Frame, st *state) {
 	finished := make(chan struct{})
 	defer close(finished)
 	stdin := newStdinFeeder(ex.stdinW, finished, s.logf)
+	stdin.kill = func() { p.Signal(syscall.SIGKILL) }
 	safeGo(s.logf, func() { run.readHost(stdin, hostGone, finished, s.logf) })
 
 	timeout := time.Duration(req.TimeoutMS) * time.Millisecond
@@ -154,6 +155,7 @@ func (s *Server) handleExec(c net.Conn, f proto.Frame, st *state) {
 		return
 	}
 	es := proto.ExitStatus{TimedOut: timedOut, DurationMS: dur.Milliseconds(), Truncated: run.truncated()}
+	es.StdinTruncated, es.StdinDroppedBytes = stdin.stalledOut()
 	ws := p.Status()
 	switch {
 	case ws.Signaled():
@@ -266,8 +268,9 @@ func (r *execRun) readHost(stdin *stdinFeeder, hostGone, finished chan struct{},
 // the one connection, so the frame reader must not wait on the child for long. The feeder queues up to stdinQueueCap
 // bytes beyond the pipe. While the queue is full the reader waits (backpressure on the host, so a child that reads
 // slower than the host sends still gets every byte), but only while the child keeps taking data: a full queue that
-// makes no progress for stdinStall means the child is not reading stdin, so its stdin is closed and every further
-// stdin byte is dropped, and the reader is never held up again.
+// makes no progress for stdinStall means the child is not reading stdin. Its input can't be delivered whole, and a
+// false EOF would let it finish as if it had read everything, so the process group is killed (SIGKILL), every further
+// stdin byte is dropped (counted), the exit status says so (StdinTruncated), and the reader is never held up again.
 const (
 	stdinQueueCap = 1 << 20
 	stdinStall    = 2 * time.Second
@@ -282,12 +285,22 @@ type stdinFeeder struct {
 	logf     func(string, ...any)
 	wake     chan struct{} // cap 1: data queued, close or drop
 	room     chan struct{} // cap 1: the writer took data off the queue
+	kill     func()        // kills the process group (set before any send)
 
-	mu      sync.Mutex
-	q       [][]byte
-	queued  int
-	eof     bool // no more data: close w once q is written
-	dropped bool // w is closed; further data is discarded
+	mu       sync.Mutex
+	q        [][]byte
+	queued   int
+	eof      bool  // no more data: close w once q is written
+	dropped  bool  // w is closed; further data is discarded
+	stalled  bool  // dropped because the child took nothing for stdinStall (it was killed)
+	stallLen int64 // bytes dropped since the stall
+}
+
+// stalledOut reports whether stdin was dropped because the child did not take it (and how many bytes were dropped).
+func (sf *stdinFeeder) stalledOut() (bool, int64) {
+	sf.mu.Lock()
+	defer sf.mu.Unlock()
+	return sf.stalled, sf.stallLen
 }
 
 func newStdinFeeder(w *os.File, finished <-chan struct{}, logf func(string, ...any)) *stdinFeeder {
@@ -360,12 +373,15 @@ func (sf *stdinFeeder) send(b []byte) {
 			stall.Stop()
 			return
 		case <-stall.C:
-			sf.drop()
+			sf.drop(int64(len(b)))
 			return
 		}
 		sf.mu.Lock()
 	}
 	if sf.eof || sf.dropped {
+		if sf.stalled {
+			sf.stallLen += int64(len(b))
+		}
 		sf.mu.Unlock()
 		return
 	}
@@ -375,20 +391,25 @@ func (sf *stdinFeeder) send(b []byte) {
 	notify(sf.wake)
 }
 
-// drop closes the child's stdin now and discards what is queued and whatever comes later.
-func (sf *stdinFeeder) drop() {
+// drop kills the child (it took no stdin for stdinStall), closes its stdin and discards what is queued (plus pending,
+// the payload that could not be queued) and whatever comes later.
+func (sf *stdinFeeder) drop(pending int64) {
 	sf.mu.Lock()
 	if sf.dropped || sf.eof {
 		sf.mu.Unlock()
 		return
 	}
 	n := sf.queued
-	sf.dropped, sf.q, sf.queued = true, nil, 0
+	sf.dropped, sf.stalled, sf.stallLen, sf.q, sf.queued = true, true, int64(n)+pending, nil, 0
 	sf.mu.Unlock()
 	if sf.logf != nil {
-		sf.logf("exec: the process took no stdin for %s with %d bytes queued: closing its stdin, dropping the rest", stdinStall, n)
+		sf.logf("exec: the process took no stdin for %s with %d bytes queued: killing it, dropping the rest", stdinStall, n)
 	}
-	sf.w.Close() // the child reads EOF; a Write blocked in run returns
+	// killed before its stdin closes, so it never reads a false EOF and exits as if it had read everything
+	if sf.kill != nil {
+		sf.kill()
+	}
+	sf.w.Close() // a Write blocked in run returns
 	notify(sf.wake)
 }
 
