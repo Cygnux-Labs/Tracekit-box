@@ -311,7 +311,9 @@ func TestExecOverHTTP(t *testing.T) {
 	}
 
 	// ask → waiting_approval names the approver and the command to approve
-	e.tk.DecideFunc = func(call tracekit.Call) tracekit.Decision { return tracekit.Decision{Decision: "ask", Reason: "needs a person"} }
+	e.tk.DecideFunc = func(call tracekit.Call) tracekit.Decision {
+		return tracekit.Decision{Decision: "ask", Reason: "needs a person"}
+	}
 	_, frames = execStream(t, sock, "ex", api.ExecRequest{Argv: []string{"git", "push"}}, nil)
 	evs = execEvents(frames)
 	if len(evs) != 3 || evs[1].State != api.ExecWaitingApproval || evs[1].Approver != "tracekit" || evs[1].ApprovalID != "appr1" ||

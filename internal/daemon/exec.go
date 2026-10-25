@@ -97,7 +97,6 @@ func (f *frameWriter) Write(p []byte) (int, error) {
 
 func (f *frameWriter) event(e api.ExecEvent) error { return proto.WriteJSON(f, proto.TypeJSON, e) }
 
-
 // runExec runs one exec on an upgraded connection: decide (Bash) → maybe wait for a Tracekit approval → run in the
 // guest, streaming stdio both ways → complete with the exit status.
 func (b *box) runExec(parent context.Context, r io.Reader, w io.Writer, req api.ExecRequest) {
