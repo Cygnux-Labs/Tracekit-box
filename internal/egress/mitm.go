@@ -29,15 +29,18 @@ func (p *Proxy) serveMITM(s *session, t target, br *bufio.Reader, up *meteredCon
 	case !rawOK:
 		nonTLS = msgNotTLS
 	}
-	br0, isTLS, ok := p.checkTunnel(s, t, br, tlsPeekTimeout, nonTLS)
+	hello, isTLS, ok := p.checkTunnel(s, t, br, tlsPeekTimeout, nonTLS)
 	if !ok {
 		return
 	}
 	if !isTLS {
-		in, out := s.splice(br0, s.client, up, up)
+		in, out := s.splice(br, s.client, up, up)
 		p.emit(Event{Kind: EventClosed, Host: t.host, Port: t.port, BytesIn: in, BytesOut: out, Reason: s.endReason("")})
 		return
 	}
+	// Box terminates this TLS itself: a HelloRetryRequest is its own, and crypto/tls refuses a second ClientHello
+	// that names another server.
+	br0 := io.MultiReader(&byteReader{b: hello}, br)
 
 	upTLS := tls.Client(up, &tls.Config{
 		ServerName: t.host,
@@ -172,6 +175,14 @@ func (x *exchange) forward(req *http.Request, overTLS bool) bool {
 	upType := ""
 	if overTLS {
 		upType = upgradeType(req.Header)
+		// The Upgrade header is the one hop-by-hop header Box sends on, so the header checks below never see it.
+		if f := p.find(upType, true); f != nil {
+			return x.leak(method, path, &leakError{secret: f[0], reason: fmt.Sprintf("a placeholder for secret %s is in the Upgrade header", f[0].Name),
+				todo: "Send the secret in its bound header."})
+		}
+		if f := p.findValues(upType); f != nil {
+			return x.leak(method, path, valueLeak(f[0], "the Upgrade header", ""))
+		}
 	}
 	teTrailers := headerHasToken(req.Header, "Te", "trailers")
 	stripHopByHop(req.Header)
@@ -187,9 +198,23 @@ func (x *exchange) forward(req *http.Request, overTLS bool) bool {
 			return x.leak(method, path, l)
 		}
 	}
+	if bound && upType != "" {
+		// After a switch the host's bytes are a protocol Box does not read (WebSocket frames, h2c), where an
+		// echoed value would reach the guest unredacted; so the value is not sent into one at all.
+		r := refusal{status: http.StatusForbidden,
+			reason: "Box does not relay protocol upgrades (such as WebSocket) to a host with a bound secret: it could not keep the secret's value out of the upgraded stream",
+			todo:   "Use the host's plain HTTPS API, or send this host's credential without a Box secret binding."}
+		p.deny(x.s, x.cliOut, t, method, path, r)
+		x.endReason = r.reason
+		return false
+	}
 	if bound {
-		// A host that may echo a value must answer in plain bytes, where Box can redact it.
+		// A host that may echo a value must answer in plain bytes, where Box can redact it, and whole: a range
+		// could hand back an echoed value in pieces too short to recognise.
 		req.Header.Set("Accept-Encoding", "identity")
+		req.Header.Del("Range")
+		req.Header.Del("If-Range")
+		req.Header.Del("Request-Range") // the legacy alias some servers (Apache httpd) still honour
 	}
 	if upType != "" {
 		req.Header.Set("Connection", "Upgrade")
@@ -274,6 +299,7 @@ func (x *exchange) forward(req *http.Request, overTLS bool) bool {
 		}
 		if overTLS {
 			p.redactValues(resp.Header)
+			p.redactValues(resp.Trailer) // the names announced in Trailer, which go to the guest in its Trailer header
 		}
 		if resp.StatusCode >= 100 && resp.StatusCode < 200 && resp.StatusCode != http.StatusSwitchingProtocols {
 			if i >= maxInterim {
@@ -314,7 +340,9 @@ func (x *exchange) forward(req *http.Request, overTLS bool) bool {
 			x.s.closeAll()
 			return false
 		}
-		// After the switch the bytes are opaque (WebSocket frames are masked); no placeholder can become a value.
+		// After the switch Box reads neither direction: it swaps nothing into the guest's bytes, and a host's
+		// bytes are not redacted. Only a host with no bound secret gets here (forward refuses upgrades to bound
+		// hosts): no value was sent to it, so its upgraded stream passes as its encoded bodies do.
 		x.spliceIn, x.spliceOut = x.s.splice(x.cr, x.cli, x.ur, x.up)
 		return false
 	}
@@ -353,6 +381,11 @@ func (x *exchange) forward(req *http.Request, overTLS bool) bool {
 // decoded first when it is gzip or deflate, and refused otherwise.
 func (p *Proxy) guardBody(resp *http.Response, method string, bound bool) *refusal {
 	code := resp.StatusCode
+	if bound && code == http.StatusPartialContent {
+		// Box sent no Range: a piece of a body can hold a piece of a value, too short to recognise.
+		return &refusal{status: 502, reason: "the host answered with a partial response (206), which Box can't check whole for secret values",
+			todo: "Box removes Range from requests to hosts with a bound secret so it sees whole responses; this host sent a range anyway."}
+	}
 	if p.valMatch.empty() || method == http.MethodHead || code == http.StatusNoContent || code == http.StatusNotModified || code < 200 {
 		return nil
 	}
@@ -365,9 +398,6 @@ func (p *Proxy) guardBody(resp *http.Response, method string, bound bool) *refus
 		return nil // no value is ever sent to this host; its encoded bodies pass as they are
 	}
 	const todo = "Box asks hosts with a bound secret for unencoded responses (Accept-Encoding: identity) so it can keep secret values out of them; this host ignored that."
-	if code == http.StatusPartialContent {
-		return &refusal{status: 502, reason: "the host answered with a range of an encoded body, which Box can't check for secret values", todo: todo}
-	}
 	dec, err := decodeBody(resp.Body, codings)
 	if err != nil {
 		return &refusal{status: 502, reason: "the host answered with " + err.Error() + ", which Box can't check for secret values", todo: todo}
@@ -566,11 +596,10 @@ func (o outRequest) write(w io.Writer) error {
 func writeResponse(w io.Writer, resp *http.Response, method string, chunkOK, closeConn bool, upType string, fixTrailer func(http.Header)) (int64, error) {
 	bw := bufio.NewWriterSize(w, 16<<10)
 	code := resp.StatusCode
-	text := printable(strings.TrimSpace(strings.TrimPrefix(resp.Status, strconv.Itoa(code))), 100)
+	// The canonical reason phrase, never the host's: a host that echoes a value could put it there.
+	text := http.StatusText(code)
 	if text == "" {
-		if text = http.StatusText(code); text == "" {
-			text = "Status"
-		}
+		text = "Status"
 	}
 	h := resp.Header.Clone()
 	if h == nil {

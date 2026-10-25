@@ -77,6 +77,11 @@ type Sink interface {
 // On inspected connections the proxy also guards the value itself: it is redacted from response headers, trailers
 // and bodies (so a host that echoes the credential never hands it to the guest), and a request that carries the
 // value (verbatim, percent-encoded, JSON-escaped or base64) anywhere but its Header on one of its Hosts is a leak.
+//
+// So that the value can be redacted, requests to a bound host go without Range (a 206 answer is refused), and a
+// request to a bound host that asks to upgrade the connection (WebSocket, h2c) is refused: Box could not keep the
+// value out of a partial body or an upgraded stream. Response status lines carry the canonical reason phrase, and
+// response header and trailer names that hold a value or a placeholder are dropped.
 type Secret struct {
 	Name        string // env var name, e.g. "GH"
 	Placeholder string // NewPlaceholder(Name)
@@ -111,6 +116,8 @@ type Config struct {
 	//
 	// What a tunnel may carry: every CONNECT tunnel must open with a TLS ClientHello whose server name (SNI) is the
 	// CONNECT host (an IP-literal CONNECT may send none) and that has no encrypted ClientHello (ECH) extension.
+	// The server_name extension must hold that one host name and no other entry, and after a TLS 1.3
+	// HelloRetryRequest the guest's second ClientHello passes the same checks before it reaches the host.
 	// Only an entry that names the port ("git.example.com:22") also lets other protocols through; a bare host
 	// carries TLS on 443. CONNECT to port 80 is always refused: plain HTTP goes through the proxy in absolute form
 	// (http_proxy), where Box writes the Host header itself.
