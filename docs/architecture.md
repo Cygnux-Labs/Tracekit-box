@@ -120,7 +120,10 @@ the box's memory per tmpfs, and vanish with the box), and `/workspace` as an ove
   proxy reads); `host:port` allows that port only. `CONNECT` to port 80 is refused: plain HTTP must use the absolute
   form (`http_proxy`), where Box writes the Host header.
 - Every HTTPS tunnel must start with a TLS ClientHello whose server name (SNI) equals the CONNECT host (a CONNECT to an
-  IP literal may omit SNI), and ECH ClientHellos are refused, so an allowed host cannot front for another. A tunnel
+  IP literal may omit SNI), with exactly one host name in its server_name list, checked again after a HelloRetryRequest;
+  ECH ClientHellos are refused. That stops fronting by SNI. Inside an uninspected tunnel the `Host` header or HTTP/2
+  `:authority` can still name another site on the same server or CDN; on inspected hosts Box refuses any request that
+  does not name the tunnel's host. A tunnel
   that is not TLS is allowed only to an allow entry that names the port (`host:port`), and such an entry lets any
   protocol through to that port.
 - MITM only for hosts with a bound secret (or every allowed host with `inspect: all`, which then refuses hosts off the
