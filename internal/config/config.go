@@ -45,6 +45,7 @@ var (
 
 // File is tkbox.yaml.
 type File struct {
+	Name      string            `yaml:"name"`
 	Image     string            `yaml:"image"`
 	Allow     []string          `yaml:"allow"`
 	Secrets   map[string]Secret `yaml:"secrets"`
@@ -53,6 +54,7 @@ type File struct {
 	Workspace string            `yaml:"workspace"` // relative paths are relative to the file's dir
 	Inspect   string            `yaml:"inspect"`   // "bound" (default) or "all"
 	Agent     string            `yaml:"agent"`     // agent name recorded in the Tracekit run
+	Task      string            `yaml:"task"`      // recorded as trusted content of the run
 
 	dir string // the file's dir, for relative paths ("" for flags: the working dir)
 }
@@ -76,7 +78,8 @@ type Limits struct {
 	ExecTimeout Duration `yaml:"exec_timeout"`
 }
 
-// Size is a byte size written with a unit ("512MiB", "2GiB", "2G"); it holds MiB, rounded up.
+// Size is a byte size written with a unit ("512MiB", "2GiB", "2G") or a plain integer of MiB; it holds MiB, rounded
+// up.
 type Size int
 
 // Duration is a Go duration string ("90s", "1h").
@@ -107,6 +110,14 @@ func (s *Secret) UnmarshalYAML(n *yaml.Node) error {
 func (s *Size) UnmarshalYAML(n *yaml.Node) error {
 	if n.Kind != yaml.ScalarNode {
 		return fmt.Errorf("line %d: want a size like \"2GiB\"", n.Line)
+	}
+	if n.Tag == "!!int" {
+		v, err := strconv.Atoi(n.Value)
+		if err != nil || v <= 0 {
+			return fmt.Errorf("line %d: size %s: want a positive number of MiB or a size like \"2GiB\"", n.Line, n.Value)
+		}
+		*s = Size(v)
+		return nil
 	}
 	v, err := ParseSize(n.Value)
 	if err != nil {
@@ -322,7 +333,7 @@ func (l Limits) Validate() error {
 	return nil
 }
 
-// Flags are `tkbox run`'s flags. Zero values leave the file's value; Allow, Env and Secrets add to the file's (a
+// Flags are `tkbox run`'s flags. Scalars override the file's values; Allow, Env and Secrets append to the file's (a
 // key given both ways takes the flag's value).
 type Flags struct {
 	Image     string
@@ -368,6 +379,12 @@ func Request(f *File, fl Flags, r Resolver) (api.CreateBoxRequest, error) {
 	}
 	if fl.Agent != "" {
 		m.Agent = fl.Agent
+	}
+	if fl.Name != "" {
+		m.Name = fl.Name
+	}
+	if fl.Task != "" {
+		m.Task = fl.Task
 	}
 	m.Allow = append(append([]string(nil), m.Allow...), fl.Allow...)
 	m.Env = mergeMap(m.Env, fl.Env)
@@ -418,7 +435,7 @@ func Request(f *File, fl Flags, r Resolver) (api.CreateBoxRequest, error) {
 		}
 	}
 	req := api.CreateBoxRequest{
-		Name: fl.Name, Image: m.Image, Allow: m.Allow, Env: m.Env, Inspect: m.Inspect, Agent: m.Agent, Task: fl.Task,
+		Name: m.Name, Image: m.Image, Allow: m.Allow, Env: m.Env, Inspect: m.Inspect, Agent: m.Agent, Task: m.Task,
 		Limits: api.Limits{CPUs: m.Limits.CPUs, MemoryMiB: int(m.Limits.Memory), DiskMiB: int(m.Limits.Disk),
 			Timeout: api.Duration(m.Limits.Timeout), ExecTimeout: api.Duration(m.Limits.ExecTimeout)},
 	}

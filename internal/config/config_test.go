@@ -10,6 +10,8 @@ import (
 )
 
 const good = `
+name: demo
+task: fix the tests
 image: python:3.12-slim
 allow: [pypi, api.example.com:8443]
 secrets:
@@ -41,6 +43,13 @@ func TestParseGood(t *testing.T) {
 		time.Duration(f.Limits.Timeout) != time.Hour || time.Duration(f.Limits.ExecTimeout) != 90*time.Second {
 		t.Fatalf("parsed %+v", f)
 	}
+	if f.Name != "demo" || f.Task != "fix the tests" {
+		t.Fatalf("name/task %q %q", f.Name, f.Task)
+	}
+	g, err := Parse([]byte("image: x\nlimits:\n  memory: 1024\n  disk: 64\n"), "tkbox.yaml")
+	if err != nil || g.Limits.Memory != 1024 || g.Limits.Disk != 64 {
+		t.Fatalf("integer MiB: %+v %v", g, err)
+	}
 	if s := f.Secrets["GITHUB_TOKEN"]; s.FromEnv != "GH_TOKEN" || len(s.Hosts) != 2 || s.Header != "Authorization" {
 		t.Fatalf("secret %+v", s)
 	}
@@ -52,7 +61,7 @@ func TestParseErrors(t *testing.T) {
 		"unknown limit key":  {"image: x\nlimits:\n  cpu: 2\n", "line 3: unknown key cpu"},
 		"unknown secret key": {"secrets:\n  A:\n    from_env: B\n    hosts: [h]\n    value: s3cret\n", "line 5: unknown key value"},
 		"duplicate key":      {"image: x\nimage: y\n", "already defined"},
-		"bad memory":         {"limits:\n  memory: 2\n", "line 2"},
+		"bad memory":         {"limits:\n  memory: -2\n", "line 2"},
 		"bad memory unit":    {"limits:\n  memory: 2Gb\n", "unknown or missing unit"},
 		"memory range":       {"limits:\n  memory: 64MiB\n", "limits.memory"},
 		"cpus range":         {"limits:\n  cpus: 99\n", "limits.cpus 99: use 1..32"},
@@ -110,7 +119,7 @@ func TestRequestMergesFlagsAndResolvesSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	req, err := Request(f, Flags{Image: "alpine:3", Allow: []string{"github"}, Memory: "1GiB", CPUs: 1,
-		Env: map[string]string{"FOO": "flag"}, Secrets: map[string]Secret{"EXTRA": flagSecret}, Task: "fix it"}, r)
+		Env: map[string]string{"FOO": "flag"}, Secrets: map[string]Secret{"EXTRA": flagSecret}, Name: "flagname"}, r)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,6 +128,9 @@ func TestRequestMergesFlagsAndResolvesSecrets(t *testing.T) {
 	}
 	if strings.Join(req.Allow, ",") != "pypi,api.example.com:8443,github" || req.Env["FOO"] != "flag" {
 		t.Fatalf("lists did not merge: %v %v", req.Allow, req.Env)
+	}
+	if req.Name != "flagname" || req.Task != "fix the tests" {
+		t.Fatalf("name/task %q %q", req.Name, req.Task)
 	}
 	if req.Workspace != dir {
 		t.Fatalf("workspace %q, want the file's dir %q", req.Workspace, dir)
