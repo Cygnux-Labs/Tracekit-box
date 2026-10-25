@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tracekit-box"
+version = "0.1.0"
+description = "Python client of the Tracekit Box daemon: run AI agents in Firecracker micro-VMs whose every door is decided and signed by Tracekit"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Cygnux Labs"}]
+requires-python = ">=3.9"
+dependencies = []
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+]
+
+[project.urls]
+Homepage = "https://github.com/Cygnux-Labs/tracekit-box"
+Source = "https://github.com/Cygnux-Labs/tracekit-box/tree/main/sdk/python"
+
+[tool.setuptools]
+packages = ["tracekit_box"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
