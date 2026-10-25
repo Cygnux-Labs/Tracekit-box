@@ -439,22 +439,24 @@ func (s *stager) hardlink(h *tar.Header, target []string) error {
 
 // whiteout applies ".wh.<name>" (delete name) or ".wh..wh..opq" (hide everything lower layers put in the dir).
 func (s *stager) whiteout(comps []string) error {
-	dir, base, err := s.parent(comps, false)
+	base := comps[len(comps)-1]
+	name := strings.TrimPrefix(base, ".wh.")
+	if name == "" || name == "." || name == ".." {
+		// ".wh.." would delete the dir itself, ".wh..." its parent: possibly the staging dir's.
+		return fmt.Errorf("whiteout %q does not name an entry; refusing the image", relOf(comps))
+	}
+	if strings.HasPrefix(base, ".wh..wh.") && base != ".wh..wh..opq" {
+		return nil // other aufs metadata
+	}
+	dir, _, err := s.parent(comps, false)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil // nothing below to hide
 	}
 	if err != nil {
 		return err
 	}
-	switch {
-	case base == ".wh..wh..opq":
+	if base == ".wh..wh..opq" {
 		return s.clearLower(dir)
-	case strings.HasPrefix(base, ".wh..wh."):
-		return nil // other aufs metadata
-	}
-	name := strings.TrimPrefix(base, ".wh.")
-	if name == "" {
-		return fmt.Errorf("whiteout %q names nothing", relOf(comps))
 	}
 	return removeExisting(s.host(append(dir, name)))
 }

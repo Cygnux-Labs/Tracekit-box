@@ -240,6 +240,20 @@ func TestHostileTarsStayInside(t *testing.T) {
 		}
 	})
 
+	t.Run("whiteouts naming dot entries", func(t *testing.T) {
+		st := newTestStager(t)
+		marker := filepath.Join(filepath.Dir(st.root), "keep")
+		os.WriteFile(marker, nil, 0o600)
+		for _, name := range []string{".wh..", ".wh...", "a/.wh..", "a/.wh...", ".wh."} {
+			if err := applyTar(t, st, mkTar(t, ent{name: "a/f", body: "x"}, ent{name: name})); err == nil || !strings.Contains(err.Error(), "does not name an entry") {
+				t.Errorf("%s: got %v", name, err)
+			}
+		}
+		if !exists(t, st.root) || !exists(t, marker) || !exists(t, filepath.Join(st.root, "a/f")) {
+			t.Error("a dot whiteout deleted the staging dir or its parent")
+		}
+	})
+
 	t.Run("specials and loops", func(t *testing.T) {
 		st := newTestStager(t)
 		err := applyTar(t, st, mkTar(t,
