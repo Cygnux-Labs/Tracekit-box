@@ -163,10 +163,13 @@ type GuestLimits struct {
 	MaxProcs       int   `json:"max_procs"`        // concurrent execs; more are refused with CodeBusy
 }
 
-// Error ends a failed exchange.
+// Error ends a failed exchange. RuleIDs and Hint are set by the daemon on exec refusals (the api.ErrorDetail shape);
+// the guest leaves them empty.
 type Error struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code    string   `json:"code"`
+	Message string   `json:"message"`
+	RuleIDs []string `json:"rule_ids,omitempty"`
+	Hint    string   `json:"hint,omitempty"`
 }
 
 // Error codes.

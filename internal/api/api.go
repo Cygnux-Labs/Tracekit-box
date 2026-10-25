@@ -221,7 +221,7 @@ type ApplyResult struct {
 }
 
 type ExportRequest struct {
-	Out string `json:"out"` // absolute path for the .tkb; the trust file is written next to it as <out>.trust.json
+	Out string `json:"out"` // absolute path for the .tkb; the trust file goes next to it: demo.tkb → demo.trust.json
 }
 
 type ExportResult struct {
