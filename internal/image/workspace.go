@@ -72,6 +72,7 @@ func (b *builder) copyWorkspace(ctx context.Context, src, staging string) (Works
 		return Workspace{}, nil, err
 	}
 	var ws Workspace
+	entries := 0 // files and symlinks, for the cap
 	meta := map[string]entryMeta{}
 	for _, name := range names {
 		if err := ctx.Err(); err != nil {
@@ -98,7 +99,7 @@ func (b *builder) copyWorkspace(ctx context.Context, src, staging string) (Works
 			}
 			continue
 		}
-		if ws.Files++; ws.Files > b.lim.WorkspaceFiles {
+		if entries++; entries > b.lim.WorkspaceFiles {
 			return Workspace{}, nil, fmt.Errorf("workspace %s has more than %d files (WorkspaceFiles); add generated or vendored dirs to .gitignore, or point the box at a smaller directory", src, b.lim.WorkspaceFiles)
 		}
 		if err := mkdirs(staging, comps[:len(comps)-1], meta, 0o755); err != nil {
@@ -126,6 +127,7 @@ func (b *builder) copyWorkspace(ctx context.Context, src, staging string) (Works
 			return Workspace{}, nil, err
 		}
 		ws.Bytes += n
+		ws.Files++
 		meta[rel] = entryMeta{mode: uint32(fi.Mode().Perm()) | 0o400}
 	}
 	return ws, meta, nil

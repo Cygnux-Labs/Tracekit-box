@@ -83,7 +83,7 @@ func TestWorkspaceGitListing(t *testing.T) {
 	if got != want {
 		t.Errorf("staged %s\nwant   %s", got, want)
 	}
-	if ws.Files != 6 {
+	if ws.Files != 5 { // regular files; the symlink is not counted
 		t.Errorf("files %d", ws.Files)
 	}
 	if fi, err := os.Lstat(filepath.Join(staging, "link")); err != nil || fi.Mode()&os.ModeSymlink == 0 {
@@ -151,7 +151,7 @@ func TestWorkspaceExt4(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ws.Path != out || ws.Files != 6 {
+	if ws.Path != out || ws.Files != 5 {
 		t.Errorf("%+v", ws)
 	}
 	fsck(t, out)
