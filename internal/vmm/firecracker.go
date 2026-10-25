@@ -113,14 +113,16 @@ func newMachine(spec Spec, bin, arch string) *machine {
 
 // bootArgs is the kernel command line: our defaults, then Spec.KernelArgs (later values win in the kernel).
 func bootArgs(spec Spec, arch string) string {
-	args := []string{"console=ttyS0", "reboot=k", "panic=1"}
+	// quiet: kernel messages on the emulated UART cost ~1.7 s of boot under nested virtualization; warnings, errors
+	// and panics still print, and KernelArgs "loglevel=7" brings the rest back.
+	args := []string{"console=ttyS0", "reboot=k", "panic=1", "quiet"}
 	switch arch {
 	case "amd64":
 		// No PCI bus (virtio-mmio only); skip i8042 probing Firecracker's minimal controller does not need.
 		args = append(args, "pci=off", "i8042.noaux", "i8042.nomux", "i8042.nopnp", "i8042.dumbkbd")
-	case "arm64":
-		args = append(args, "keep_bootcon")
 	}
+	// aarch64 needs nothing extra: Firecracker appends earlycon=uart,mmio,<addr> and pci=off itself, and keep_bootcon
+	// (in Firecracker's getting-started) would print every line twice once ttyS0 takes over.
 	args = append(args, "root=/dev/vda", "ro", "rootfstype=ext4", "init=/sbin/tkbox-guest", "tkbox.id="+spec.ID)
 	if s := strings.TrimSpace(spec.KernelArgs); s != "" {
 		args = append(args, s)

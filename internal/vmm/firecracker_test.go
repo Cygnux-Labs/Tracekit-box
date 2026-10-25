@@ -34,7 +34,7 @@ func testSpec(t *testing.T, id string) Spec {
 	return Spec{
 		ID: id, KernelPath: filepath.Join(files, "vmlinux"), RootfsPath: filepath.Join(files, "rootfs.ext4"),
 		Drives: []Drive{{ID: "workspace_upper", Path: filepath.Join(files, "upper.ext4")}},
-		VCPUs:  2, MemoryMiB: 256, StateDir: dir, GuestCID: 7, KernelArgs: "quiet",
+		VCPUs:  2, MemoryMiB: 256, StateDir: dir, GuestCID: 7, KernelArgs: "tkbox.extra=1",
 	}
 }
 
@@ -182,7 +182,7 @@ func TestLifecycle(t *testing.T) {
 	}
 	want := []string{
 		`PUT /machine-config {"vcpu_count":2,"mem_size_mib":256}`,
-		`PUT /boot-source {"kernel_image_path":"` + spec.KernelPath + `","boot_args":"console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd root=/dev/vda ro rootfstype=ext4 init=/sbin/tkbox-guest tkbox.id=fake-ok quiet"}`,
+		`PUT /boot-source {"kernel_image_path":"` + spec.KernelPath + `","boot_args":"console=ttyS0 reboot=k panic=1 quiet pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd root=/dev/vda ro rootfstype=ext4 init=/sbin/tkbox-guest tkbox.id=fake-ok tkbox.extra=1"}`,
 		`PUT /drives/rootfs {"drive_id":"rootfs","path_on_host":"` + spec.RootfsPath + `","is_root_device":true,"is_read_only":true}`,
 		`PUT /drives/workspace_upper {"drive_id":"workspace_upper","path_on_host":"` + spec.Drives[0].Path + `","is_root_device":false,"is_read_only":false}`,
 		`PUT /vsock {"guest_cid":7,"uds_path":"` + spec.StateDir + `/vsock.sock"}`,
@@ -415,7 +415,7 @@ func TestValidateSpec(t *testing.T) {
 
 func TestBootArgsArm64(t *testing.T) {
 	got := bootArgs(Spec{ID: "b1", KernelArgs: " init=/bin/sh "}, "arm64")
-	want := "console=ttyS0 reboot=k panic=1 keep_bootcon root=/dev/vda ro rootfstype=ext4 init=/sbin/tkbox-guest tkbox.id=b1 init=/bin/sh"
+	want := "console=ttyS0 reboot=k panic=1 quiet root=/dev/vda ro rootfstype=ext4 init=/sbin/tkbox-guest tkbox.id=b1 init=/bin/sh"
 	if got != want {
 		t.Fatalf("got  %q\nwant %q", got, want)
 	}
