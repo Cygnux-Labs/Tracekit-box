@@ -124,9 +124,9 @@ What each step shows:
   `tkbox approvals` and `tkbox approve <id>` (or `tkbox reject <id>`) in another terminal on the host; nothing in the VM
   can answer it. Unanswered, it is refused after 2 minutes.
 - **`169.254.169.254`** is the cloud metadata address. It is refused before any decision, whatever the allowlist says.
-- **`$GH` inside the box is a placeholder**, not your token. `evil.example` is off the allowlist, so that request waits
-  for approval like `example.com`; even if someone approved it, only the placeholder could leave, because the real value
-  never enters the VM. With `--inspect all` the proxy also opens allowed HTTPS connections to unbound hosts and blocks a
+- **`$GH` inside the box is a placeholder**, not your token. `evil.example` does not resolve, so the proxy refuses it at
+  once; a real host off the allowlist would wait for approval like `example.com`. Even if someone approved a connection
+  to an unbound host, only the placeholder could leave, because the real value never enters the VM. With `--inspect all` the proxy also opens allowed HTTPS connections to unbound hosts and blocks a
   request that carries a placeholder (recorded as `tkbox.secret.leak`).
 - **`api.github.com`** is the host `GH` is bound to, so the proxy opens that connection, swaps the real token into the
   request headers and records `tkbox.secret.use`.

@@ -150,6 +150,12 @@ def test_exec_stdin_larger_than_a_frame(client, box):
     assert r.stdout == data
 
 
+def test_exec_stdin_not_read(client, box):
+    # the process exits without reading stdin: the result still arrives and the stdin writer gives up quietly
+    r = client.exec("demo", ["echo", "done"], stdin=b"y" * (frames.MAX_FRAME * 3))
+    assert r.stdout == b"done\n" and r.exit_code == 0
+
+
 def test_exec_request_fields(client, box):
     r = client.exec("demo", ["showreq"], env={"K": "V"}, cwd="/workspace/sub", timeout=90)
     req = json.loads(r.stdout)

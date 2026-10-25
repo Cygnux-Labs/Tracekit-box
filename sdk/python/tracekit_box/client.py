@@ -508,7 +508,7 @@ class Client:
             if resp.status != 101:
                 self._raise_for(resp, resp.body())
                 raise ProtocolError(f"exec: expected 101 Switching Protocols, got {resp.status} {resp.reason}")
-            if resp.header("upgrade").lower() != EXEC_UPGRADE:
+            if resp.header("upgrade") and resp.header("upgrade").lower() != EXEC_UPGRADE:
                 raise ProtocolError(f"exec: the daemon upgraded to {resp.header('upgrade')!r}, not {EXEC_UPGRADE}")
             writer: Optional[threading.Thread] = None
             write_err: List[BaseException] = []
