@@ -286,9 +286,9 @@ func (t *transport) send(ctx context.Context, method string, frame []byte, own b
 		if err != nil {
 			return nil, err
 		}
-		m, err := exchange(ctx, c, frame, deadline)
+		m, reusable, err := exchange(ctx, c, frame, deadline)
 		if err == nil {
-			if own {
+			if own || !reusable {
 				c.close()
 			} else {
 				t.put(c)
@@ -319,7 +319,9 @@ func (t *transport) send(ctx context.Context, method string, frame []byte, own b
 
 var errBadAnswer = errors.New("the signer's answer is not a JSON object")
 
-func exchange(ctx context.Context, c *conn, frame []byte, deadline time.Time) (map[string]any, error) {
+// exchange sends frame on c and reads the answer. reusable is false when ctx's cancel callback ran or is running: it
+// sets a past deadline on c at any moment, so c must be closed, never pooled (where it would fail an unrelated call).
+func exchange(ctx context.Context, c *conn, frame []byte, deadline time.Time) (m map[string]any, reusable bool, err error) {
 	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
 		deadline = dl
 	}
@@ -329,16 +331,19 @@ func exchange(ctx context.Context, c *conn, frame []byte, deadline time.Time) (m
 	buf := make([]byte, 0, len(frame)+1)
 	buf = append(append(buf, frame...), '\n')
 	if _, err := c.nc.Write(buf); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	data, err := readFrame(c.r)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	m, err := parseFrame(data)
+	m, err = parseFrame(data)
 	if err != nil {
-		return nil, errBadAnswer
+		return nil, false, errBadAnswer
+	}
+	if !stop() || ctx.Err() != nil {
+		return m, false, nil
 	}
 	_ = c.nc.SetDeadline(time.Time{})
-	return m, nil
+	return m, true, nil
 }
