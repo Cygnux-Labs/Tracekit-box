@@ -61,12 +61,21 @@ type change struct {
 
 type differ struct {
 	upper, base Tree
+	exclude     map[string]bool // directory names left out wherever they are
 	changes     []change
 }
 
 // Diff compares upper (an overlay upper layer) with base and returns the summary and the patch, at most max bytes.
-func Diff(upper, base Tree, max int64) (proto.DiffSummary, []byte, error) {
+// A directory named one of excludeDirs (a base name: "node_modules") is left out wherever it is, on either side:
+// nothing below it is in the patch or counts toward max.
+func Diff(upper, base Tree, max int64, excludeDirs ...string) (proto.DiffSummary, []byte, error) {
 	d := &differ{upper: upper, base: base}
+	if len(excludeDirs) > 0 {
+		d.exclude = make(map[string]bool, len(excludeDirs))
+		for _, n := range excludeDirs {
+			d.exclude[n] = true
+		}
+	}
 	root, err := upper.Stat("")
 	if err != nil {
 		return proto.DiffSummary{}, nil, err
@@ -94,6 +103,19 @@ func Diff(upper, base Tree, max int64) (proto.DiffSummary, []byte, error) {
 // host treat .GIT as .git).
 func isGitName(name string) bool { return strings.EqualFold(name, ".git") }
 
+// excluded reports a directory the caller asked to leave out: a directory named in exclude on either side.
+func (d *differ) excluded(name string, sides ...*Entry) bool {
+	if !d.exclude[name] {
+		return false
+	}
+	for _, e := range sides {
+		if e != nil && e.Kind == KindDir {
+			return true
+		}
+	}
+	return false
+}
+
 // walk visits upper directory rel. opaque: the lower layer is hidden below rel (an opaque or brand-new directory);
 // baseDir: base has a directory at rel.
 func (d *differ) walk(rel string, opaque, baseDir bool) error {
@@ -118,6 +140,9 @@ func (d *differ) walk(rel string, opaque, baseDir bool) error {
 			case err != nil && !isNotExist(err):
 				return err
 			}
+		}
+		if d.excluded(e.Name, e, b) {
+			continue // seen: an opaque rel does not delete the base one either
 		}
 		switch e.Kind {
 		case KindWhiteout, KindOther:
@@ -162,7 +187,7 @@ func (d *differ) walk(rel string, opaque, baseDir bool) error {
 		}
 		for i := range bents {
 			be := &bents[i]
-			if seen[be.Name] || isGitName(be.Name) {
+			if seen[be.Name] || isGitName(be.Name) || d.excluded(be.Name, be) {
 				continue
 			}
 			if err := d.removeAll(joinRel(rel, be.Name), be); err != nil {
@@ -188,7 +213,7 @@ func (d *differ) removeAll(p string, b *Entry) error {
 			return err
 		}
 		for i := range ents {
-			if isGitName(ents[i].Name) {
+			if isGitName(ents[i].Name) || d.excluded(ents[i].Name, &ents[i]) {
 				continue
 			}
 			if err := d.removeAll(joinRel(p, ents[i].Name), &ents[i]); err != nil {
@@ -450,11 +475,15 @@ func (s *Server) handleDiff(c net.Conn, f proto.Frame, st *state) {
 		sendError(c, proto.CodeNotFound, "this box has no workspace")
 		return
 	}
+	if err := proto.CheckExcludeDirs(req.ExcludeDirs); err != nil {
+		sendError(c, proto.CodeBadRequest, err.Error())
+		return
+	}
 	max := req.MaxBytes
 	if max <= 0 {
 		max = proto.DefaultMaxDiffBytes
 	}
-	sum, patch, err := Diff(st.ws.Upper, st.ws.Base, max)
+	sum, patch, err := Diff(st.ws.Upper, st.ws.Base, max, req.ExcludeDirs...)
 	switch {
 	case errors.Is(err, errTooLarge):
 		sendError(c, proto.CodeTooLarge, fmt.Sprintf("the workspace patch is over max_bytes (%d bytes): "+

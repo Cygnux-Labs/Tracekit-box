@@ -42,12 +42,18 @@ func protoErr(format string, args ...any) error {
 	return fmt.Errorf("%w: "+format, append([]any{ErrProtocol}, args...)...)
 }
 
-// call is one connection: frames are written under a mutex (stdin and signal pumps share it with the caller).
+// call is one connection. Frame writes are serialized, and urgent frames (signals) go before the data frames (stdin)
+// that are waiting: a signal waits for at most the one frame being written, never behind a stdin stream. Cancelling
+// ctx closes the connection, which also ends a write the guest is not reading.
 type call struct {
 	ctx  context.Context
 	conn net.Conn
-	wmu  sync.Mutex
 	stop func() bool
+
+	wmu     sync.Mutex
+	wcond   sync.Cond // on wmu
+	writing bool      // a frame is being written
+	urgent  int       // urgent writers waiting
 }
 
 func (c *Client) open(ctx context.Context) (*call, error) {
@@ -62,6 +68,7 @@ func (c *Client) open(ctx context.Context) (*call, error) {
 		conn.SetDeadline(dl)
 	}
 	k := &call{ctx: ctx, conn: conn}
+	k.wcond.L = &k.wmu
 	k.stop = context.AfterFunc(ctx, func() { conn.Close() })
 	return k, nil
 }
@@ -71,10 +78,31 @@ func (k *call) close() {
 	k.conn.Close()
 }
 
-func (k *call) write(typ byte, p []byte) error {
+// write writes one data frame, after any urgent frame that is waiting.
+func (k *call) write(typ byte, p []byte) error { return k.writeFrame(false, typ, p) }
+
+// writeUrgent writes one frame ahead of the data frames that are waiting.
+func (k *call) writeUrgent(typ byte, p []byte) error { return k.writeFrame(true, typ, p) }
+
+func (k *call) writeFrame(urgent bool, typ byte, p []byte) error {
 	k.wmu.Lock()
-	defer k.wmu.Unlock()
-	return k.err(proto.WriteFrame(k.conn, typ, p))
+	if urgent {
+		k.urgent++
+	}
+	for k.writing || (!urgent && k.urgent > 0) {
+		k.wcond.Wait()
+	}
+	if urgent {
+		k.urgent--
+	}
+	k.writing = true
+	k.wmu.Unlock()
+	err := proto.WriteFrame(k.conn, typ, p)
+	k.wmu.Lock()
+	k.writing = false
+	k.wcond.Broadcast()
+	k.wmu.Unlock()
+	return k.err(err)
 }
 
 func (k *call) send(req any) error {
@@ -169,8 +197,9 @@ func (c *Client) Stat(ctx context.Context, path string) (proto.FileInfo, error) 
 	return fi, err
 }
 
-// Exec runs req. Stdin and Signals are pumped on their own goroutines; a Stdin reader blocked in Read is abandoned
-// (not waited for) when the exec ends.
+// Exec runs req. Stdin and Signals are pumped on their own goroutines, a signal ahead of any stdin frame still to be
+// written; a Stdin reader blocked in Read is abandoned (not waited for) when the exec ends. Cancelling ctx closes the
+// connection: the guest kills the process group.
 func (c *Client) Exec(ctx context.Context, req proto.ExecRequest, stdio ExecIO) (proto.ExitStatus, error) {
 	req.Op = proto.OpExec
 	req.Stdin = stdio.Stdin != nil
@@ -220,7 +249,7 @@ func (c *Client) Exec(ctx context.Context, req proto.ExecRequest, stdio ExecIO) 
 						continue
 					}
 					b, _ := json.Marshal(proto.Signal{Signal: s})
-					if k.write(proto.TypeSignal, b) != nil {
+					if k.writeUrgent(proto.TypeSignal, b) != nil {
 						return
 					}
 				}
@@ -414,15 +443,25 @@ func (c *Client) WriteFile(ctx context.Context, path string, mode uint32, r io.R
 // Diff writes the patch to w. The summary is checked before any patch byte is accepted: its size must fit maxBytes
 // and every path must be relative, clean and free of .git; the patch must then be exactly that size.
 func (c *Client) Diff(ctx context.Context, maxBytes int64, w io.Writer) (proto.DiffSummary, error) {
-	if maxBytes <= 0 {
-		maxBytes = proto.DefaultMaxDiffBytes
+	return c.DiffWith(ctx, proto.DiffRequest{MaxBytes: maxBytes}, w)
+}
+
+// DiffWith is Diff with the whole request (req.ExcludeDirs: directory names left out of the patch).
+func (c *Client) DiffWith(ctx context.Context, req proto.DiffRequest, w io.Writer) (proto.DiffSummary, error) {
+	req.Op = proto.OpDiff
+	if req.MaxBytes <= 0 {
+		req.MaxBytes = proto.DefaultMaxDiffBytes
+	}
+	maxBytes := req.MaxBytes
+	if err := proto.CheckExcludeDirs(req.ExcludeDirs); err != nil {
+		return proto.DiffSummary{}, fmt.Errorf("agentrpc: %w", err)
 	}
 	k, err := c.open(ctx)
 	if err != nil {
 		return proto.DiffSummary{}, err
 	}
 	defer k.close()
-	if err := k.send(proto.DiffRequest{Op: proto.OpDiff, MaxBytes: maxBytes}); err != nil {
+	if err := k.send(req); err != nil {
 		return proto.DiffSummary{}, err
 	}
 	f, err := k.read()

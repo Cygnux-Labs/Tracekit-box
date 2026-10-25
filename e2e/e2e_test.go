@@ -126,6 +126,17 @@ func (e *env) exec(t *testing.T, box string, argv ...string) (string, string, in
 
 const py = "python3"
 
+// countSleepsPy prints how many `sleep 302` processes run in the box (slim images have no ps or pgrep).
+const countSleepsPy = `import os
+n = 0
+for p in os.listdir("/proc"):
+    if p.isdigit():
+        try:
+            n += open("/proc/" + p + "/cmdline", "rb").read().split(b"\0")[:2] == [b"sleep", b"302"]
+        except OSError:
+            pass
+print(n)`
+
 func TestBox(t *testing.T) {
 	e := setup(t)
 	host := "127.0.0.1:" + e.port
@@ -146,6 +157,51 @@ func TestBox(t *testing.T) {
 			t.Fatalf("exit code %d, want 7", code)
 		}
 	})
+
+	// a command that never reads its 2 MB of stdin still gets Ctrl-C, and dies when the client is killed (both used
+	// to leave it running until the exec timeout)
+	countSleeps := func(t *testing.T) string {
+		out, _, _ := e.exec(t, "e2e", py, "-c", countSleepsPy)
+		return strings.TrimSpace(out)
+	}
+	for _, how := range []string{"interrupt", "kill"} {
+		t.Run("unread-stdin-"+how, func(t *testing.T) {
+			c := exec.Command(filepath.Join(e.bin, "tkbox"), "exec", "-i", "e2e", "--", "sleep", "302")
+			c.Env = append(os.Environ(), "TKBOX_SOCKET="+e.sock)
+			c.Stdin = bytes.NewReader(make([]byte, 2_000_000))
+			if err := c.Start(); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- c.Wait() }()
+			defer c.Process.Kill()
+			for i := 0; countSleeps(t) != "1"; i++ {
+				if i > 60 {
+					t.Fatal("sleep 302 did not start")
+				}
+				time.Sleep(500 * time.Millisecond)
+			}
+			time.Sleep(time.Second) // stdin backs up behind the child
+			start := time.Now()
+			if how == "interrupt" {
+				c.Process.Signal(os.Interrupt)
+			} else {
+				c.Process.Kill()
+			}
+			select {
+			case <-done:
+			case <-time.After(20 * time.Second):
+				t.Fatal("the client did not exit")
+			}
+			for countSleeps(t) != "0" {
+				if time.Since(start) > 20*time.Second {
+					t.Fatalf("sleep 302 still runs %s after the client's %s", time.Since(start).Round(time.Second), how)
+				}
+				time.Sleep(500 * time.Millisecond)
+			}
+			t.Logf("sleep 302 gone within %s of the %s", time.Since(start).Round(100*time.Millisecond), how)
+		})
+	}
 
 	t.Run("signer-deny", func(t *testing.T) {
 		if _, stderr, code := e.exec(t, "e2e", "pkill", "tracekitd"); code != 126 || !strings.Contains(stderr, "TK-D007") {

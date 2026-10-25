@@ -114,7 +114,7 @@ func (s *Server) handleExec(c net.Conn, f proto.Frame, st *state) {
 	hostGone := make(chan struct{})
 	finished := make(chan struct{})
 	defer close(finished)
-	stdin := newStdinFeeder(ex.stdinW, finished)
+	stdin := newStdinFeeder(ex.stdinW, finished, s.logf)
 	safeGo(s.logf, func() { run.readHost(stdin, hostGone, finished, s.logf) })
 
 	timeout := time.Duration(req.TimeoutMS) * time.Millisecond
@@ -226,7 +226,8 @@ func (r *execRun) write(typ byte, b []byte) {
 }
 
 // readHost reads stdin and signal frames until the connection closes; a close before the exec finished means the
-// host is gone.
+// host is gone. It never waits on the child for long (see stdinFeeder), so signals, stdin EOF and the host going
+// away are acted on even while the child does not read its stdin.
 func (r *execRun) readHost(stdin *stdinFeeder, hostGone, finished chan struct{}, logf func(string, ...any)) {
 	for {
 		f, err := proto.ReadFrame(r.conn)
@@ -261,68 +262,145 @@ func (r *execRun) readHost(stdin *stdinFeeder, hostGone, finished chan struct{},
 	}
 }
 
-// stdinFeeder writes TypeStdin payloads to the child's stdin pipe on its own goroutine so a child that does not read
-// stdin never blocks the frame reader (and with it signals and host-gone detection) for long. ch is never closed (a
-// late frame after the process exited must not panic PID 1); stop ends the feed after what is queued.
+// Stdin flow control. The protocol has no window, and signals, stdin EOF and the host's close travel behind stdin on
+// the one connection, so the frame reader must not wait on the child for long. The feeder queues up to stdinQueueCap
+// bytes beyond the pipe. While the queue is full the reader waits (backpressure on the host, so a child that reads
+// slower than the host sends still gets every byte), but only while the child keeps taking data: a full queue that
+// makes no progress for stdinStall means the child is not reading stdin, so its stdin is closed and every further
+// stdin byte is dropped, and the reader is never held up again.
+const (
+	stdinQueueCap = 1 << 20
+	stdinStall    = 2 * time.Second
+	stdinChunk    = 64 << 10 // pipe write size: progress is seen at this granularity
+)
+
+// stdinFeeder writes TypeStdin payloads to the child's stdin pipe on its own goroutine. close ends the feed after
+// what is queued (EOF for the child); drop ends it at once.
 type stdinFeeder struct {
 	w        *os.File // nil when the exec has no stdin
-	ch       chan []byte
-	stop     chan struct{}
-	once     sync.Once
 	finished <-chan struct{}
+	logf     func(string, ...any)
+	wake     chan struct{} // cap 1: data queued, close or drop
+	room     chan struct{} // cap 1: the writer took data off the queue
+
+	mu      sync.Mutex
+	q       [][]byte
+	queued  int
+	eof     bool // no more data: close w once q is written
+	dropped bool // w is closed; further data is discarded
 }
 
-func newStdinFeeder(w *os.File, finished <-chan struct{}) *stdinFeeder {
-	sf := &stdinFeeder{w: w, ch: make(chan []byte, 4), stop: make(chan struct{}), finished: finished}
+func newStdinFeeder(w *os.File, finished <-chan struct{}, logf func(string, ...any)) *stdinFeeder {
+	sf := &stdinFeeder{w: w, finished: finished, logf: logf, wake: make(chan struct{}, 1), room: make(chan struct{}, 1)}
 	if w != nil {
-		go func() {
-			defer w.Close() // EOF for the child
-			ok := true
-			write := func(b []byte) {
-				if ok {
-					if _, err := w.Write(b); err != nil {
-						ok = false // the child closed stdin: drop the rest
-					}
-				}
-			}
-			for {
-				select {
-				case b := <-sf.ch:
-					write(b)
-				case <-sf.stop:
-					for {
-						select {
-						case b := <-sf.ch:
-							write(b)
-						default:
-							return
-						}
-					}
-				}
-			}
-		}()
+		safeGo(logf, sf.run)
 	}
 	return sf
 }
 
-func (sf *stdinFeeder) send(b []byte) {
-	if sf.w == nil {
-		return
-	}
+func notify(c chan struct{}) {
 	select {
-	case <-sf.stop:
-		return
+	case c <- struct{}{}:
 	default:
-	}
-	select {
-	case sf.ch <- b:
-	case <-sf.stop:
-	case <-sf.finished:
 	}
 }
 
+func (sf *stdinFeeder) run() {
+	defer sf.w.Close() // EOF for the child
+	for {
+		sf.mu.Lock()
+		for len(sf.q) == 0 && !sf.eof && !sf.dropped {
+			sf.mu.Unlock()
+			<-sf.wake
+			sf.mu.Lock()
+		}
+		if sf.dropped || len(sf.q) == 0 {
+			sf.mu.Unlock()
+			return
+		}
+		b := sf.q[0][:min(len(sf.q[0]), stdinChunk)]
+		sf.mu.Unlock()
+		_, err := sf.w.Write(b)
+		sf.mu.Lock()
+		if err != nil {
+			// the child closed its stdin, or drop closed the pipe: the rest is dropped
+			sf.dropped, sf.q, sf.queued = true, nil, 0
+			sf.mu.Unlock()
+			notify(sf.room)
+			return
+		}
+		if !sf.dropped {
+			if len(b) == len(sf.q[0]) {
+				sf.q[0] = nil
+				sf.q = sf.q[1:]
+			} else {
+				sf.q[0] = sf.q[0][len(b):]
+			}
+			sf.queued -= len(b)
+		}
+		sf.mu.Unlock()
+		notify(sf.room)
+	}
+}
+
+// send queues b for the child. It waits while the queue is full and the child keeps taking data; when the child takes
+// nothing for stdinStall, the feed is dropped.
+func (sf *stdinFeeder) send(b []byte) {
+	if sf.w == nil || len(b) == 0 {
+		return
+	}
+	sf.mu.Lock()
+	for !sf.eof && !sf.dropped && sf.queued >= stdinQueueCap {
+		sf.mu.Unlock()
+		stall := time.NewTimer(stdinStall)
+		select {
+		case <-sf.room:
+			stall.Stop()
+		case <-sf.finished:
+			stall.Stop()
+			return
+		case <-stall.C:
+			sf.drop()
+			return
+		}
+		sf.mu.Lock()
+	}
+	if sf.eof || sf.dropped {
+		sf.mu.Unlock()
+		return
+	}
+	sf.q = append(sf.q, b)
+	sf.queued += len(b)
+	sf.mu.Unlock()
+	notify(sf.wake)
+}
+
+// drop closes the child's stdin now and discards what is queued and whatever comes later.
+func (sf *stdinFeeder) drop() {
+	sf.mu.Lock()
+	if sf.dropped || sf.eof {
+		sf.mu.Unlock()
+		return
+	}
+	n := sf.queued
+	sf.dropped, sf.q, sf.queued = true, nil, 0
+	sf.mu.Unlock()
+	if sf.logf != nil {
+		sf.logf("exec: the process took no stdin for %s with %d bytes queued: closing its stdin, dropping the rest", stdinStall, n)
+	}
+	sf.w.Close() // the child reads EOF; a Write blocked in run returns
+	notify(sf.wake)
+}
+
+// close ends the feed once what is queued is written: stdin EOF, the host gone, or the process done.
 func (sf *stdinFeeder) close() {
-	sf.once.Do(func() { close(sf.stop) })
+	if sf.w == nil {
+		return
+	}
+	sf.mu.Lock()
+	sf.eof = true
+	sf.mu.Unlock()
+	notify(sf.wake)
 }
 
 // execPipes are the child's stdio. The parent keeps stdinW (nil without stdin), outR and errR.
