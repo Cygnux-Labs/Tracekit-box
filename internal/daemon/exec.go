@@ -97,7 +97,7 @@ func (d *Daemon) prepareExec(ref string, req api.ExecRequest) (*box, *api.ErrorD
 	if req.Cwd != "" && !strings.HasPrefix(req.Cwd, "/") {
 		return nil, errf(api.CodeBadRequest, "pass --cwd /workspace/... (absolute)", "cwd %q must be an absolute path in the box", req.Cwd)
 	}
-	if t := time.Duration(req.Timeout); t < 0 || t > config.MaxExecTimeout {
+	if t := time.Duration(req.Timeout); t < 0 || (t > 0 && t < config.MinExecTimeout) || t > config.MaxExecTimeout {
 		return nil, limitErr("exec timeout %s is outside 1s..24h", "pass --timeout up to 24h", t)
 	}
 	return b, nil

@@ -954,20 +954,36 @@ func (b *box) teardown(ctx context.Context, reason, detail string, kill, failed 
 	if run != nil {
 		fctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		b.flushObserver(fctx)
+		cancel()
+		// must-record observes that never reached the signer are recorded as a gap; if even that fails the run is
+		// closed now with what was lost as its reason (no apply can then be recorded as if nothing was missing)
+		fctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+		lostReason := b.recordGaps(fctx, run)
 		event := "stopped"
 		if failed {
 			event = "failed"
 		}
 		if err := run.Observe(fctx, tracekit.SourceBox, trustedObs, map[string]any{"event": event, "box_id": b.id, "reason": reason}); err != nil {
 			b.event(api.EventSignerProblem, "lifecycle", "could not record the stop: "+err.Error(), nil)
+			if lostReason != "" {
+				lostReason += "; "
+			}
+			lostReason += "the stop could not be recorded"
 		}
 		cancel()
 		b.mu.Lock()
 		b.closeReason = reason
+		if lostReason != "" {
+			b.closeReason = reason + "; " + lostReason
+		}
 		b.mu.Unlock()
-		if failed { // nothing left to apply: close now; a stopped box keeps its run open for apply (see closeRun)
+		if failed || lostReason != "" { // nothing (recordable) left to apply: close now; a stopped box keeps its run open for apply (see closeRun)
 			cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if err := b.closeRun(cctx, "failed"); err != nil {
+			by := "failed"
+			if !failed {
+				by = "records lost"
+			}
+			if err := b.closeRun(cctx, by); err != nil {
 				b.event(api.EventSignerProblem, "lifecycle", "could not close the Tracekit run: "+err.Error(), nil)
 			}
 			cancel()

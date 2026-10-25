@@ -324,14 +324,29 @@ func TestApplyGuards(t *testing.T) {
 			t.Fatalf("git %v: %v %s", args, err, out)
 		}
 	}
-	marker := filepath.Join(t.TempDir(), "filter-ran")
+	// host programs the checkout's own config could make git run: a smudge/clean filter for *.txt, hooks in
+	// .git/hooks and in core.hooksPath, an fsmonitor; each leaves a file in marks if it runs
+	marks := t.TempDir()
+	marker := filepath.Join(marks, "filter-ran")
 	os.WriteFile(filepath.Join(ws, "a.txt"), []byte("old\n"), 0o644)
 	os.WriteFile(filepath.Join(ws, ".gitignore"), []byte("build/\n.env\n"), 0o644)
 	os.WriteFile(filepath.Join(ws, ".env"), []byte("old\n"), 0o600)
 	os.WriteFile(filepath.Join(ws, ".gitattributes"), []byte("*.txt filter=evil\n"), 0o644)
 	git("config", "filter.evil.smudge", "touch "+marker+"; cat")
 	git("config", "filter.evil.clean", "touch "+marker+"; cat")
+	git("config", "filter.evil.required", "true")
 	git("config", "core.hooksPath", "githooks")
+	hookNames := []string{"pre-applypatch", "post-applypatch", "applypatch-msg", "post-checkout", "post-index-change",
+		"reference-transaction", "pre-commit", "post-merge", "pre-auto-gc"}
+	for _, d := range []string{filepath.Join(ws, ".git", "hooks"), filepath.Join(ws, "githooks")} {
+		os.MkdirAll(d, 0o755)
+		for _, h := range hookNames {
+			os.WriteFile(filepath.Join(d, h), []byte("#!/bin/sh\ntouch "+filepath.Join(marks, "hook-"+h)+"\n"), 0o755)
+		}
+	}
+	fsmon := filepath.Join(t.TempDir(), "fsmonitor.sh")
+	os.WriteFile(fsmon, []byte("#!/bin/sh\ntouch "+filepath.Join(marks, "fsmonitor-ran")+"\n"), 0o755)
+	git("config", "core.fsmonitor", fsmon)
 	newFile := func(name, content string) string {
 		return "diff --git a/" + name + " b/" + name + "\nnew file mode 100755\nindex 0000000..1111111\n--- /dev/null\n+++ b/" + name +
 			"\n@@ -0,0 +1 @@\n+" + content + "\n"
@@ -399,8 +414,11 @@ func TestApplyGuards(t *testing.T) {
 	if err != nil || !slices.Equal(res.Applied, []string{"a.txt", "tool.sh"}) || res.SHA256 == "" {
 		t.Fatalf("apply %+v %v", res, err)
 	}
-	if _, err := os.Stat(marker); err == nil {
-		t.Fatal("a git filter driver from the checkout's config ran on the host")
+	if ran, _ := os.ReadDir(marks); len(ran) != 0 {
+		t.Fatalf("host programs from the checkout's git config ran during apply: %v", ran)
+	}
+	if got := readFile(t, filepath.Join(ws, "a.txt")); got != "new\n" {
+		t.Fatalf("a.txt is %q", got)
 	}
 	if _, err := os.Stat(filepath.Join(ws, "build", "out.o")); err == nil {
 		t.Fatal("an ignored new file was written")

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -227,10 +228,22 @@ func (b *box) event(kind, door, summary string, data map[string]any) {
 // closed). Bulk observes (the refusals Box makes itself, which a guest can produce at will) are rate-limited to
 // bulkRate a second per box; the rest are counted in a summary observe once a second.
 const (
-	mustQueue = 4096
 	bulkQueue = 256
 	bulkRate  = 20
 )
+
+// mustQueue is how many must-record observes may wait for the signer (a var for tests).
+var mustQueue = 4096
+
+// sourceGap is the observe that records must-record observes that never reached the signer:
+// {kind: their source, dropped: how many, reason}.
+const sourceGap = "tkbox.gap"
+
+// gap counts the must-record observes of one source that were lost.
+type gap struct {
+	dropped int
+	reason  string
+}
 
 type observer struct {
 	must   chan observation
@@ -243,6 +256,20 @@ type observer struct {
 	tokens     float64
 	last       time.Time
 	suppressed int
+	gaps       map[string]*gap // must-record observes lost, by source
+}
+
+// lost counts a must-record observe that will never reach the signer (caller holds box.mu).
+func (o *observer) lost(source, reason string) {
+	if o.gaps == nil {
+		o.gaps = map[string]*gap{}
+	}
+	g := o.gaps[source]
+	if g == nil {
+		g = &gap{reason: reason}
+		o.gaps[source] = g
+	}
+	g.dropped++
 }
 
 type observation struct {
@@ -260,16 +287,32 @@ func (b *box) startObserver(run tracekit.Run) {
 	b.mu.Unlock()
 	send := func(ob observation, must bool) {
 		if o.ctx.Err() != nil {
+			if must {
+				b.mu.Lock()
+				o.lost(ob.source, "the signer did not take it before the box stopped")
+				b.mu.Unlock()
+			}
 			return
 		}
 		ctx, cancel := context.WithTimeout(o.ctx, 30*time.Second)
 		err := run.Observe(ctx, ob.source, ob.trust, ob.value)
 		cancel()
-		if err == nil || o.ctx.Err() != nil {
+		if err == nil {
+			return
+		}
+		if o.ctx.Err() != nil {
+			if must {
+				b.mu.Lock()
+				o.lost(ob.source, "the signer did not take it before the box stopped")
+				b.mu.Unlock()
+			}
 			return
 		}
 		b.event(api.EventSignerProblem, "lifecycle", fmt.Sprintf("observe %s failed: %v", ob.source, err), nil)
 		if must {
+			b.mu.Lock()
+			o.lost(ob.source, "the signer refused it or did not answer: "+err.Error())
+			b.mu.Unlock()
 			b.failClosed(ob.source, err)
 		}
 	}
@@ -371,9 +414,42 @@ func (b *box) observe(source, trust string, value any) {
 	case o.must <- ob:
 		b.mu.Unlock()
 	default:
+		o.lost(source, fmt.Sprintf("%d records were already waiting for the signer", mustQueue))
 		b.mu.Unlock()
 		b.failClosed(source, fmt.Errorf("%d records are already waiting for the signer", mustQueue))
 	}
+}
+
+// recordGaps records, once the observer has drained, every must-record observe that never reached the signer
+// (observe tkbox.gap). It returns a close reason naming what was lost when even that could not be recorded.
+func (b *box) recordGaps(ctx context.Context, run tracekit.Run) string {
+	b.mu.Lock()
+	var gaps map[string]*gap
+	if b.obs != nil {
+		gaps, b.obs.gaps = b.obs.gaps, nil
+	}
+	b.mu.Unlock()
+	if len(gaps) == 0 {
+		return ""
+	}
+	sources := make([]string, 0, len(gaps))
+	for s := range gaps {
+		sources = append(sources, s)
+	}
+	sort.Strings(sources)
+	var unrecorded []string
+	for _, s := range sources {
+		g := gaps[s]
+		b.event(api.EventSignerProblem, "lifecycle", fmt.Sprintf("%d %s records never reached the signer: %s", g.dropped, s, g.reason),
+			map[string]any{"kind": s, "dropped": g.dropped})
+		if err := run.Observe(ctx, sourceGap, trustedObs, map[string]any{"kind": s, "dropped": g.dropped, "reason": g.reason}); err != nil {
+			unrecorded = append(unrecorded, fmt.Sprintf("%d %s records lost (%s)", g.dropped, s, g.reason))
+		}
+	}
+	if len(unrecorded) == 0 {
+		return ""
+	}
+	return "records lost and the loss could not be recorded: " + strings.Join(unrecorded, "; ")
 }
 
 // flushObserver stops taking observes and waits until the queued ones reached the signer, or ctx ends (then the rest
