@@ -352,6 +352,6 @@ def test_frames_limits():
 
 
 def test_exec_stdin_truncated_is_a_failure(client, box):
-    r = client.exec(box, ["stdin-unread"])
+    r = client.exec("demo", ["stdin-unread"])
     assert r.stdin_truncated and r.stdin_dropped_bytes == 4096
     assert not r.ok
