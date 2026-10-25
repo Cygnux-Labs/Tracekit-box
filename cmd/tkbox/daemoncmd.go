@@ -1,0 +1,194 @@
+package main
+
+import (
+	"context"
+	"crypto/x509"
+	"fmt"
+	"log"
+	"net/netip"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"syscall"
+	"time"
+
+	"github.com/Cygnux-Labs/tracekit-box/internal/assets"
+	"github.com/Cygnux-Labs/tracekit-box/internal/daemon"
+	"github.com/Cygnux-Labs/tracekit-box/internal/image"
+	"github.com/Cygnux-Labs/tracekit-box/internal/tracekit"
+	"github.com/Cygnux-Labs/tracekit-box/internal/vmm"
+)
+
+// cmdDaemon runs the box manager: it checks the host, connects to the signer (unless --unrecorded), and serves the
+// API until SIGINT/SIGTERM, then stops every box.
+func cmdDaemon(args []string, env *cliEnv) error {
+	fs, _ := newFlags("daemon", env)
+	stateDir := fs.String("state-dir", defaultStateDir(), "state dir (images, boxes, run/tkbox.sock)")
+	signer := fs.String("signer", "", "Tracekit signer socket (default: $TRACEKIT_SIGNER, /etc/tracekit/client.json, or the dev signer)")
+	unrecorded := fs.Bool("unrecorded", false, "run boxes that record NOTHING in Tracekit (no signer needed; boxes can't be exported)")
+	tracekitBin := fs.String("tracekit-bin", "", "the tracekit CLI used by export (default: tracekit in PATH)")
+	fcBin := fs.String("firecracker", "", "firecracker binary (default: the pinned release, downloaded and verified)")
+	kernel := fs.String("kernel", "", "guest kernel vmlinux (default: the pinned kernel, downloaded and verified)")
+	guestDir := fs.String("guest-dir", "", "dir holding tkbox-guest-linux-<arch> (default: next to this binary)")
+	maxBoxes := fs.Int("max-boxes", daemon.DefaultMaxBoxes, "boxes alive at once")
+	approvalTimeout := fs.Duration("approval-timeout", daemon.DefaultApprovalTimeout, "how long egress waits for `tkbox approve`")
+	var allowPrivate stringList
+	allowPrivate.split = true
+	fs.Var(&allowPrivate, "egress-allow-private", "TEST ONLY, DANGEROUS: a private CIDR boxes may reach (repeatable)")
+	upstreamCA := fs.String("upstream-ca", "", "TEST ONLY, DANGEROUS: PEM file of roots trusted for upstream TLS instead of the system's")
+	if pos, err := parseAll(fs, args); err != nil {
+		return err
+	} else if len(pos) > 0 {
+		return usagef("unexpected argument %q", pos[0])
+	}
+	logger := log.New(env.stderr, "tkbox: ", log.LstdFlags)
+	if !filepath.IsAbs(*stateDir) {
+		abs, err := filepath.Abs(*stateDir)
+		if err != nil {
+			return err
+		}
+		*stateDir = abs
+	}
+	if *maxBoxes < 1 || *maxBoxes > 1024 {
+		return usagef("--max-boxes %d: use 1..1024", *maxBoxes)
+	}
+	if *approvalTimeout < time.Second || *approvalTimeout > 4*time.Minute {
+		return usagef("--approval-timeout %s: use 1s..4m (the egress proxy gives up on a connection after 5m)", *approvalTimeout)
+	}
+	if err := os.MkdirAll(*stateDir, 0o700); err != nil {
+		return err
+	}
+	// claim the socket first: a second daemon fails here, before downloading anything
+	sockPath := filepath.Join(*stateDir, "run", "tkbox.sock")
+	l, err := daemon.ListenSocket(sockPath)
+	if err != nil {
+		return err
+	}
+	defer l.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	arch := runtime.GOARCH
+	assetDir := filepath.Join(*stateDir, "images", "assets")
+	if *fcBin == "" {
+		if *fcBin, err = ensureAsset(ctx, assetDir, arch, assets.Firecracker, logger); err != nil {
+			return err
+		}
+	}
+	if *kernel == "" {
+		if *kernel, err = ensureAsset(ctx, assetDir, arch, assets.Kernel, logger); err != nil {
+			return err
+		}
+	}
+	launcher := vmm.NewFirecracker(vmm.FirecrackerOptions{Binary: *fcBin})
+	if err := launcher.Check(); err != nil {
+		return fmt.Errorf("this host can't run boxes: %w", err)
+	}
+	if *guestDir == "" {
+		exe, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		if exe, err = filepath.EvalSymlinks(exe); err != nil {
+			return err
+		}
+		*guestDir = filepath.Dir(exe)
+	}
+	guestBinary := func(a string) (string, error) {
+		p := filepath.Join(*guestDir, "tkbox-guest-linux-"+a)
+		if _, err := os.Stat(p); err != nil {
+			return "", fmt.Errorf("no guest agent at %s: build it with `make guest` or pass --guest-dir", p)
+		}
+		return p, nil
+	}
+	if _, err := guestBinary(arch); err != nil {
+		return err
+	}
+	builder, err := image.NewBuilder(image.Options{CacheDir: filepath.Join(*stateDir, "images"), GuestBinary: guestBinary})
+	if err != nil {
+		return fmt.Errorf("image builder: %w", err)
+	}
+
+	var tk tracekit.Client
+	if *unrecorded {
+		logger.Printf("WARNING: --unrecorded: boxes record NOTHING in Tracekit and cannot be exported; the allowlist and Box approvals still apply")
+	} else {
+		where := *signer
+		if where == "" {
+			where = "the default signer location ($TRACEKIT_SIGNER, /etc/tracekit/client.json, or the dev signer)"
+		}
+		noSigner := func(err error) error {
+			return fmt.Errorf("no Tracekit signer answering at %s (%v): start one with `tracekit up`, or pass --unrecorded to run boxes that record nothing", where, err)
+		}
+		dctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		tk, err = tracekit.Dial(dctx, tracekit.Options{Signer: *signer, TracekitBin: *tracekitBin})
+		cancel()
+		if err != nil {
+			return noSigner(err)
+		}
+		defer tk.Close()
+		sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		st, err := tk.Status(sctx)
+		cancel()
+		if err != nil {
+			return noSigner(err)
+		}
+		logger.Printf("signer %s %s at %s (rpc %d, identity %s)", st.SignerName, st.SignerVersion, st.Where, st.RPCVersion, st.Identity)
+	}
+
+	var prefixes []netip.Prefix
+	for _, c := range allowPrivate.vals {
+		p, err := netip.ParsePrefix(c)
+		if err != nil {
+			return usagef("--egress-allow-private %q: want a CIDR like 10.0.0.0/8", c)
+		}
+		prefixes = append(prefixes, p)
+		logger.Printf("WARNING: --egress-allow-private %s: boxes may reach that private range (test only)", p)
+	}
+	var roots *x509.CertPool
+	if *upstreamCA != "" {
+		pem, err := os.ReadFile(*upstreamCA)
+		if err != nil {
+			return err
+		}
+		roots = x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(pem) {
+			return fmt.Errorf("--upstream-ca %s: no PEM certificates in it", *upstreamCA)
+		}
+		logger.Printf("WARNING: --upstream-ca %s replaces the system roots for upstream TLS (test only)", *upstreamCA)
+	}
+
+	d, err := daemon.New(daemon.Options{
+		StateDir: *stateDir, Launcher: launcher, Builder: builder, Tracekit: tk, Unrecorded: *unrecorded,
+		KernelPath: *kernel, Arch: arch, Version: version, ApprovalTimeout: *approvalTimeout, MaxBoxes: *maxBoxes,
+		EgressAllowPrivate: prefixes, EgressUpstreamRoots: roots, Logger: logger,
+		// GuestClient, NewProxy and Gate default to agentrpc.New, egress.New and tracekit.Gate
+	})
+	if err != nil {
+		return err
+	}
+	logger.Printf("tkbox %s serving on %s (state %s, max %d boxes)", version, sockPath, *stateDir, *maxBoxes)
+	serveErr := d.ServeListener(ctx, l)
+	logger.Printf("stopping every box…")
+	sctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	d.Shutdown(sctx)
+	return serveErr
+}
+
+func ensureAsset(ctx context.Context, dir, arch string, pick func(string) (assets.Asset, error), logger *log.Logger) (string, error) {
+	a, err := pick(arch)
+	if err != nil {
+		return "", fmt.Errorf("no pinned asset for %s: %w (pass --firecracker and --kernel)", arch, err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	p, err := assets.Ensure(ctx, dir, a)
+	if err != nil {
+		return "", fmt.Errorf("fetch %s %s: %w (pass --firecracker/--kernel to use local files)", a.Name, a.Version, err)
+	}
+	logger.Printf("%s %s: %s", a.Name, a.Version, p)
+	return p, nil
+}
