@@ -175,6 +175,18 @@ func (s *Server) handleShutdown(c net.Conn, f proto.Frame) {
 	})
 }
 
+// safeGo runs f on a goroutine that logs a panic instead of crashing: in PID 1 a crash panics the kernel.
+func safeGo(logf func(string, ...any), f func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil && logf != nil {
+				logf("panic: %v", r)
+			}
+		}()
+		f()
+	}()
+}
+
 func sendError(c net.Conn, code, msg string) {
 	proto.WriteJSON(c, proto.TypeError, proto.Error{Code: code, Message: msg})
 }

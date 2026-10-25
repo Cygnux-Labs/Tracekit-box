@@ -121,6 +121,14 @@ func TestExecStdin(t *testing.T) {
 	if err != nil || es.Code != 0 || !bytes.Equal(out.Bytes(), data) {
 		t.Fatalf("cat: %+v %v, %d bytes back", es, err, out.Len())
 	}
+	// the process exits while the host is still streaming stdin: late frames are dropped, never a guest crash
+	for _, argv := range [][]string{{"true"}, {"head", "-c", "10"}} {
+		es, err = f.c.Exec(ctxT(t, 20*time.Second), proto.ExecRequest{Argv: argv},
+			agentrpc.ExecIO{Stdin: io.LimitReader(zeroReader{}, 64<<20), Stdout: io.Discard})
+		if err != nil || es.Code != 0 {
+			t.Fatalf("%v with unread stdin: %+v %v", argv, es, err)
+		}
+	}
 	// without Stdin the child reads /dev/null
 	out.Reset()
 	es, err = f.c.Exec(ctxT(t, 5*time.Second), proto.ExecRequest{Argv: []string{"sh", "-c", "cat; echo done"}},

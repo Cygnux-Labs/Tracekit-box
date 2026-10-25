@@ -108,14 +108,14 @@ func (s *Server) handleExec(c net.Conn, f proto.Frame, st *state) {
 	run := &execRun{conn: c, proc: p, maxOut: lim.MaxOutputBytes}
 	var pumps sync.WaitGroup
 	pumps.Add(2)
-	go run.pump(ex.outR, proto.TypeStdout, &pumps)
-	go run.pump(ex.errR, proto.TypeStderr, &pumps)
+	safeGo(s.logf, func() { run.pump(ex.outR, proto.TypeStdout, &pumps) })
+	safeGo(s.logf, func() { run.pump(ex.errR, proto.TypeStderr, &pumps) })
 
 	hostGone := make(chan struct{})
 	finished := make(chan struct{})
 	defer close(finished)
 	stdin := newStdinFeeder(ex.stdinW, finished)
-	go run.readHost(stdin, hostGone, finished, s.logf)
+	safeGo(s.logf, func() { run.readHost(stdin, hostGone, finished, s.logf) })
 
 	timeout := time.Duration(req.TimeoutMS) * time.Millisecond
 	if req.TimeoutMS <= 0 {
@@ -262,27 +262,44 @@ func (r *execRun) readHost(stdin *stdinFeeder, hostGone, finished chan struct{},
 }
 
 // stdinFeeder writes TypeStdin payloads to the child's stdin pipe on its own goroutine so a child that does not read
-// stdin never blocks the frame reader (and with it signals and host-gone detection) for long.
+// stdin never blocks the frame reader (and with it signals and host-gone detection) for long. ch is never closed (a
+// late frame after the process exited must not panic PID 1); stop ends the feed after what is queued.
 type stdinFeeder struct {
 	w        *os.File // nil when the exec has no stdin
 	ch       chan []byte
+	stop     chan struct{}
 	once     sync.Once
 	finished <-chan struct{}
 }
 
 func newStdinFeeder(w *os.File, finished <-chan struct{}) *stdinFeeder {
-	sf := &stdinFeeder{w: w, ch: make(chan []byte, 4), finished: finished}
+	sf := &stdinFeeder{w: w, ch: make(chan []byte, 4), stop: make(chan struct{}), finished: finished}
 	if w != nil {
 		go func() {
+			defer w.Close() // EOF for the child
 			ok := true
-			for b := range sf.ch {
+			write := func(b []byte) {
 				if ok {
 					if _, err := w.Write(b); err != nil {
 						ok = false // the child closed stdin: drop the rest
 					}
 				}
 			}
-			w.Close()
+			for {
+				select {
+				case b := <-sf.ch:
+					write(b)
+				case <-sf.stop:
+					for {
+						select {
+						case b := <-sf.ch:
+							write(b)
+						default:
+							return
+						}
+					}
+				}
+			}
 		}()
 	}
 	return sf
@@ -293,15 +310,19 @@ func (sf *stdinFeeder) send(b []byte) {
 		return
 	}
 	select {
+	case <-sf.stop:
+		return
+	default:
+	}
+	select {
 	case sf.ch <- b:
+	case <-sf.stop:
 	case <-sf.finished:
 	}
 }
 
 func (sf *stdinFeeder) close() {
-	sf.once.Do(func() {
-		close(sf.ch)
-	})
+	sf.once.Do(func() { close(sf.stop) })
 }
 
 // execPipes are the child's stdio. The parent keeps stdinW (nil without stdin), outR and errR.

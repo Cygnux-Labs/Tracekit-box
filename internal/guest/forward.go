@@ -51,10 +51,10 @@ func (f *Forwarder) Serve(l net.Listener) error {
 			c.Close()
 			continue
 		}
-		go func() {
+		safeGo(f.Logf, func() {
 			defer func() { <-slots }()
 			f.forward(c)
-		}()
+		})
 	}
 }
 
