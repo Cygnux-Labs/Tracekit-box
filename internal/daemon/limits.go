@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"fmt"
+	"net/netip"
 	"net/textproto"
 	"os"
 	"path/filepath"
@@ -59,6 +60,8 @@ type spec struct {
 	secrets    []egress.Secret // placeholders filled later
 	inspect    string
 	agent      string
+	// this host's own addresses, which the proxy refuses
+	blockPrefixes []netip.Prefix
 }
 
 // validate checks a create request and fills in defaults. Errors never hold a secret value.
@@ -111,7 +114,8 @@ func (d *Daemon) validate(req api.CreateBoxRequest) (*spec, *api.ErrorDetail) {
 	if len(req.Allow) > 0 {
 		allow, model, err := d.eg.expand(req.Allow)
 		if err != nil {
-			return bad("use a preset (github, pypi, npm, anthropic, openai, apt-ubuntu, go-proxy) or a host (api.example.com, h:8443)", "allow: %v", err)
+			// the egress package's message names the presets and says what to do
+			return bad("", "%s", strings.TrimPrefix(err.Error(), "egress: "))
 		}
 		s.allow, s.modelHosts = allow, model
 	}
@@ -146,13 +150,16 @@ func (d *Daemon) validate(req api.CreateBoxRequest) (*spec, *api.ErrorDetail) {
 		hosts := make([]string, len(sec.Hosts))
 		for i, h := range sec.Hosts {
 			h = strings.ToLower(strings.TrimSpace(h))
-			if h == "" || h == "*" || strings.ContainsAny(h, " /@#:") || strings.Count(h, "*") > 1 ||
-				(strings.Contains(h, "*") && !strings.HasPrefix(h, "*.")) {
-				return bad("use exact host names or *.example.com", "secret %s: host %q is not valid", n, sec.Hosts[i])
+			if strings.Contains(h, "*") {
+				return bad("list each exact host the secret may go to, e.g. "+n+"=env:VAR@api.example.com,uploads.example.com",
+					"secret %s: host %q is a wildcard; a secret is bound to exact hosts only", n, sec.Hosts[i])
+			}
+			if h == "" || strings.ContainsAny(h, " /@#:") {
+				return bad("use exact host names such as api.example.com", "secret %s: host %q is not valid", n, sec.Hosts[i])
 			}
 			hosts[i] = h
 		}
-		header := ""
+		header := egress.DefaultSecretHeader // an empty header means Authorization
 		if sec.Header != "" {
 			if !headerRE.MatchString(sec.Header) {
 				return bad("use an HTTP header name such as Authorization", "secret %s: header %q is not valid", n, sec.Header)

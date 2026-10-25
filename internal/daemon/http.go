@@ -280,6 +280,10 @@ func (d *Daemon) hExec(w http.ResponseWriter, r *http.Request) {
 	}
 	var req api.ExecRequest
 	if err := readJSON(r, &req); err != nil {
+		if strings.Contains(err.Error(), "http: request body too large") || r.ContentLength > maxBody {
+			writeErr(w, errTooLong)
+			return
+		}
 		writeErr(w, err)
 		return
 	}
@@ -288,6 +292,15 @@ func (d *Daemon) hExec(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, e)
 		return
 	}
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		writeErr(w, errf(api.CodeUnavailable, "start the daemon again (`tkbox daemon`) and retry", "the daemon is shutting down"))
+		return
+	}
+	d.wg.Add(1)
+	d.mu.Unlock()
+	defer d.wg.Done()
 	conn, brw, err := http.NewResponseController(w).Hijack()
 	if err != nil {
 		writeErr(w, errf(api.CodeInternal, "retry over the Unix socket with HTTP/1.1", "cannot upgrade: %v", err))
@@ -298,9 +311,7 @@ func (d *Daemon) hExec(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: "+api.ExecUpgrade+"\r\nConnection: Upgrade\r\n\r\n"); err != nil {
 		return
 	}
-	d.wg.Add(1)
-	defer d.wg.Done()
-	b.runExec(d.ctx, brw.Reader, conn, req)
+	b.runExec(d.ctx, conn, brw.Reader, conn, req)
 }
 
 // Serve listens on the API socket and serves until ctx ends. It refuses to start while another daemon answers on

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,17 +17,33 @@ import (
 	"github.com/Cygnux-Labs/tracekit-box/internal/tracekit"
 )
 
+// maxEventLog caps events.ndjson: past it bulk lines (egress connections and refusals, signer problems) are dropped
+// after one line saying so; must-record lines (lifecycle, execs, secrets, approvals, containment, apply) are kept.
+const maxEventLog = 64 << 20
+
+// EventLogCapped is the kind of the one line written when events.ndjson reaches maxEventLog.
+const eventLogCapped = "events.capped"
+
+// bulkEventKinds are the event kinds a guest can produce at will; they are the first to go when a cap is reached.
+var bulkEventKinds = map[string]bool{api.EventEgressAllowed: true, api.EventEgressDenied: true,
+	api.EventEgressClosed: true, api.EventSignerProblem: true}
+
 // eventLog is a box's events.ndjson (0600, append only). Every line goes through the box's scrubber, so a secret value
 // or placeholder never lands on disk even if a caller slips one into a summary.
 type eventLog struct {
-	path   string
-	mu     sync.Mutex
-	f      *os.File
-	notify chan struct{} // closed and replaced on every write (followers wait on it)
+	path      string
+	mu        sync.Mutex
+	f         *os.File
+	size      int64
+	sized     bool
+	capped    bool
+	transient bool          // the box is down: open the file per write instead of holding it
+	notify    chan struct{} // closed and replaced on every write (followers wait on it)
+	max       int64
 }
 
 func openEventLog(dir string) *eventLog {
-	return &eventLog{path: filepath.Join(dir, "events.ndjson"), notify: make(chan struct{})}
+	return &eventLog{path: filepath.Join(dir, "events.ndjson"), notify: make(chan struct{}), max: maxEventLog}
 }
 
 func (l *eventLog) write(e api.Event) error {
@@ -43,11 +60,41 @@ func (l *eventLog) write(e api.Event) error {
 			return err
 		}
 		l.f = f
+		if !l.sized {
+			if fi, err := f.Stat(); err == nil {
+				l.size = fi.Size()
+			}
+			l.sized = true
+		}
 	}
-	_, err = l.f.Write(b)
+	if l.transient {
+		defer func() { l.f.Close(); l.f = nil }()
+	}
+	if l.size+int64(len(b)) > l.max && bulkEventKinds[e.Kind] {
+		if l.capped {
+			return nil
+		}
+		l.capped = true
+		capLine, _ := json.Marshal(api.Event{Time: e.Time, BoxID: e.BoxID, Kind: eventLogCapped, Door: "lifecycle",
+			Summary: fmt.Sprintf("events.ndjson reached %d MiB: egress and signer-problem lines are no longer written (lifecycle, exec, secret, approval, containment and apply lines still are)", l.max>>20)})
+		b = append(capLine, '\n')
+	}
+	n, err := l.f.Write(b)
+	l.size += int64(n)
 	close(l.notify)
 	l.notify = make(chan struct{})
 	return err
+}
+
+// release closes the file once the box is down; later lines (apply decisions) open it per write.
+func (l *eventLog) release() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.transient = true
+	if l.f != nil {
+		l.f.Close()
+		l.f = nil
+	}
 }
 
 func (l *eventLog) wait() <-chan struct{} {
@@ -63,6 +110,7 @@ func (l *eventLog) close() {
 		l.f.Close()
 		l.f = nil
 	}
+	l.transient = true
 	close(l.notify)
 	l.notify = make(chan struct{})
 }
@@ -175,10 +223,53 @@ func (b *box) event(kind, door, summary string, data map[string]any) {
 	}
 }
 
-// observer queues observe calls in order so the proxy's goroutines never wait on the signer.
+// Observes go to the signer in two lanes. Must-record observes (secret use and leaks, model calls, approvals,
+// containment) are never dropped: when one can't be queued or the signer refuses it, the box is stopped (fail
+// closed). Bulk observes (the refusals Box makes itself, which a guest can produce at will) are rate-limited to
+// bulkRate a second per box; the rest are counted in a summary observe once a second.
+const (
+	bulkQueue = 256
+	bulkRate  = 20
+)
+
+// mustQueue is how many must-record observes may wait for the signer (a var for tests).
+var mustQueue = 4096
+
+// sourceGap is the observe that records must-record observes that never reached the signer:
+// {kind: their source, dropped: how many, reason}.
+const sourceGap = "tkbox.gap"
+
+// gap counts the must-record observes of one source that were lost.
+type gap struct {
+	dropped int
+	reason  string
+}
+
 type observer struct {
-	ch   chan observation
-	done chan struct{}
+	must   chan observation
+	bulk   chan observation
+	ctx    context.Context // cancelled when a flush gives up: the rest is dropped instead of waiting on a hung signer
+	cancel context.CancelFunc
+	done   chan struct{}
+
+	// guarded by box.mu
+	tokens     float64
+	last       time.Time
+	suppressed int
+	gaps       map[string]*gap // must-record observes lost, by source
+}
+
+// lost counts a must-record observe that will never reach the signer (caller holds box.mu).
+func (o *observer) lost(source, reason string) {
+	if o.gaps == nil {
+		o.gaps = map[string]*gap{}
+	}
+	g := o.gaps[source]
+	if g == nil {
+		g = &gap{reason: reason}
+		o.gaps[source] = g
+	}
+	g.dropped++
 }
 
 type observation struct {
@@ -187,50 +278,199 @@ type observation struct {
 	value  any
 }
 
-const observeQueue = 4096
-
 func (b *box) startObserver(run tracekit.Run) {
-	o := &observer{ch: make(chan observation, observeQueue), done: make(chan struct{})}
+	ctx, cancel := context.WithCancel(b.d.ctx)
+	o := &observer{must: make(chan observation, mustQueue), bulk: make(chan observation, bulkQueue), ctx: ctx,
+		cancel: cancel, done: make(chan struct{}), tokens: bulkRate, last: time.Now()}
+	b.mu.Lock()
 	b.obs = o
+	b.mu.Unlock()
+	send := func(ob observation, must bool) {
+		if o.ctx.Err() != nil {
+			if must {
+				b.mu.Lock()
+				o.lost(ob.source, "the signer did not take it before the box stopped")
+				b.mu.Unlock()
+			}
+			return
+		}
+		ctx, cancel := context.WithTimeout(o.ctx, 30*time.Second)
+		err := run.Observe(ctx, ob.source, ob.trust, ob.value)
+		cancel()
+		if err == nil {
+			return
+		}
+		if o.ctx.Err() != nil {
+			if must {
+				b.mu.Lock()
+				o.lost(ob.source, "the signer did not take it before the box stopped")
+				b.mu.Unlock()
+			}
+			return
+		}
+		b.event(api.EventSignerProblem, "lifecycle", fmt.Sprintf("observe %s failed: %v", ob.source, err), nil)
+		if must {
+			b.mu.Lock()
+			o.lost(ob.source, "the signer refused it or did not answer: "+err.Error())
+			b.mu.Unlock()
+			b.failClosed(ob.source, err)
+		}
+	}
+	summary := func() {
+		b.mu.Lock()
+		n := o.suppressed
+		o.suppressed = 0
+		b.mu.Unlock()
+		if n > 0 {
+			send(observation{tracekit.SourceEgress, untrustedObs, map[string]any{"decision": "deny", "summary": true,
+				"suppressed": n, "reason": fmt.Sprintf("%d more refusals Box made itself were not recorded one by one (at most %d a second)", n, bulkRate)}}, false)
+		}
+	}
+	drain := func() { // the run is closing: send what is queued, then the last summary
+		for {
+			select {
+			case ob := <-o.bulk:
+				send(ob, false)
+			default:
+				summary()
+				return
+			}
+		}
+	}
 	go func() {
 		defer close(o.done)
-		for ob := range o.ch {
-			ctx, cancel := context.WithTimeout(b.d.ctx, 30*time.Second)
-			err := run.Observe(ctx, ob.source, ob.trust, ob.value)
-			cancel()
-			if err != nil {
-				b.event(api.EventSignerProblem, "lifecycle", fmt.Sprintf("observe %s failed: %v", ob.source, err), nil)
+		defer cancel()
+		tick := time.NewTicker(time.Second)
+		defer tick.Stop()
+		for {
+			select { // must-record observes first
+			case ob, ok := <-o.must:
+				if !ok {
+					drain()
+					return
+				}
+				send(ob, true)
+				continue
+			default:
+			}
+			select {
+			case ob, ok := <-o.must:
+				if !ok {
+					drain()
+					return
+				}
+				send(ob, true)
+			case ob := <-o.bulk:
+				send(ob, false)
+			case <-tick.C:
+				summary()
 			}
 		}
 	}()
 }
 
-// observe queues one observe (no-op when unrecorded). It never blocks: a full queue drops the record and says so.
+// failClosed stops a box whose must-record observe could not be recorded.
+func (b *box) failClosed(source string, err error) {
+	b.mu.Lock()
+	already := b.failedClosed
+	b.failedClosed = true
+	b.mu.Unlock()
+	if already {
+		return // the box is already going down; the loss is counted for its tkbox.gap record
+	}
+	reason := "could not record " + source + " in Tracekit, so the box was stopped (fail closed)"
+	b.event(api.EventSignerProblem, "lifecycle", reason+": "+err.Error(), nil)
+	b.d.log.Printf("%s: %s: %v", b.id, reason, err)
+	go b.stop(context.Background(), reason, false)
+}
+
+// observe queues one observe (no-op when unrecorded). It never blocks.
 func (b *box) observe(source, trust string, value any) {
 	value = b.scrub().value(value)
-	dropped := false
+	ob := observation{source, trust, value}
+	bulk := source == tracekit.SourceEgress
 	b.mu.Lock()
-	if b.obs != nil && !b.obsClosed {
-		select {
-		case b.obs.ch <- observation{source, trust, value}:
-		default:
-			dropped = true
+	o := b.obs
+	if o == nil || b.obsClosed {
+		if o != nil && !bulk {
+			o.lost(source, "it came after the box started closing its run")
 		}
+		b.mu.Unlock()
+		if o != nil {
+			b.event(api.EventSignerProblem, "lifecycle", "not recorded, the run is closing: a "+source+" record", nil)
+		}
+		return
 	}
-	b.mu.Unlock()
-	if dropped {
-		b.event(api.EventSignerProblem, "lifecycle", "observe queue full: a "+source+" record was dropped", nil)
+	if bulk {
+		now := time.Now()
+		o.tokens = min(bulkRate, o.tokens+now.Sub(o.last).Seconds()*bulkRate)
+		o.last = now
+		queued := false
+		if o.tokens >= 1 {
+			select {
+			case o.bulk <- ob:
+				o.tokens--
+				queued = true
+			default:
+			}
+		}
+		if !queued {
+			o.suppressed++
+		}
+		b.mu.Unlock()
+		return
+	}
+	select {
+	case o.must <- ob:
+		b.mu.Unlock()
+	default:
+		o.lost(source, fmt.Sprintf("%d records were already waiting for the signer", mustQueue))
+		b.mu.Unlock()
+		b.failClosed(source, fmt.Errorf("%d records are already waiting for the signer", mustQueue))
 	}
 }
 
-// flushObserver stops taking observes and waits until the queued ones reached the signer (or ctx ends).
+// recordGaps records, once the observer has drained, every must-record observe that never reached the signer
+// (observe tkbox.gap). It returns a close reason naming what was lost when even that could not be recorded.
+func (b *box) recordGaps(ctx context.Context, run tracekit.Run) string {
+	b.mu.Lock()
+	var gaps map[string]*gap
+	if b.obs != nil {
+		gaps, b.obs.gaps = b.obs.gaps, nil
+	}
+	b.mu.Unlock()
+	if len(gaps) == 0 {
+		return ""
+	}
+	sources := make([]string, 0, len(gaps))
+	for s := range gaps {
+		sources = append(sources, s)
+	}
+	sort.Strings(sources)
+	var unrecorded []string
+	for _, s := range sources {
+		g := gaps[s]
+		b.event(api.EventSignerProblem, "lifecycle", fmt.Sprintf("%d %s records never reached the signer: %s", g.dropped, s, g.reason),
+			map[string]any{"kind": s, "dropped": g.dropped})
+		if err := run.Observe(ctx, sourceGap, trustedObs, map[string]any{"kind": s, "dropped": g.dropped, "reason": g.reason}); err != nil {
+			unrecorded = append(unrecorded, fmt.Sprintf("%d %s records lost (%s)", g.dropped, s, g.reason))
+		}
+	}
+	if len(unrecorded) == 0 {
+		return ""
+	}
+	return "records lost and the loss could not be recorded: " + strings.Join(unrecorded, "; ")
+}
+
+// flushObserver stops taking observes and waits until the queued ones reached the signer, or ctx ends (then the rest
+// is dropped and the observer stops at once).
 func (b *box) flushObserver(ctx context.Context) {
 	b.mu.Lock()
 	o := b.obs
 	already := b.obsClosed
 	b.obsClosed = true
 	if o != nil && !already {
-		close(o.ch)
+		close(o.must)
 	}
 	b.mu.Unlock()
 	if o == nil {
@@ -239,5 +479,7 @@ func (b *box) flushObserver(ctx context.Context) {
 	select {
 	case <-o.done:
 	case <-ctx.Done():
+		o.cancel()
+		b.event(api.EventSignerProblem, "lifecycle", "the signer did not take the last records in time; they were dropped", nil)
 	}
 }

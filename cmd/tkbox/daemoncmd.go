@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"crypto/x509"
+	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net/netip"
@@ -23,7 +25,7 @@ import (
 // cmdDaemon runs the box manager: it checks the host, connects to the signer (unless --unrecorded), and serves the
 // API until SIGINT/SIGTERM, then stops every box.
 func cmdDaemon(args []string, env *cliEnv) error {
-	fs, _ := newFlags("daemon", env)
+	fs, sock := newFlags("daemon", env)
 	stateDir := fs.String("state-dir", defaultStateDir(), "state dir (images, boxes, run/tkbox.sock)")
 	signer := fs.String("signer", "", "Tracekit signer socket (default: $TRACEKIT_SIGNER, /etc/tracekit/client.json, or the dev signer)")
 	unrecorded := fs.Bool("unrecorded", false, "run boxes that record NOTHING in Tracekit (no signer needed; boxes can't be exported)")
@@ -32,7 +34,7 @@ func cmdDaemon(args []string, env *cliEnv) error {
 	kernel := fs.String("kernel", "", "guest kernel vmlinux (default: the pinned kernel, downloaded and verified)")
 	guestDir := fs.String("guest-dir", "", "dir holding tkbox-guest-linux-<arch> (default: next to this binary)")
 	maxBoxes := fs.Int("max-boxes", daemon.DefaultMaxBoxes, "boxes alive at once")
-	approvalTimeout := fs.Duration("approval-timeout", daemon.DefaultApprovalTimeout, "how long egress waits for `tkbox approve`")
+	approvalTimeout := fs.Duration("approval-timeout", daemon.DefaultApprovalTimeout, "how long egress waits for a person to run tkbox approve (1s..4m)")
 	var allowPrivate stringList
 	allowPrivate.split = true
 	fs.Var(&allowPrivate, "egress-allow-private", "TEST ONLY, DANGEROUS: a private CIDR boxes may reach (repeatable)")
@@ -54,13 +56,25 @@ func cmdDaemon(args []string, env *cliEnv) error {
 		return usagef("--max-boxes %d: use 1..1024", *maxBoxes)
 	}
 	if *approvalTimeout < time.Second || *approvalTimeout > 4*time.Minute {
-		return usagef("--approval-timeout %s: use 1s..4m (the egress proxy gives up on a connection after 5m)", *approvalTimeout)
+		return usagef("--approval-timeout %s: use 1s..4m (a connection waits for its approval at most that long plus 30s)", *approvalTimeout)
 	}
-	if err := os.MkdirAll(*stateDir, 0o700); err != nil {
+	socketSet := false
+	fs.Visit(func(f *flag.Flag) { socketSet = socketSet || f.Name == "socket" })
+	var err error
+	if err = os.MkdirAll(*stateDir, 0o700); err != nil {
 		return err
+	}
+	// a host without KVM fails here, before anything is downloaded
+	if err := checkKVM(); err != nil {
+		return fmt.Errorf("this host can't run boxes: %w", err)
 	}
 	// claim the socket first: a second daemon fails here, before downloading anything
 	sockPath := filepath.Join(*stateDir, "run", "tkbox.sock")
+	if socketSet {
+		if sockPath, err = filepath.Abs(*sock); err != nil {
+			return err
+		}
+	}
 	l, err := daemon.ListenSocket(sockPath)
 	if err != nil {
 		return err
@@ -114,12 +128,12 @@ func cmdDaemon(args []string, env *cliEnv) error {
 	if *unrecorded {
 		logger.Printf("WARNING: --unrecorded: boxes record NOTHING in Tracekit and cannot be exported; the allowlist and Box approvals still apply")
 	} else {
-		where := *signer
-		if where == "" {
-			where = "the default signer location ($TRACEKIT_SIGNER, /etc/tracekit/client.json, or the dev signer)"
-		}
 		noSigner := func(err error) error {
-			return fmt.Errorf("no Tracekit signer answering at %s (%v): start one with `tracekit up`, or pass --unrecorded to run boxes that record nothing", where, err)
+			var u *tracekit.Unavailable
+			if errors.As(err, &u) {
+				err = u.Err // "no signer answering at …", without the wrapper's own words
+			}
+			return fmt.Errorf("the daemon needs a Tracekit signer: %v\nstart one with `tracekit up`, or pass --unrecorded to run boxes that record nothing", err)
 		}
 		dctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		tk, err = tracekit.Dial(dctx, tracekit.Options{Signer: *signer, TracekitBin: *tracekitBin})
@@ -175,6 +189,18 @@ func cmdDaemon(args []string, env *cliEnv) error {
 	defer cancel()
 	d.Shutdown(sctx)
 	return serveErr
+}
+
+// checkKVM fails fast on a host that can't run Firecracker.
+func checkKVM() error {
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("tkbox daemon runs on Linux with /dev/kvm, not %s (use a Linux VM such as Lima)", runtime.GOOS)
+	}
+	f, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("/dev/kvm is not usable (%v): enable KVM (nested virtualization on a VM) and add this user to the kvm group", err)
+	}
+	return f.Close()
 }
 
 func ensureAsset(ctx context.Context, dir, arch string, pick func(string) (assets.Asset, error), logger *log.Logger) (string, error) {

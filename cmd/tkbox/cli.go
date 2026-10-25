@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -15,6 +20,7 @@ import (
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
 	"github.com/Cygnux-Labs/tracekit-box/internal/config"
+	"github.com/Cygnux-Labs/tracekit-box/internal/proto"
 )
 
 const unrecordedWarning = "WARNING: this box is UNRECORDED: nothing it does is recorded in Tracekit and it cannot be exported. The allowlist and Box approvals still apply."
@@ -40,6 +46,7 @@ func buildRunRequest(args []string, env *cliEnv) (api.CreateBoxRequest, string, 
 	fs.StringVar(&fl.Task, "task", "", "the task, recorded in the Tracekit run")
 	fs.StringVar(&fl.Agent, "agent", "", `agent name recorded in the run (default "tkbox")`)
 	cfgPath := fs.String("config", "", "tkbox.yaml (default ./tkbox.yaml if present)")
+	noConfig := fs.Bool("no-config", false, "don't read ./tkbox.yaml")
 	jsonOut := fs.Bool("json", false, "print the box as JSON")
 	pos, err := parseAll(fs, args)
 	if err != nil {
@@ -48,11 +55,15 @@ func buildRunRequest(args []string, env *cliEnv) (api.CreateBoxRequest, string, 
 	if len(pos) > 0 {
 		return api.CreateBoxRequest{}, "", false, usagef("unexpected argument %q (flags only; the command goes to `tkbox exec`)", pos[0])
 	}
+	if *noConfig && *cfgPath != "" {
+		return api.CreateBoxRequest{}, "", false, usagef("--config and --no-config: pick one")
+	}
 	var file *config.File
 	path := *cfgPath
-	if path == "" {
+	if path == "" && !*noConfig {
 		if _, err := os.Stat(config.DefaultFile); err == nil {
 			path = config.DefaultFile
+			fmt.Fprintf(env.stderr, "tkbox: reading settings from ./%s (pass --no-config to skip it)\n", config.DefaultFile)
 		}
 	}
 	if path != "" {
@@ -83,9 +94,17 @@ func cmdRun(ctx context.Context, args []string, env *cliEnv) error {
 	if err != nil {
 		return err
 	}
+	c := newClient(sock)
+	// the daemon checks the request first, so a bad flag is reported before anything is pulled or booted
+	check := req
+	check.ValidateOnly = true
+	var preview api.Box
+	if err := c.do(ctx, "POST", "/v1/boxes", check, &preview); err != nil {
+		return err
+	}
 	fmt.Fprintf(env.stderr, "tkbox: creating a box from %s…\n", req.Image)
 	var b api.Box
-	if err := newClient(sock).do(ctx, "POST", "/v1/boxes", req, &b); err != nil {
+	if err := c.do(ctx, "POST", "/v1/boxes", req, &b); err != nil {
 		return err
 	}
 	if jsonOut {
@@ -98,6 +117,14 @@ func cmdRun(ctx context.Context, args []string, env *cliEnv) error {
 	}
 	fmt.Fprintf(env.stderr, "; expires %s\n", b.ExpiresAt.Local().Format(time.Kitchen))
 	fmt.Fprintf(env.stderr, "tkbox: allowed egress: %s\n", orNone(b.Allow))
+	for _, n := range b.Secrets {
+		if h := b.SecretHeaders[n]; h != "" {
+			fmt.Fprintf(env.stderr, "tkbox: secret %s goes only in the %s header, only to its bound hosts\n", n, h)
+		}
+	}
+	for _, n := range b.Notices {
+		fmt.Fprintf(env.stderr, "tkbox: %s\n", printable(env.stderr, n))
+	}
 	if b.Unrecorded {
 		fmt.Fprintln(env.stderr, "tkbox: "+unrecordedWarning)
 	}
@@ -112,19 +139,57 @@ func orNone(s []string) string {
 	return strings.Join(s, ", ")
 }
 
-// Linux signal numbers (the guest is Linux) for exit codes 128+n.
+// Linux signal numbers (the guest is Linux; x86_64 and arm64 share them) for exit codes 128+n, with the usual aliases.
 var signalNumbers = map[string]int{"SIGHUP": 1, "SIGINT": 2, "SIGQUIT": 3, "SIGILL": 4, "SIGTRAP": 5, "SIGABRT": 6,
-	"SIGBUS": 7, "SIGFPE": 8, "SIGKILL": 9, "SIGUSR1": 10, "SIGSEGV": 11, "SIGUSR2": 12, "SIGPIPE": 13, "SIGALRM": 14,
-	"SIGTERM": 15}
+	"SIGIOT": 6, "SIGBUS": 7, "SIGFPE": 8, "SIGKILL": 9, "SIGUSR1": 10, "SIGSEGV": 11, "SIGUSR2": 12, "SIGPIPE": 13,
+	"SIGALRM": 14, "SIGTERM": 15, "SIGSTKFLT": 16, "SIGCHLD": 17, "SIGCLD": 17, "SIGCONT": 18, "SIGSTOP": 19,
+	"SIGTSTP": 20, "SIGTTIN": 21, "SIGTTOU": 22, "SIGURG": 23, "SIGXCPU": 24, "SIGXFSZ": 25, "SIGVTALRM": 26,
+	"SIGPROF": 27, "SIGWINCH": 28, "SIGIO": 29, "SIGPOLL": 29, "SIGPWR": 30, "SIGSYS": 31, "SIGUNUSED": 31}
+
+// Real-time signals as glibc and `kill -l` number them.
+const sigRTMin, sigRTMax = 34, 64
+
+// signalNumber maps a signal name ("SIGTERM", "SIGRTMIN+3", "SIGRTMAX-1", "signal 40") to its Linux number.
+func signalNumber(name string) (int, bool) {
+	if n, ok := signalNumbers[name]; ok {
+		return n, true
+	}
+	num := func(s string) (int, bool) {
+		n, err := strconv.Atoi(s)
+		return n, err == nil && n >= 0
+	}
+	switch {
+	case name == "SIGRTMIN":
+		return sigRTMin, true
+	case name == "SIGRTMAX":
+		return sigRTMax, true
+	case strings.HasPrefix(name, "SIGRTMIN+"):
+		if n, ok := num(strings.TrimPrefix(name, "SIGRTMIN+")); ok && sigRTMin+n <= sigRTMax {
+			return sigRTMin + n, true
+		}
+	case strings.HasPrefix(name, "SIGRTMAX-"):
+		if n, ok := num(strings.TrimPrefix(name, "SIGRTMAX-")); ok && sigRTMax-n >= sigRTMin {
+			return sigRTMax - n, true
+		}
+	case strings.HasPrefix(name, "signal "):
+		if n, ok := num(strings.TrimPrefix(name, "signal ")); ok && n >= 1 && n <= sigRTMax {
+			return n, true
+		}
+	}
+	return 0, false
+}
 
 func cmdExec(args []string, env *cliEnv) int {
 	fs, sock := newFlags("exec", env)
 	interactive := fs.Bool("i", false, "forward stdin")
-	timeout := fs.Duration("timeout", 0, "per-command timeout (default the box's exec timeout)")
+	timeout := fs.Duration("timeout", 0, "per-command timeout, 1s..24h (default the box's exec timeout)")
 	cwd := fs.String("cwd", "", "working dir in the box (default /workspace)")
 	var envs stringList
 	fs.Var(&envs, "env", "KEY=VALUE (repeatable)")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 2
 	}
 	rest := fs.Args()
@@ -134,11 +199,18 @@ func cmdExec(args []string, env *cliEnv) int {
 	}
 	box := rest[0]
 	if err := fs.Parse(rest[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 2
 	}
 	argv := fs.Args()
 	if len(argv) == 0 {
 		fmt.Fprintln(env.stderr, "tkbox exec: no command: tkbox exec <box> -- <command> [args...]")
+		return 2
+	}
+	if *timeout != 0 && (*timeout < time.Second || *timeout > config.MaxExecTimeout) {
+		fmt.Fprintf(env.stderr, "tkbox exec: --timeout %s: use 1s..24h\n", *timeout)
 		return 2
 	}
 	envMap, err := parseEnvList(envs.vals)
@@ -155,7 +227,7 @@ func cmdExec(args []string, env *cliEnv) int {
 		for s := range sigc {
 			switch s {
 			case os.Interrupt:
-				// Ctrl-C goes to the process in the box; the third one gives up on it here
+				// Ctrl-C goes to the process in the box (before it starts, it cancels it); the third one gives up here
 				if interrupts++; interrupts >= 3 {
 					fmt.Fprintln(env.stderr, "tkbox: giving up on the command (it may still run in the box; `tkbox stop` stops the box)")
 					os.Exit(130)
@@ -173,7 +245,7 @@ func cmdExec(args []string, env *cliEnv) int {
 	eio := execIO{Stdout: env.stdout, Stderr: env.stderr, Signals: names, OnEvent: func(ev api.ExecEvent) {
 		switch ev.State {
 		case api.ExecNotice:
-			fmt.Fprintf(env.stderr, "tkbox: %s\n", ev.Message)
+			fmt.Fprintf(env.stderr, "tkbox: %s\n", printable(env.stderr, ev.Message))
 		case api.ExecWaitingApproval:
 			fmt.Fprintf(env.stderr, "tkbox: waiting for approval %s: %s\n", ev.ApprovalID, ev.Message)
 		case api.ExecRunning:
@@ -187,38 +259,46 @@ func cmdExec(args []string, env *cliEnv) int {
 	}
 	st, err := newClient(*sock).exec(context.Background(), box,
 		api.ExecRequest{Argv: argv, Env: envMap, Cwd: *cwd, Timeout: api.Duration(*timeout)}, eio)
-	return execExitCode(st.Code, st.Signal, st.TimedOut, err, env)
+	return execExitCode(st, err, env)
 }
 
 // execExitCode maps an exec outcome to tkbox exec's exit code: the process's own, 128+n when a signal killed it,
-// 124 timed out, 126 denied, 125 a tkbox error.
-func execExitCode(code int, sig string, timedOut bool, err error, env *cliEnv) int {
+// 124 timed out, 126 denied, 127 not found, 125 a tkbox error (including a command cancelled before it started).
+func execExitCode(st proto.ExitStatus, err error, env *cliEnv) int {
 	if err != nil {
 		printErr(env.stderr, err)
 		var ae *api.ErrorDetail
 		if errors.As(err, &ae) {
-			switch ae.Code {
-			case api.CodeDenied:
+			switch {
+			case ae.Code == api.CodeDenied:
 				return exitDenied
-			case api.CodeTimeout:
+			case ae.Code == api.CodeTimeout:
 				return exitTimedOut
+			case ae.Code == api.CodeNotFound && strings.HasPrefix(ae.Message, "start "):
+				return exitNotFound
 			}
 		}
 		return exitTkbox
 	}
+	if st.Truncated {
+		fmt.Fprintf(env.stderr, "tkbox: output past %d MiB was dropped; write large output to a file and read the part you need\n", proto.DefaultMaxOutputBytes>>20)
+	}
 	switch {
-	case timedOut:
-		fmt.Fprintln(env.stderr, "tkbox: the command timed out and was killed")
+	case st.TimedOut:
+		fmt.Fprintln(env.stderr, "tkbox: the command was killed by its exec timeout; pass a longer --timeout (up to 24h) or set limits.exec_timeout")
 		return exitTimedOut
-	case sig != "":
-		if n, ok := signalNumbers[sig]; ok {
+	case st.Signal != "":
+		if st.Signal == "SIGKILL" {
+			fmt.Fprintln(env.stderr, "tkbox: the process was killed (SIGKILL); if the box ran out of memory, raise --memory (writes outside /workspace use memory too)")
+		}
+		if n, ok := signalNumber(st.Signal); ok {
 			return 128 + n
 		}
 		return 128 + 9
-	case code < 0 || code > 255:
+	case st.Code < 0 || st.Code > 255:
 		return exitTkbox
 	}
-	return code
+	return st.Code
 }
 
 func cmdLs(ctx context.Context, args []string, env *cliEnv) error {
@@ -237,6 +317,7 @@ func cmdLs(ctx context.Context, args []string, env *cliEnv) error {
 	tw := tabwriter.NewWriter(env.stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "ID\tNAME\tSTATE\tIMAGE\tAGE\tEXECS\tRUN")
 	unrecorded := false
+	var problems []string
 	for _, b := range boxes {
 		run := b.RunID
 		if b.Unrecorded {
@@ -244,18 +325,32 @@ func cmdLs(ctx context.Context, args []string, env *cliEnv) error {
 		}
 		state := b.State
 		if b.Error != "" {
-			state += ": " + b.Error
+			problems = append(problems, fmt.Sprintf("%s %s: %s", b.Name, b.State, b.Error))
 		} else if b.StopReason != "" && b.State == api.StateStopped {
 			state += " (" + b.StopReason + ")"
+		}
+		if b.DiffError != "" && !alive(b.State) {
+			problems = append(problems, fmt.Sprintf("%s: %s", b.Name, b.DiffError))
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\t%s\n", b.ID, b.Name, state, b.Image,
 			time.Since(b.CreatedAt).Round(time.Second), b.Execs, run)
 	}
 	tw.Flush()
+	for _, p := range problems {
+		fmt.Fprintf(env.stderr, "tkbox: %s\n", printable(env.stderr, p))
+	}
 	if unrecorded {
 		fmt.Fprintln(env.stderr, "tkbox: WARNING: boxes marked UNRECORDED record nothing in Tracekit")
 	}
 	return nil
+}
+
+func alive(state string) bool {
+	switch state {
+	case api.StateCreating, api.StateRunning, api.StatePaused, api.StateStopping:
+		return true
+	}
+	return false
 }
 
 func oneBox(name string, pos []string) (string, error) {
@@ -281,8 +376,15 @@ func cmdStop(ctx context.Context, args []string, env *cliEnv) error {
 		return err
 	}
 	fmt.Fprintf(env.stderr, "tkbox: box %s %s (%s)\n", b.Name, b.State, b.StopReason)
-	if !*kill {
-		fmt.Fprintf(env.stderr, "tkbox: see its changes with `tkbox diff %s`; apply them with `tkbox apply %s`\n", b.Name, b.Name)
+	switch {
+	case b.DiffSaved:
+		fmt.Fprintf(env.stderr, "tkbox: see its changes with `tkbox diff %s`; apply them with `tkbox apply %s` before `tkbox export %s -o %s.tkb`\n",
+			b.Name, b.Name, b.Name, b.Name)
+	case b.DiffError != "" && !*kill:
+		fmt.Fprintf(env.stderr, "tkbox: WARNING: %s\n", printable(env.stderr, b.DiffError))
+		fmt.Fprintln(env.stderr, "tkbox: WARNING: nothing can be applied from this box")
+	case b.DiffError != "":
+		fmt.Fprintf(env.stderr, "tkbox: %s\n", printable(env.stderr, b.DiffError))
 	}
 	return nil
 }
@@ -321,12 +423,12 @@ func cmdDiff(ctx context.Context, args []string, env *cliEnv) error {
 	}
 	if *stat {
 		for _, f := range sum.Files {
-			fmt.Fprintf(env.stdout, "%-9s %s\n", f.Status, f.Path)
+			fmt.Fprintf(env.stdout, "%-9s %s\n", f.Status, printable(env.stdout, f.Path))
 		}
 		return nil
 	}
-	env.stdout.Write(patch)
-	fmt.Fprintf(env.stderr, "tkbox: %d files changed\n", len(sum.Files))
+	io.WriteString(env.stdout, printable(env.stdout, string(patch)))
+	fmt.Fprintf(env.stderr, "tkbox: %s changed\n", plural(len(sum.Files), "file"))
 	return nil
 }
 
@@ -334,6 +436,7 @@ func cmdApply(ctx context.Context, args []string, env *cliEnv) error {
 	fs, sock := newFlags("apply", env)
 	dir := fs.String("dir", "", "checkout to apply to (default the box's workspace)")
 	check := fs.Bool("check", false, "validate and decide only; write nothing")
+	sensitive := fs.Bool("allow-sensitive", false, "let the patch change .gitignore, .gitattributes, .gitmodules, tkbox.yaml, .husky/, .github/workflows/, .envrc, .pre-commit-config.yaml")
 	pos, err := parseAll(fs, args)
 	if err != nil {
 		return err
@@ -342,21 +445,50 @@ func cmdApply(ctx context.Context, args []string, env *cliEnv) error {
 	if err != nil {
 		return err
 	}
-	req := api.ApplyRequest{Check: *check}
+	req := api.ApplyRequest{Check: *check, AllowSensitive: *sensitive}
 	if *dir != "" {
 		if req.Dir, err = filepath.Abs(*dir); err != nil {
 			return err
 		}
 	}
+	c := newClient(*sock)
+	// the signer may ask a person about a file: show its approval while the apply waits
+	seen := len(c.events(ctx, box))
+	wctx, stopWatch := context.WithCancel(ctx)
+	watched := make(chan struct{})
+	go func() {
+		defer close(watched)
+		for {
+			select {
+			case <-wctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+			evs := c.events(wctx, box)
+			for _, e := range evs[min(seen, len(evs)):] {
+				if e.Kind == api.EventApproval && e.Door == "apply" {
+					fmt.Fprintf(env.stderr, "tkbox: %s\n", printable(env.stderr, e.Summary))
+				}
+			}
+			seen = max(seen, len(evs))
+		}
+	}()
 	var res api.ApplyResult
-	if err := newClient(*sock).do(ctx, "POST", boxPath(box, "/apply"), req, &res); err != nil {
+	err = c.do(ctx, "POST", boxPath(box, "/apply"), req, &res)
+	stopWatch()
+	<-watched
+	if err != nil {
 		return err
+	}
+	if len(res.Ignored) > 0 {
+		fmt.Fprintf(env.stderr, "tkbox: left out %s the checkout ignores (.gitignore): %s\n", plural(len(res.Ignored), "new file"),
+			printable(env.stderr, strings.Join(res.Ignored, ", ")))
 	}
 	if len(res.Denied) > 0 {
 		for _, p := range res.Denied {
-			fmt.Fprintf(env.stderr, "tkbox: denied by the signer: %s\n", p)
+			fmt.Fprintf(env.stderr, "tkbox: denied by the signer: %s\n", printable(env.stderr, p))
 		}
-		return &api.ErrorDetail{Code: api.CodeDenied, Message: fmt.Sprintf("%d files were refused, so nothing was applied", len(res.Denied)),
+		return &api.ErrorDetail{Code: api.CodeDenied, Message: fmt.Sprintf("%s refused, so nothing was applied", plural(len(res.Denied), "file")),
 			Hint: "apply the rest by hand from " + res.Patch + ", or change the signer's policy"}
 	}
 	verb := "applied"
@@ -364,9 +496,66 @@ func cmdApply(ctx context.Context, args []string, env *cliEnv) error {
 		verb = "would apply (check only, nothing written)"
 	}
 	for _, p := range res.Applied {
-		fmt.Fprintf(env.stdout, "%s\n", p)
+		fmt.Fprintf(env.stdout, "%s\n", printable(env.stdout, p))
 	}
-	fmt.Fprintf(env.stderr, "tkbox: %s %d files\n", verb, len(res.Applied))
+	if len(res.Sensitive) > 0 {
+		fmt.Fprintf(env.stderr, "tkbox: sensitive files (they steer the next run or host automation): %s\n", printable(env.stderr, strings.Join(res.Sensitive, ", ")))
+	}
+	fmt.Fprintf(env.stderr, "tkbox: %s %s\n", verb, plural(len(res.Applied), "file"))
+	return nil
+}
+
+func cmdEvents(ctx context.Context, args []string, env *cliEnv) error {
+	fs, sock := newFlags("events", env)
+	follow := fs.Bool("f", false, "keep printing new events while the box is alive")
+	jsonOut := fs.Bool("json", false, "print the raw NDJSON lines")
+	pos, err := parseAll(fs, args)
+	if err != nil {
+		return err
+	}
+	box, err := oneBox("events", pos)
+	if err != nil {
+		return err
+	}
+	path := boxPath(box, "/events")
+	if *follow {
+		path += "?follow=1"
+	}
+	c := newClient(*sock)
+	req, _ := http.NewRequestWithContext(ctx, "GET", "http://tkbox"+path, nil)
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		var dd *daemonDown
+		if errors.As(err, &dd) {
+			return dd
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return decodeError(resp)
+	}
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 64<<10), 4<<20)
+	for sc.Scan() {
+		line := sc.Bytes()
+		var e api.Event
+		if *jsonOut || json.Unmarshal(line, &e) != nil {
+			fmt.Fprintf(env.stdout, "%s\n", printable(env.stdout, string(line)))
+			continue
+		}
+		door := e.Door
+		if door == "" {
+			door = "-"
+		}
+		fmt.Fprintf(env.stdout, "%s  %-9s %-16s %s\n", e.Time.Local().Format("15:04:05"), door, e.Kind, printable(env.stdout, e.Summary))
+	}
+	if err := sc.Err(); err != nil && ctx.Err() == nil {
+		return err
+	}
 	return nil
 }
 

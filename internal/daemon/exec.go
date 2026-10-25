@@ -1,13 +1,16 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/agentrpc"
@@ -17,10 +20,26 @@ import (
 	"github.com/Cygnux-Labs/tracekit-box/internal/tracekit"
 )
 
+const (
+	// maxStdinBuffer is how much stdin the daemon holds for a process that has not read it yet. The frame reader
+	// never blocks on stdin (signals and a closed connection must get through); past this the process's stdin is
+	// closed and the rest dropped, with a notice.
+	maxStdinBuffer = 4 << 20
+	// clientWriteGrace is how long a client may take to read the last frames once the exec is cancelled or the box
+	// stops; a client that stalls longer is cut off so the exec can finish and be completed.
+	clientWriteGrace = 2 * time.Second
+)
+
 // execSession is one exec stream; it receives notices (egress refusals, approvals to give) for the person.
 type execSession struct {
-	notices chan string
+	notices  chan string
+	sigs     chan string   // signals for the process once it runs
+	started  atomic.Bool   // the command was handed to the guest (set under box.mu)
+	execDone chan struct{} // closed once the guest exec returned (or it never started)
+	doneOnce sync.Once
 }
+
+func (s *execSession) finish() { s.doneOnce.Do(func() { close(s.execDone) }) }
 
 // notice tells every exec stream of the box something the person should see on stderr.
 func (b *box) notice(msg string) {
@@ -36,6 +55,11 @@ func (b *box) notice(msg string) {
 }
 
 var signalNames = map[string]bool{"SIGINT": true, "SIGTERM": true, "SIGKILL": true, "SIGHUP": true, "SIGQUIT": true}
+
+// loaderEnv are env names that change what a decided command runs without changing its argv; a per-exec env may not
+// set them (an operator's box env may).
+var loaderEnv = map[string]bool{"LD_PRELOAD": true, "LD_LIBRARY_PATH": true, "LD_AUDIT": true, "BASH_ENV": true,
+	"ENV": true, "PROMPT_COMMAND": true}
 
 // prepareExec checks an exec request before the connection is upgraded, so a refusal is a plain JSON error.
 func (d *Daemon) prepareExec(ref string, req api.ExecRequest) (*box, *api.ErrorDetail) {
@@ -65,11 +89,15 @@ func (d *Daemon) prepareExec(ref string, req api.ExecRequest) (*box, *api.ErrorD
 		if reservedEnv[k] {
 			return nil, errf(api.CodeBadRequest, "every connection goes through the box's proxy", "env %s is set by the box and can't be overridden", k)
 		}
+		if loaderEnv[k] {
+			return nil, errf(api.CodeBadRequest, "it changes what the command runs without showing in the command the signer decides; put it in the command itself (e.g. sh -c '"+k+"=… cmd') so it is decided",
+				"env %s can't be set per command", k)
+		}
 	}
 	if req.Cwd != "" && !strings.HasPrefix(req.Cwd, "/") {
 		return nil, errf(api.CodeBadRequest, "pass --cwd /workspace/... (absolute)", "cwd %q must be an absolute path in the box", req.Cwd)
 	}
-	if t := time.Duration(req.Timeout); t < 0 || t > config.MaxExecTimeout {
+	if t := time.Duration(req.Timeout); t < 0 || (t > 0 && t < config.MinExecTimeout) || t > config.MaxExecTimeout {
 		return nil, limitErr("exec timeout %s is outside 1s..24h", "pass --timeout up to 24h", t)
 	}
 	return b, nil
@@ -97,9 +125,102 @@ func (f *frameWriter) Write(p []byte) (int, error) {
 
 func (f *frameWriter) event(e api.ExecEvent) error { return proto.WriteJSON(f, proto.TypeJSON, e) }
 
+// stdinQueue holds stdin frames until the process reads them. Writes never block.
+type stdinQueue struct {
+	mu       sync.Mutex
+	cond     *sync.Cond
+	buf      bytes.Buffer
+	max      int
+	closed   bool
+	err      error
+	overflow bool
+}
+
+func newStdinQueue(max int) *stdinQueue {
+	q := &stdinQueue{max: max}
+	q.cond = sync.NewCond(&q.mu)
+	return q
+}
+
+// write queues p; it reports false the first time the queue overflows (stdin is then closed after what is queued).
+func (q *stdinQueue) write(p []byte) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return true
+	}
+	if q.buf.Len()+len(p) > q.max {
+		q.overflow, q.closed = true, true
+		q.cond.Broadcast()
+		return false
+	}
+	q.buf.Write(p)
+	q.cond.Broadcast()
+	return true
+}
+
+func (q *stdinQueue) closeWith(err error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if !q.closed {
+		q.closed, q.err = true, err
+	}
+	q.cond.Broadcast()
+}
+
+func (q *stdinQueue) Read(p []byte) (int, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for q.buf.Len() == 0 && !q.closed {
+		q.cond.Wait()
+	}
+	if q.buf.Len() == 0 {
+		if q.err != nil {
+			return 0, q.err
+		}
+		return 0, io.EOF
+	}
+	return q.buf.Read(p)
+}
+
+// bashArgs is what the signer decides for an exec: the command line and everything else that changes what runs.
+func (b *box) bashArgs(req api.ExecRequest, line string) map[string]any {
+	cwd := req.Cwd
+	if cwd == "" {
+		cwd = proto.DefaultWorkspacePath
+	}
+	env := map[string]any{}
+	b.mu.Lock()
+	secrets := b.secrets
+	b.mu.Unlock()
+	for k, v := range req.Env {
+		for _, s := range secrets {
+			if s.Placeholder != "" {
+				v = strings.ReplaceAll(v, s.Placeholder, "tkbox_"+s.Name+"_…")
+			}
+			if s.Value != "" {
+				v = strings.ReplaceAll(v, s.Value, "[secret "+s.Name+"]")
+			}
+		}
+		env[k] = v
+	}
+	return map[string]any{"command": line, "cwd": cwd, "env": env, "stdin": req.Stdin}
+}
+
+// tooLongToRecord reports whether err is the signer's (or the client's) refusal of a frame over 1 MiB.
+func tooLongToRecord(err error) bool {
+	var rpc *tracekit.RPCError
+	return errors.As(err, &rpc) && rpc.Code == "quota_exceeded"
+}
+
+var errTooLong = errf(api.CodeLimit, "put it in a script in /workspace and run that",
+	"the command is too long to record (over 1 MiB)")
+
 // runExec runs one exec on an upgraded connection: decide (Bash) → maybe wait for a Tracekit approval → run in the
-// guest, streaming stdio both ways → complete with the exit status.
-func (b *box) runExec(parent context.Context, r io.Reader, w io.Writer, req api.ExecRequest) {
+// guest, streaming stdio both ways → complete with the exit status. conn may be nil in tests (no write deadlines).
+func (b *box) runExec(parent context.Context, conn net.Conn, r io.Reader, w io.Writer, req api.ExecRequest) {
+	b.calls.begin()
+	defer b.calls.end()
 	fw := &frameWriter{w: w}
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
@@ -110,8 +231,19 @@ func (b *box) runExec(parent context.Context, r io.Reader, w io.Writer, req api.
 		case <-ctx.Done():
 		}
 	}()
+	if conn != nil {
+		// once the exec is cancelled (the box stops, the client goes away) a client that does not read can't hold
+		// the exec, its goroutines or the run's complete hostage
+		stopDeadline := context.AfterFunc(ctx, func() { conn.SetWriteDeadline(time.Now().Add(clientWriteGrace)) })
+		defer stopDeadline()
+	}
+	// dctx is the decision's context: a signal or a closed connection before the command starts cancels it (and
+	// withdraws a pending approval) instead of being delivered later
+	dctx, dcancel := context.WithCancel(ctx)
+	defer dcancel()
 
-	sess := &execSession{notices: make(chan string, 64)}
+	sess := &execSession{notices: make(chan string, 64), sigs: make(chan string, 8), execDone: make(chan struct{})}
+	defer sess.finish()
 	b.mu.Lock()
 	b.sessions[sess] = struct{}{}
 	b.mu.Unlock()
@@ -140,89 +272,133 @@ func (b *box) runExec(parent context.Context, r io.Reader, w io.Writer, req api.
 		proto.WriteJSON(fw, typ, v)
 	}
 
-	// client → daemon: stdin, stdin EOF, signals; a closed connection cancels the exec
-	stdinR, stdinW := io.Pipe()
-	defer stdinR.Close()
-	sigs := make(chan string, 8)
+	// client → daemon: stdin, stdin EOF, signals. This loop never blocks, so a signal or a closed connection is
+	// seen at once whatever the process does with its stdin.
+	stdin := newStdinQueue(maxStdinBuffer)
+	defer stdin.closeWith(io.EOF)
 	go func() {
 		for {
 			f, err := proto.ReadFrame(r)
 			if err != nil {
-				stdinW.CloseWithError(io.ErrUnexpectedEOF)
+				stdin.closeWith(io.ErrUnexpectedEOF)
 				cancel()
 				return
 			}
 			switch f.Type {
 			case proto.TypeStdin:
-				if req.Stdin {
-					stdinW.Write(f.Payload) // an error means the process stopped reading; drop the rest
-				}
-			case proto.TypeStdinEOF:
-				stdinW.Close()
-			case proto.TypeSignal:
-				var s proto.Signal
-				if f.Decode(&s) == nil && signalNames[s.Signal] {
+				if req.Stdin && !stdin.write(f.Payload) {
 					select {
-					case sigs <- s.Signal:
+					case sess.notices <- fmt.Sprintf("stdin: more than %d MiB waited for the process to read it; its stdin was closed and the rest dropped (write large input to a file in /workspace instead)", maxStdinBuffer>>20):
 					default:
 					}
+				}
+			case proto.TypeStdinEOF:
+				stdin.closeWith(nil)
+			case proto.TypeSignal:
+				var s proto.Signal
+				if f.Decode(&s) != nil || !signalNames[s.Signal] {
+					continue
+				}
+				if !sess.started.Load() {
+					dcancel() // not started yet: don't start it
+					continue
+				}
+				select {
+				case sess.sigs <- s.Signal:
+				default:
 				}
 			}
 		}
 	}()
 
 	b.mu.Lock()
-	run, g := b.run, b.guest
+	run, g, m := b.run, b.guest, b.machine
 	timeout := time.Duration(b.info.Limits.ExecTimeout)
 	b.mu.Unlock()
 	if req.Timeout > 0 {
 		timeout = time.Duration(req.Timeout)
 	}
 	line := tracekit.ShellQuote(req.Argv)
+	cancelled := func() {
+		b.event(api.EventExecDecided, "exec", "exec cancelled before it started: "+line, map[string]any{"command": line, "decision": "cancelled"})
+		if isClosed(b.stopCh) {
+			final(proto.TypeError, api.ErrorDetail{Code: api.CodeConflict, Message: "the box stopped before the command started",
+				Hint: "see why with `tkbox ls`; start a new box with `tkbox run`"})
+			return
+		}
+		final(proto.TypeError, api.ErrorDetail{Code: api.CodeCancelled, Message: "cancelled before the command started (nothing ran)"})
+	}
 	fw.event(api.ExecEvent{State: api.ExecDeciding})
 	var call tracekit.Call
 	var dec tracekit.Decision
+	decided := false
+	complete := func(status string, result any) {
+		if !decided {
+			return
+		}
+		cctx, cancel := context.WithTimeout(b.d.ctx, 30*time.Second)
+		defer cancel()
+		if err := run.Complete(cctx, call, dec, status, result); err != nil {
+			b.event(api.EventSignerProblem, "exec", "complete failed: "+err.Error(), nil)
+		}
+	}
 	if run != nil {
-		call = tracekit.Call{ID: b.nextCallID("exec"), Tool: tracekit.ToolBash, Args: tracekit.BashArgs(req.Argv)}
-		out, err := b.d.opts.Gate(ctx, run, call, tracekit.GateHooks{OnAsk: func(id string) {
+		call = tracekit.Call{ID: b.nextCallID("exec"), Tool: tracekit.ToolBash, Args: b.bashArgs(req, line)}
+		out, err := b.d.opts.Gate(dctx, run, call, tracekit.GateHooks{OnAsk: func(id string) {
 			fw.event(api.ExecEvent{State: api.ExecWaitingApproval, Decision: "ask", ApprovalID: id, Approver: "tracekit",
 				Message: "approve with: tracekit approvals approve " + id})
 		}})
 		if err != nil {
-			b.event(api.EventExecDecided, "exec", "exec refused, the signer did not answer: "+line,
-				map[string]any{"command": line, "decision": "deny", "reason": err.Error()})
-			final(proto.TypeError, api.ErrorDetail{Code: api.CodeUnavailable,
-				Message: "the Tracekit signer did not answer, so nothing runs (fail closed): " + err.Error(),
-				Hint:    "check the signer with `tracekit status` (start it with `tracekit up`), then run the command again"})
+			switch {
+			case dctx.Err() != nil:
+				cancelled()
+			case tooLongToRecord(err):
+				b.event(api.EventExecDecided, "exec", "exec refused, too long to record: "+trunc(line),
+					map[string]any{"decision": "deny", "reason": err.Error()})
+				final(proto.TypeError, *errTooLong)
+			default:
+				b.event(api.EventExecDecided, "exec", "exec refused, the signer did not answer: "+line,
+					map[string]any{"command": line, "decision": "deny", "reason": err.Error()})
+				final(proto.TypeError, api.ErrorDetail{Code: api.CodeUnavailable,
+					Message: "the Tracekit signer did not answer, so nothing runs (fail closed): " + err.Error(),
+					Hint:    "check the signer with `tracekit status` (start it with `tracekit up`), then run the command again"})
+			}
 			return
 		}
 		if !out.Allowed {
-			reason := out.Reason
-			if reason == "" {
-				reason = "refused by the Tracekit signer"
+			if dctx.Err() != nil {
+				cancelled() // Gate withdrew the approval
+				return
 			}
+			msg, hint := denial(out)
 			b.event(api.EventExecDecided, "exec", "exec denied: "+line,
-				map[string]any{"command": line, "decision": "deny", "rule_ids": out.RuleIDs, "reason": reason})
-			fw.event(api.ExecEvent{State: api.ExecDeciding, Decision: "deny", RuleIDs: out.RuleIDs, Message: reason})
-			hint := "the signer's policy refused this command; run something it allows, or change the policy in Tracekit"
-			if out.ApprovalID != "" {
-				hint = "the approval " + out.ApprovalID + " was not given; ask again and approve with `tracekit approvals approve <id>`"
-			}
-			final(proto.TypeError, api.ErrorDetail{Code: api.CodeDenied, Message: "denied: " + reason, RuleIDs: out.RuleIDs, Hint: hint})
+				map[string]any{"command": line, "decision": "deny", "rule_ids": out.RuleIDs, "reason": out.Reason})
+			fw.event(api.ExecEvent{State: api.ExecDeciding, Decision: "deny", RuleIDs: out.RuleIDs, Message: msg})
+			final(proto.TypeError, api.ErrorDetail{Code: api.CodeDenied, Message: msg, RuleIDs: out.RuleIDs, Hint: hint})
 			return
 		}
-		dec = out.Decision
+		dec, decided = out.Decision, true
 	}
 	b.event(api.EventExecDecided, "exec", "exec allowed: "+line,
 		map[string]any{"command": line, "decision": "allow", "rule_ids": dec.RuleIDs, "decision_id": nonEmpty(dec.DecisionID)})
-	if g == nil {
-		final(proto.TypeError, api.ErrorDetail{Code: api.CodeConflict, Message: "the box is not running",
+	b.mu.Lock()
+	st := b.info.State
+	if st != api.StateRunning || g == nil {
+		b.mu.Unlock()
+		complete("error", "not run: the box is "+st)
+		final(proto.TypeError, api.ErrorDetail{Code: api.CodeConflict, Message: "the box is " + st + ", so the command did not start",
 			Hint: "start a new box with `tkbox run`"})
 		return
 	}
-	b.mu.Lock()
+	sess.started.Store(true) // from here on stop() waits for it (and signals it) before saving the diff
 	b.info.Execs++
 	b.mu.Unlock()
+	if dctx.Err() != nil {
+		sess.finish()
+		complete("error", "not run: cancelled before it started")
+		cancelled()
+		return
+	}
 	b.persist()
 	msg := ""
 	if run == nil {
@@ -238,51 +414,73 @@ func (b *box) runExec(parent context.Context, r io.Reader, w io.Writer, req api.
 	preq := proto.ExecRequest{Op: proto.OpExec, Argv: req.Argv, Env: env, Cwd: req.Cwd,
 		TimeoutMS: timeout.Milliseconds(), Stdin: req.Stdin}
 	stdio := agentrpc.ExecIO{Stdout: proto.ChunkWriter{W: fw, Type: proto.TypeStdout},
-		Stderr: proto.ChunkWriter{W: fw, Type: proto.TypeStderr}, Signals: sigs}
+		Stderr: proto.ChunkWriter{W: fw, Type: proto.TypeStderr}, Signals: sess.sigs}
 	if req.Stdin {
-		stdio.Stdin = stdinR
+		stdio.Stdin = stdin
 	}
 	ectx, ecancel := context.WithTimeout(ctx, timeout+30*time.Second) // host backstop; the guest enforces timeout
-	st, err := g.Exec(ectx, preq, stdio)
+	es, err := g.Exec(ectx, preq, stdio)
+	deadline := errors.Is(ectx.Err(), context.DeadlineExceeded)
 	ecancel()
-	complete := func(status string, result any) {
-		if run == nil {
-			return
-		}
-		cctx, cancel := context.WithTimeout(b.d.ctx, 30*time.Second)
-		defer cancel()
-		if err := run.Complete(cctx, call, dec, status, result); err != nil {
-			b.event(api.EventSignerProblem, "exec", "complete failed: "+err.Error(), nil)
-		}
-	}
+	sess.finish()
 	if err != nil {
-		code, m, hint := api.CodeInternal, err.Error(), "read the box's console.log and events (`tkbox ls` shows the box state)"
+		code, m2, hint := api.CodeInternal, err.Error(), "read the box's console.log and events (`tkbox events <box>`)"
 		var pe *proto.Error
 		switch {
-		case errors.As(err, &pe):
-			code, m = pe.Code, pe.Message
-			if pe.Code == proto.CodeBusy {
-				hint = fmt.Sprintf("at most %d commands run at once in a box; wait for one to finish", proto.DefaultMaxProcs)
-			}
+		case m != nil && isClosed(m.Done()):
+			code, m2, hint = api.CodeConflict, "the VM exited while the command ran", "see why with `tkbox ls` and `tkbox events <box>`; start a new box with `tkbox run`"
 		case isClosed(b.stopCh):
-			code, m, hint = api.CodeConflict, "the box stopped while the command ran", "see why with `tkbox ls`; start a new box with `tkbox run`"
-		case errors.Is(ectx.Err(), context.DeadlineExceeded):
-			code, m, hint = api.CodeTimeout, fmt.Sprintf("the command did not finish within %s", timeout), "pass a longer --timeout (up to 24h)"
+			code, m2, hint = api.CodeConflict, "the box stopped while the command ran", "see why with `tkbox ls`; start a new box with `tkbox run`"
+		case deadline:
+			code, m2, hint = api.CodeTimeout, fmt.Sprintf("the command did not finish within %s", timeout), "pass a longer --timeout (up to 24h) or set limits.exec_timeout"
+		case ctx.Err() != nil:
+			code, m2, hint = api.CodeCancelled, "the client went away, so the command was stopped", ""
+		case errors.As(err, &pe):
+			code, m2 = pe.Code, pe.Message
+			switch {
+			case pe.Code == proto.CodeBusy:
+				hint = fmt.Sprintf("at most %d commands run at once in a box; wait for one to finish", proto.DefaultMaxProcs)
+			case pe.Code == proto.CodeNotFound && strings.HasPrefix(pe.Message, "start "):
+				hint = "install it in the box or use an image that has it"
+			}
 		}
-		complete("error", map[string]any{"error": m})
-		b.event(api.EventExecExited, "exec", "exec failed: "+m, map[string]any{"command": line, "error": m})
-		final(proto.TypeError, api.ErrorDetail{Code: code, Message: m, Hint: hint})
+		complete("error", map[string]any{"error": m2})
+		b.event(api.EventExecExited, "exec", "exec failed: "+m2, map[string]any{"command": line, "error": m2})
+		final(proto.TypeError, api.ErrorDetail{Code: code, Message: m2, Hint: hint})
 		return
 	}
 	status := "ok"
-	if st.Code != 0 {
+	if es.Code != 0 {
 		status = "error"
 	}
-	result := map[string]any{"exit_code": st.Code, "signal": st.Signal, "timed_out": st.TimedOut, "duration_ms": st.DurationMS}
+	result := map[string]any{"exit_code": es.Code, "signal": es.Signal, "timed_out": es.TimedOut, "duration_ms": es.DurationMS}
 	complete(status, result)
-	b.event(api.EventExecExited, "exec", fmt.Sprintf("exec exited %d: %s", st.Code, line), map[string]any{"command": line,
-		"exit_code": st.Code, "signal": st.Signal, "timed_out": st.TimedOut, "duration_ms": st.DurationMS})
-	final(proto.TypeExit, st)
+	b.event(api.EventExecExited, "exec", fmt.Sprintf("exec exited %d: %s", es.Code, line), map[string]any{"command": line,
+		"exit_code": es.Code, "signal": es.Signal, "timed_out": es.TimedOut, "duration_ms": es.DurationMS})
+	final(proto.TypeExit, es)
+}
+
+// denial is the message and hint of a refusal: the signer's own reason with the rule ids once, and a hint only when
+// the signer gave no reason.
+func denial(out tracekit.Outcome) (string, string) {
+	rules := ""
+	if len(out.RuleIDs) > 0 {
+		rules = " [" + strings.Join(out.RuleIDs, ", ") + "]"
+	}
+	reason := ""
+	if out.Decision.Decision == "deny" {
+		reason = out.Decision.Reason
+	}
+	switch {
+	case out.ApprovalID != "":
+		return "denied by Tracekit policy" + rules + ": the approval " + out.ApprovalID + " was not given",
+			"ask again and approve with `tracekit approvals approve <id>`"
+	case reason != "":
+		return "denied by Tracekit policy" + rules + ": " + reason, ""
+	case out.Reason != "" && rules == "":
+		return out.Reason, ""
+	}
+	return "denied by Tracekit policy" + rules, "run something the policy allows, or change the policy in Tracekit"
 }
 
 func nonEmpty(s string) any {
@@ -297,6 +495,51 @@ func isClosed(c <-chan struct{}) bool {
 	case <-c:
 		return true
 	default:
+		return false
+	}
+}
+
+// callTracker counts a box's in-flight gated calls (exec, egress decisions, apply) so the run is not closed under
+// them.
+type callTracker struct {
+	mu   sync.Mutex
+	n    int
+	idle chan struct{} // closed while n == 0
+}
+
+func (c *callTracker) begin() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.n == 0 {
+		c.idle = make(chan struct{})
+	}
+	c.n++
+}
+
+func (c *callTracker) end() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n--
+	if c.n == 0 {
+		close(c.idle)
+	}
+}
+
+// wait waits until no call is in flight, at most d. It reports whether they all finished.
+func (c *callTracker) wait(d time.Duration) bool {
+	c.mu.Lock()
+	if c.n == 0 {
+		c.mu.Unlock()
+		return true
+	}
+	idle := c.idle
+	c.mu.Unlock()
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-idle:
+		return true
+	case <-t.C:
 		return false
 	}
 }

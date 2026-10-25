@@ -57,6 +57,33 @@ type File struct {
 	Task      string            `yaml:"task"`      // recorded as trusted content of the run
 
 	dir string // the file's dir, for relative paths ("" for flags: the working dir)
+	// limitNames names a limit in errors ("limits.cpus" in a file, "--cpus" for a flag)
+	limitNames map[string]string
+}
+
+// WorkspacePath is the file's workspace as an absolute, clean path ("~/" expanded, relative paths taken from the
+// file's dir); "" when it names none.
+func (f *File) WorkspacePath() string {
+	if f == nil || f.Workspace == "" {
+		return ""
+	}
+	return absWorkspace(f.Workspace, f.dir)
+}
+
+func absWorkspace(ws, dir string) string {
+	if strings.HasPrefix(ws, "~/") || ws == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			ws = filepath.Join(home, strings.TrimPrefix(ws, "~"))
+		}
+	}
+	if !filepath.IsAbs(ws) {
+		if dir != "" {
+			ws = filepath.Join(dir, ws)
+		} else if a, err := filepath.Abs(ws); err == nil {
+			ws = a
+		}
+	}
+	return filepath.Clean(ws)
 }
 
 // Secret names where one secret's value comes from. Exactly one of FromEnv and FromFile.
@@ -281,7 +308,7 @@ func (f *File) Validate() error {
 			add("env: %s is also a secret; keep it in secrets only", k)
 		}
 	}
-	if err := f.Limits.Validate(); err != nil {
+	if err := f.Limits.validate(f.limitNames); err != nil {
 		add("%v", err)
 	}
 	switch f.Inspect {
@@ -301,31 +328,42 @@ func checkHosts(hosts []string) error {
 	}
 	for _, h := range hosts {
 		hl := strings.ToLower(strings.TrimSpace(h))
-		if hl == "" || hl == "*" || strings.ContainsAny(hl, " /@#:") || strings.Count(hl, "*") > 1 ||
-			(strings.Contains(hl, "*") && !strings.HasPrefix(hl, "*.")) {
-			return fmt.Errorf("host %q: want an exact host name or \"*.example.com\"", h)
+		if strings.Contains(hl, "*") {
+			return fmt.Errorf("host %q is a wildcard: a secret goes to exact hosts only; list each one (e.g. [api.github.com, uploads.github.com])", h)
+		}
+		if hl == "" || strings.ContainsAny(hl, " /@#:") {
+			return fmt.Errorf("host %q: want an exact host name such as api.github.com", h)
 		}
 	}
 	return nil
 }
 
 // Validate checks the ranges; zero values mean the daemon's default.
-func (l Limits) Validate() error {
+func (l Limits) Validate() error { return l.validate(nil) }
+
+// validate checks the ranges, naming each limit as names says (default "limits.<key>").
+func (l Limits) validate(names map[string]string) error {
+	name := func(k string) string {
+		if n, ok := names[k]; ok {
+			return n
+		}
+		return "limits." + k
+	}
 	var errs []string
 	if l.CPUs != 0 && (l.CPUs < MinCPUs || l.CPUs > MaxCPUs) {
-		errs = append(errs, fmt.Sprintf("limits.cpus %d: use %d..%d", l.CPUs, MinCPUs, MaxCPUs))
+		errs = append(errs, fmt.Sprintf("%s %d: use %d..%d", name("cpus"), l.CPUs, MinCPUs, MaxCPUs))
 	}
 	if l.Memory != 0 && (l.Memory < MinMemoryMiB || l.Memory > MaxMemoryMiB) {
-		errs = append(errs, fmt.Sprintf("limits.memory %dMiB: use 128MiB..64GiB", l.Memory))
+		errs = append(errs, fmt.Sprintf("%s %dMiB: use 128MiB..64GiB", name("memory"), l.Memory))
 	}
 	if l.Disk != 0 && (l.Disk < MinDiskMiB || l.Disk > MaxDiskMiB) {
-		errs = append(errs, fmt.Sprintf("limits.disk %dMiB: use 64MiB..1TiB", l.Disk))
+		errs = append(errs, fmt.Sprintf("%s %dMiB: use 64MiB..1TiB", name("disk"), l.Disk))
 	}
 	if t := time.Duration(l.Timeout); t != 0 && (t < MinTimeout || t > MaxTimeout) {
-		errs = append(errs, fmt.Sprintf("limits.timeout %s: use 10s..168h", t))
+		errs = append(errs, fmt.Sprintf("%s %s: use 10s..168h", name("timeout"), t))
 	}
 	if t := time.Duration(l.ExecTimeout); t != 0 && (t < MinExecTimeout || t > MaxExecTimeout) {
-		errs = append(errs, fmt.Sprintf("limits.exec_timeout %s: use 1s..24h", t))
+		errs = append(errs, fmt.Sprintf("%s %s: use 1s..24h", name("exec_timeout"), t))
 	}
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))
@@ -396,8 +434,19 @@ func Request(f *File, fl Flags, r Resolver) (api.CreateBoxRequest, error) {
 	if fl.Workspace != "" {
 		m.Workspace, wsDir = fl.Workspace, ""
 	}
+	m.limitNames = map[string]string{}
 	if fl.CPUs != 0 {
 		m.Limits.CPUs = fl.CPUs
+		m.limitNames["cpus"] = "--cpus"
+	}
+	if fl.Memory != "" {
+		m.limitNames["memory"] = "--memory"
+	}
+	if fl.Disk != "" {
+		m.limitNames["disk"] = "--disk"
+	}
+	if fl.Timeout != "" {
+		m.limitNames["timeout"] = "--timeout"
 	}
 	if fl.Memory != "" {
 		v, err := ParseSize(fl.Memory)
@@ -440,15 +489,7 @@ func Request(f *File, fl Flags, r Resolver) (api.CreateBoxRequest, error) {
 			Timeout: api.Duration(m.Limits.Timeout), ExecTimeout: api.Duration(m.Limits.ExecTimeout)},
 	}
 	if m.Workspace != "" {
-		ws := m.Workspace
-		if !filepath.IsAbs(ws) {
-			if wsDir != "" {
-				ws = filepath.Join(wsDir, ws)
-			} else if a, err := filepath.Abs(ws); err == nil {
-				ws = a
-			}
-		}
-		req.Workspace = filepath.Clean(ws)
+		req.Workspace = absWorkspace(m.Workspace, wsDir)
 	}
 	if len(secrets) > 0 {
 		req.Secrets = map[string]api.SecretSpec{}

@@ -16,11 +16,15 @@ import (
 
 // Approval states.
 const (
-	approvalPending  = "pending"
-	approvalApproved = "approved"
-	approvalRejected = "rejected"
-	approvalExpired  = "expired"
+	approvalPending   = "pending"
+	approvalApproved  = "approved"
+	approvalRejected  = "rejected"
+	approvalExpired   = "expired"
+	approvalWithdrawn = "withdrawn" // no connection waited on it any more
 )
+
+// maxPendingApprovals caps the Box approvals one box may hold open at once.
+const maxPendingApprovals = 16
 
 // approval is a Box approval: an egress host off the allowlist, held until a person answers on the host.
 type approval struct {
@@ -30,6 +34,7 @@ type approval struct {
 	scope        string
 	decided      chan struct{}
 	timer        *time.Timer
+	recordErr    error // the decision could not be recorded in Tracekit: an approval then allows nothing
 }
 
 // boxDecider is the egress.Decider of one box.
@@ -38,6 +43,8 @@ type boxDecider box
 // Decide asks the signer (WebFetch), then the allowlist, then a person. Every refusal says what to do.
 func (bd *boxDecider) Decide(ctx context.Context, req egress.Request) (egress.Verdict, error) {
 	b := (*box)(bd)
+	b.calls.begin()
+	defer b.calls.end()
 	b.mu.Lock()
 	run := b.run
 	b.mu.Unlock()
@@ -52,11 +59,8 @@ func (bd *boxDecider) Decide(ctx context.Context, req egress.Request) (egress.Ve
 			return egress.Verdict{Reason: "the Tracekit signer did not answer, so nothing leaves the box (fail closed): " + err.Error()}, nil
 		}
 		if !out.Allowed {
-			reason := out.Reason
-			if reason == "" {
-				reason = "refused by the Tracekit signer"
-			}
-			return egress.Verdict{Reason: reason, RuleIDs: out.RuleIDs}, nil
+			msg, _ := denial(out)
+			return egress.Verdict{Reason: msg, RuleIDs: out.RuleIDs}, nil
 		}
 		dec = out.Decision
 	}
@@ -82,34 +86,50 @@ func (bd *boxDecider) Decide(ctx context.Context, req egress.Request) (egress.Ve
 		complete("ok", map[string]any{"allowed": true, "via": "approval", "scope": "box"})
 		return egress.Verdict{Allow: true, Reason: "approved for this box"}, nil
 	}
-	state, id := b.d.awaitApproval(ctx, b, req, hostPort)
 	allowHint := req.Host
 	if req.Port != 80 && req.Port != 443 {
 		allowHint = hostPort
 	}
-	switch state {
-	case approvalApproved:
+	state, id, recErr := b.d.awaitApproval(ctx, b, req, hostPort)
+	switch {
+	case state == approvalApproved && recErr != nil:
+		complete("error", map[string]any{"allowed": false, "approval_id": id, "decision": "unrecorded"})
+		return egress.Verdict{Reason: fmt.Sprintf("the approval %s could not be recorded in Tracekit, so egress to %s stays closed (fail closed): %v", id, req.URL, recErr)}, nil
+	case state == approvalApproved:
 		complete("ok", map[string]any{"allowed": true, "via": "approval", "approval_id": id})
 		return egress.Verdict{Allow: true, Reason: "approved by a person (" + id + ")"}, nil
-	case approvalRejected:
+	case state == approvalRejected:
 		complete("error", map[string]any{"allowed": false, "approval_id": id, "decision": approvalRejected})
-		return egress.Verdict{Reason: fmt.Sprintf("a person rejected egress to %s (%s); to allow it next time add `--allow %s`", req.URL, id, allowHint)}, nil
+		return egress.Verdict{Reason: fmt.Sprintf("a person rejected egress to %s (%s); to allow it next time start the box with `--allow %s`", req.URL, id, allowHint)}, nil
+	case state == approvalLimit:
+		complete("error", map[string]any{"allowed": false, "decision": "too many pending approvals"})
+		return egress.Verdict{Reason: fmt.Sprintf("too many pending approvals in this box (%d): egress to %s refused at once; answer the pending ones with `tkbox approvals`, or start the box with `--allow %s`", maxPendingApprovals, req.URL, allowHint)}, nil
 	default:
-		complete("error", map[string]any{"allowed": false, "approval_id": id, "decision": approvalExpired})
-		return egress.Verdict{Reason: fmt.Sprintf("no one approved egress to %s within %s (%s): run `tkbox approve <id>` sooner, or add `--allow %s`",
-			req.URL, b.d.opts.ApprovalTimeout, id, allowHint)}, nil
+		complete("error", map[string]any{"allowed": false, "approval_id": id, "decision": state})
+		if id == "" {
+			return egress.Verdict{Reason: fmt.Sprintf("egress to %s was not approved: the box is going down", req.URL)}, nil
+		}
+		return egress.Verdict{Reason: fmt.Sprintf("no one approved egress to %s within %s (%s); next time answer sooner with `tkbox approve %s --box` (allows it for the rest of the box), or start the box with `--allow %s`",
+			req.URL, b.d.opts.ApprovalTimeout, id, id, allowHint)}, nil
 	}
 }
 
+// approvalLimit is awaitApproval's answer when the box already holds maxPendingApprovals.
+const approvalLimit = "limit"
+
 // awaitApproval opens (or joins) the pending approval for req's target and waits for its answer. A connection that
-// gives up first gets "expired"; the approval itself stays open until its own timeout.
-func (d *Daemon) awaitApproval(ctx context.Context, b *box, req egress.Request, hostPort string) (string, string) {
+// gives up first gets "expired"; when no connection waits on an approval any more it is withdrawn, so no one
+// approves a connection that is gone. recErr is set when an approval could not be recorded in Tracekit.
+func (d *Daemon) awaitApproval(ctx context.Context, b *box, req egress.Request, hostPort string) (string, string, error) {
 	d.mu.Lock()
 	var a *approval
+	pending := 0
 	for _, x := range d.approvals {
-		if x.box == b && x.Target == req.URL && x.State == approvalPending {
-			a = x
-			break
+		if x.box == b && x.State == approvalPending {
+			pending++
+			if x.Target == req.URL {
+				a = x
+			}
 		}
 	}
 	created := false
@@ -117,8 +137,12 @@ func (d *Daemon) awaitApproval(ctx context.Context, b *box, req egress.Request, 
 		select {
 		case <-b.stopCh:
 			d.mu.Unlock()
-			return approvalExpired, ""
+			return approvalExpired, "", nil
 		default:
+		}
+		if pending >= maxPendingApprovals {
+			d.mu.Unlock()
+			return approvalLimit, "", nil
 		}
 		d.pruneApprovals()
 		id := ""
@@ -133,6 +157,7 @@ func (d *Daemon) awaitApproval(ctx context.Context, b *box, req egress.Request, 
 		d.approvals[id] = a
 		created = true
 	}
+	a.Waiters++
 	id := a.ID
 	d.mu.Unlock()
 	if created {
@@ -142,21 +167,30 @@ func (d *Daemon) awaitApproval(ctx context.Context, b *box, req egress.Request, 
 		}
 		b.event(api.EventApproval, "egress", fmt.Sprintf("egress to %s is waiting for approval %s", req.URL, id),
 			map[string]any{"approval_id": id, "target": req.URL, "state": approvalPending})
-		b.notice(fmt.Sprintf("egress to %s is waiting for approval: run `tkbox approve %s` on the host, or add `--allow %s`",
+		b.notice(fmt.Sprintf("egress to %s is waiting for approval: run `tkbox approve %s` on the host (add --box to allow it for the rest of the box); next time start the box with `--allow %s`",
 			req.URL, id, allowHint))
 	}
 	select {
 	case <-a.decided:
 		d.mu.Lock()
-		st := a.State
+		a.Waiters--
+		st, recErr := a.State, a.recordErr
 		d.mu.Unlock()
-		return st, id
+		return st, id, recErr
 	case <-ctx.Done():
-		return approvalExpired, id
+		d.mu.Lock()
+		a.Waiters--
+		last := a.Waiters == 0 && a.State == approvalPending
+		d.mu.Unlock()
+		if last {
+			d.finish(a, approvalWithdrawn, "", "")
+		}
+		return approvalExpired, id, nil
 	}
 }
 
-// finish records an approval's answer once: approved, rejected or expired.
+// finish records an approval's answer once: approved, rejected, expired or withdrawn. An approval is recorded in
+// Tracekit before any connection is let through on it; if that fails it allows nothing.
 func (d *Daemon) finish(a *approval, state, by, scope string) bool {
 	d.mu.Lock()
 	if a.State != approvalPending {
@@ -169,25 +203,47 @@ func (d *Daemon) finish(a *approval, state, by, scope string) bool {
 	if a.timer != nil {
 		a.timer.Stop()
 	}
-	close(a.decided)
 	view := a.Approval
 	d.mu.Unlock()
 	b := a.box
-	if state == approvalApproved && scope == "box" {
+	value := map[string]any{"approval_id": view.ID, "target": view.Target, "decision": state, "approver": by, "scope": scope}
+	var recErr error
+	if state == approvalApproved {
 		b.mu.Lock()
-		b.approvedHosts[a.hostPort] = true
+		run := b.run
 		b.mu.Unlock()
+		if run != nil {
+			ctx, cancel := context.WithTimeout(d.ctx, 30*time.Second)
+			recErr = run.Observe(ctx, tracekit.SourceApproval, trustedObs, b.scrub().value(value))
+			cancel()
+		}
+		if recErr == nil && scope == "box" {
+			b.mu.Lock()
+			b.approvedHosts[a.hostPort] = true
+			b.mu.Unlock()
+		}
+	} else {
+		b.observe(tracekit.SourceApproval, trustedObs, value)
 	}
-	b.observe(tracekit.SourceApproval, trustedObs, map[string]any{"approval_id": view.ID, "target": view.Target,
-		"decision": state, "approver": by, "scope": scope})
+	d.mu.Lock()
+	a.recordErr = recErr
+	close(a.decided)
+	d.mu.Unlock()
 	summary := fmt.Sprintf("approval %s for %s: %s", view.ID, view.Target, state)
 	if by != "" {
 		summary += " by " + by
 	}
-	b.event(api.EventApproval, "egress", summary, map[string]any{"approval_id": view.ID, "target": view.Target,
-		"state": state, "decided_by": by, "scope": scope})
-	if state == approvalExpired {
+	data := map[string]any{"approval_id": view.ID, "target": view.Target, "state": state, "decided_by": by, "scope": scope}
+	if recErr != nil {
+		summary += " (NOT recorded in Tracekit, so it allows nothing: " + recErr.Error() + ")"
+		data["record_error"] = recErr.Error()
+	}
+	b.event(api.EventApproval, "egress", summary, data)
+	switch state {
+	case approvalExpired:
 		b.notice(fmt.Sprintf("approval %s for %s expired after %s", view.ID, view.Target, d.opts.ApprovalTimeout))
+	case approvalWithdrawn:
+		b.notice(fmt.Sprintf("approval %s for %s was withdrawn: no connection waits for it any more", view.ID, view.Target))
 	}
 	return true
 }
@@ -267,6 +323,10 @@ func (d *Daemon) DecideApproval(id string, dec api.ApprovalDecision, uid int) (a
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if a.recordErr != nil {
+		return api.Approval{}, errf(api.CodeUnavailable, "check the signer (`tracekit status`); the connection stays closed",
+			"approval %s could not be recorded in Tracekit, so it allows nothing: %v", id, a.recordErr)
+	}
 	return a.Approval, nil
 }
 
@@ -275,7 +335,12 @@ type boxSink box
 
 func (s *boxSink) Emit(e egress.Event) {
 	b := (*box)(s)
+	// "egress to host:port", or just "egress" when the event names no host (connection-limit refusals, summaries)
 	target := net.JoinHostPort(e.Host, strconv.Itoa(e.Port))
+	egressTo := "egress to " + target
+	if e.Host == "" {
+		target, egressTo = "", "egress"
+	}
 	data := map[string]any{"host": e.Host, "port": e.Port}
 	if e.Method != "" {
 		data["method"] = e.Method
@@ -300,14 +365,19 @@ func (s *boxSink) Emit(e egress.Event) {
 	}
 	switch e.Kind {
 	case egress.EventAllowed:
-		b.event(e.Kind, "egress", "egress to "+target+" allowed", data)
+		b.event(e.Kind, "egress", egressTo+" allowed", data)
 	case egress.EventClosed:
-		b.event(e.Kind, "egress", fmt.Sprintf("egress to %s closed (%d bytes in, %d out)", target, e.BytesIn, e.BytesOut), data)
+		b.event(e.Kind, "egress", fmt.Sprintf("%s closed (%d bytes in, %d out)", egressTo, e.BytesIn, e.BytesOut), data)
+		if e.Reason != "" && e.BytesIn == 0 && e.BytesOut == 0 {
+			b.notice(egressTo + " failed: " + e.Reason) // e.g. the host did not answer (502)
+		}
 	case egress.EventDenied:
-		b.event(e.Kind, "egress", "egress to "+target+" refused: "+e.Reason, data)
-		msg := "egress to " + target + " refused: " + e.Reason
+		b.event(e.Kind, "egress", egressTo+" refused: "+e.Reason, data)
+		msg := egressTo + " refused: " + e.Reason
 		if len(e.RuleIDs) > 0 {
-			msg += " [" + strings.Join(e.RuleIDs, ", ") + "]"
+			if !strings.Contains(e.Reason, e.RuleIDs[0]) {
+				msg += " [" + strings.Join(e.RuleIDs, ", ") + "]"
+			}
 		} else {
 			// the signer recorded its own refusals; record the ones Box made itself
 			b.observe(tracekit.SourceEgress, untrustedObs, map[string]any{"host": e.Host, "port": e.Port,
@@ -326,6 +396,6 @@ func (s *boxSink) Emit(e egress.Event) {
 		b.observe(tracekit.SourceModelCall, untrustedObs, map[string]any{"host": e.Host, "path": e.Path,
 			"status": e.Status, "bytes": e.BytesIn + e.BytesOut})
 	default:
-		b.event(e.Kind, "egress", e.Kind+" "+target, data)
+		b.event(e.Kind, "egress", strings.TrimSpace(e.Kind+" "+target), data)
 	}
 }

@@ -17,7 +17,7 @@ allow: [pypi, api.example.com:8443]
 secrets:
   GITHUB_TOKEN:
     from_env: GH_TOKEN
-    hosts: [api.github.com, "*.githubusercontent.com"]
+    hosts: [api.github.com, raw.githubusercontent.com]
     header: Authorization
   KEY:
     from_file: key.txt

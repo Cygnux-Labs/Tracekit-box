@@ -38,7 +38,7 @@ type daemonDown struct {
 }
 
 func (e *daemonDown) Error() string {
-	return fmt.Sprintf("no tkbox daemon answering at %s (%v): start one with `tkbox daemon` (as root on a server), or pass --socket", e.sock, e.err)
+	return fmt.Sprintf("no tkbox daemon answering at %s (%v): start one with `tkbox daemon`, or pass --socket", e.sock, e.err)
 }
 
 func (c *client) dial(ctx context.Context) (net.Conn, error) {
@@ -117,6 +117,28 @@ func (c *client) diff(ctx context.Context, box string) ([]byte, api.DiffSummary,
 	}
 	patch, err := io.ReadAll(resp.Body)
 	return patch, sum, err
+}
+
+// events reads a box's events.ndjson as it is now (nil on any error).
+func (c *client) events(ctx context.Context, box string) []api.Event {
+	req, _ := http.NewRequestWithContext(ctx, "GET", "http://tkbox"+boxPath(box, "/events"), nil)
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	var out []api.Event
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 64<<10), 4<<20)
+	for sc.Scan() {
+		var e api.Event
+		json.Unmarshal(sc.Bytes(), &e) // a line that does not decode still counts
+		out = append(out, e)
+	}
+	return out
 }
 
 // execIO is the client side of one exec.

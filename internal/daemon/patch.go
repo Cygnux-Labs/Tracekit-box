@@ -10,6 +10,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/Cygnux-Labs/tracekit-box/internal/api"
+	"github.com/Cygnux-Labs/tracekit-box/internal/proto"
 )
 
 // patchFile is one file section of a git-format patch, as far as apply needs to judge it.
@@ -23,6 +26,7 @@ type patchFile struct {
 	Binary       bool
 	Added        []string // '+' lines of the hunks (the target of a symlink)
 	HasHunks     bool
+	Raw          string // the section's own text, from its "diff --git" line up to the next section
 }
 
 var (
@@ -49,6 +53,16 @@ func parsePatch(patch string) ([]*patchFile, error) {
 	if n := len(lines); n > 0 && lines[n-1] == "" {
 		lines = lines[:n-1]
 	}
+	var starts []int
+	defer func() {
+		for k, f := range files {
+			end := len(lines)
+			if k+1 < len(starts) {
+				end = starts[k+1]
+			}
+			f.Raw = strings.Join(lines[starts[k]:end], "\n") + "\n"
+		}
+	}()
 	for i, ln := range lines {
 		lineNo := i + 1
 		bad := func(format string, a ...any) error {
@@ -80,6 +94,7 @@ func parsePatch(patch string) ([]*patchFile, error) {
 		if strings.HasPrefix(ln, "diff --git ") {
 			cur = &patchFile{}
 			files = append(files, cur)
+			starts = append(starts, i)
 			state = header
 			a, b, ok := splitGitHeader(strings.TrimPrefix(ln, "diff --git "))
 			if ok {
@@ -478,4 +493,57 @@ func checkSymlink(f *patchFile, dir string) error {
 		}
 	}
 	return nil
+}
+
+// summarize is the host's own summary of a patch (the guest's is never trusted): one entry per file section.
+func summarize(patch []byte) api.DiffSummary {
+	sum := api.DiffSummary{Files: []proto.DiffFile{}, Bytes: int64(len(patch))}
+	files, err := parsePatch(string(patch))
+	if err != nil {
+		return sum
+	}
+	for _, f := range files {
+		df := proto.DiffFile{Path: f.New, Binary: f.Binary,
+			Symlink: f.NewMode == "120000" || (f.NewMode == "" && f.IndexMode == "120000")}
+		switch {
+		case f.Deleted:
+			df.Path, df.Status = f.Old, "deleted"
+		case f.Rename:
+			df.Status = "renamed"
+		case f.Copy:
+			df.Status = "copied"
+		case f.Old == "":
+			df.Status = "added"
+		case f.NewMode != "" && !f.HasHunks && !f.Binary:
+			df.Status = "mode"
+		default:
+			df.Status = "modified"
+		}
+		if df.Path == "" && len(f.Names) > 0 {
+			df.Path = f.Names[len(f.Names)-1]
+		}
+		sum.Files = append(sum.Files, df)
+	}
+	return sum
+}
+
+// isSensitive reports whether a path steers the next run or host automation: git's own trust inputs (.gitignore,
+// .gitattributes, .gitmodules), tkbox.yaml, and files tools run on the host (.husky/, .github/workflows/, .envrc,
+// .pre-commit-config.yaml). Case-insensitive, at any depth.
+func isSensitive(p string) bool {
+	lower := strings.ToLower(p)
+	switch path.Base(lower) {
+	case ".gitignore", ".gitattributes", ".gitmodules", "tkbox.yaml", "tkbox.yml", ".envrc", ".pre-commit-config.yaml":
+		return true
+	}
+	comps := strings.Split(lower, "/")
+	for i, c := range comps[:len(comps)-1] {
+		if c == ".husky" {
+			return true
+		}
+		if c == ".github" && i+1 < len(comps)-1 && comps[i+1] == "workflows" {
+			return true
+		}
+	}
+	return false
 }

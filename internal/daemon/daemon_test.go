@@ -311,8 +311,8 @@ func TestExecOverHTTP(t *testing.T) {
 	var ed api.ErrorDetail
 	json.Unmarshal(last.Payload, &ed)
 	evs = execEvents(frames)
-	if last.Type != proto.TypeError || ed.Code != api.CodeDenied || !slices.Equal(ed.RuleIDs, []string{"TK-D002"}) || ed.Hint == "" ||
-		!strings.Contains(ed.Message, "destructive") || stdoutOf(frames) != "" {
+	if last.Type != proto.TypeError || ed.Code != api.CodeDenied || !slices.Equal(ed.RuleIDs, []string{"TK-D002"}) || ed.Hint != "" ||
+		ed.Message != "denied by Tracekit policy [TK-D002]: destructive command" || stdoutOf(frames) != "" {
 		t.Fatalf("denied frames %v %+v", frames, ed)
 	}
 	if evs[len(evs)-1].Decision != "deny" || !slices.Equal(evs[len(evs)-1].RuleIDs, []string{"TK-D002"}) {
