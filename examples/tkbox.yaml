@@ -1,0 +1,43 @@
+# A box for a Python service's agent. Put this file at the repository root and run, from there:
+#   tkbox run --config tkbox.yaml
+# Reference: docs/config.md. Flags given to tkbox run override these values.
+
+image: python:3.12-slim
+name: service-agent
+
+# The repository root: copied into /workspace (tracked and untracked-not-ignored files; never .git or ignored files
+# such as .env). Changes come back only through tkbox diff / tkbox apply.
+workspace: .
+
+# Hosts the box may reach without asking. Anything else waits up to 2 minutes for `tkbox approve <id>` on the host.
+allow:
+  - pypi
+  - github
+  - anthropic
+
+# The box sees placeholders in these variables; the host proxy swaps the real value in only on requests to `hosts`,
+# in `header`. Values are read on the host when the box starts and never enter the VM.
+secrets:
+  ANTHROPIC_API_KEY:
+    from_env: ANTHROPIC_API_KEY
+    hosts: [api.anthropic.com]
+    header: X-Api-Key
+  GH_TOKEN:
+    from_env: GH_TOKEN
+    hosts: [api.github.com, github.com]
+    header: Authorization
+
+# Plain environment for every exec (visible in the box: never secrets).
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+limits:
+  cpus: 2
+  memory: 4096        # MiB; writes outside /workspace (pip installs, /tmp) use this memory
+  disk: 8192          # MiB for writes to /workspace
+  timeout: 1h         # the box's lifetime
+  exec_timeout: 30m   # each command's
+
+# bound: inspect (MITM) only hosts with a bound secret. all: every allowed HTTPS host (breaks certificate pinning).
+inspect: bound

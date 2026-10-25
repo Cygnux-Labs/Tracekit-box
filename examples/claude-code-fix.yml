@@ -1,0 +1,72 @@
+# Copy to .github/workflows/claude-code-fix.yml. Runs Claude Code in a Tracekit Box to fix a failing test in a Node
+# project, checks the fix on the runner, and opens a pull request from the applied changes. The pull request is made
+# here, outside the box: the agent never holds a GitHub token, and its only output is the patch Box applied.
+#
+# Needs: the repository secret ANTHROPIC_API_KEY, and "Allow GitHub Actions to create and approve pull requests"
+# (Settings > Actions > General) for gh pr create with the workflow token.
+#
+# For a Python project, use an image with both Node (for Claude Code) and Python, add `allow: pypi`, and change the
+# test commands.
+name: claude-code-fix
+
+on:
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "The failing test, e.g. test/parser.test.js"
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fix the test in a box
+        id: box
+        uses: Cygnux-Labs/tracekit-box/action@v0.1.0
+        with:
+          agent: claude-code
+          image: node:22-slim
+          timeout: 30m
+          prompt: >-
+            The test ${{ inputs.test }} fails. Run `npm ci` and then `npm test`, find the cause and fix the code so the
+            test passes. Do not change or delete tests. Keep the change small.
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Check the fix on the runner
+        if: steps.box.outputs.changed-files != ''
+        run: npm ci && npm test
+
+      - name: Open a pull request
+        if: steps.box.outputs.changed-files != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TEST: ${{ inputs.test }}
+          VERIFY: ${{ steps.box.outputs.verify }}
+          FILES: ${{ steps.box.outputs.changed-files }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          branch="tracekit-box/fix-$GITHUB_RUN_ID"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add -A
+          git commit -q -m "Fix failing test $TEST"
+          git push -q origin "$branch"
+          body=$(printf '%s\n' \
+            "Claude Code fixed \`$TEST\` inside a Tracekit Box; the fix passed \`npm test\` on the runner." \
+            "" \
+            "Changed files:" \
+            "$(printf '%s\n' "$FILES" | sed 's/^/- /')" \
+            "" \
+            "Every command, connection and file write of the run was decided and signed by Tracekit. The bundle" \
+            "(tracekit-box.tkb, its trust file and the patch) is an artifact of $RUN_URL." \
+            "Integrity: $VERIFY. Check it yourself: \`tracekit verify tracekit-box.tkb --trust tracekit-box.trust.json\`.")
+          gh pr create --base "${GITHUB_REF_NAME}" --head "$branch" --title "Fix failing test $TEST" --body "$body"
