@@ -580,7 +580,6 @@ func cmdExport(ctx context.Context, args []string, env *cliEnv) error {
 	return nil
 }
 
-
 func cmdImage(ctx context.Context, args []string, env *cliEnv) error {
 	if len(args) == 0 || args[0] != "build" {
 		return usagef("usage: tkbox image build <ref>")
