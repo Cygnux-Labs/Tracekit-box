@@ -17,9 +17,9 @@ import (
 // diffFixture builds a base tree, a simulated overlay upper layer (whiteouts and opaque dirs recorded in maps) and
 // the merged tree the upper layer should produce, so a patch can be checked with the real git apply.
 type diffFixture struct {
-	t                *testing.T
+	t                 *testing.T
 	base, upper, want string
-	wh, opq          map[string]bool
+	wh, opq           map[string]bool
 }
 
 func newDiffFixture(t *testing.T) *diffFixture {
@@ -56,8 +56,10 @@ func writeLink(t *testing.T, root, rel, target string) {
 	must(t, os.Symlink(target, p))
 }
 
-func (f *diffFixture) baseFile(rel, content string, perm fs.FileMode) { writeFile(f.t, f.base, rel, content, perm) }
-func (f *diffFixture) baseLink(rel, target string)                    { writeLink(f.t, f.base, rel, target) }
+func (f *diffFixture) baseFile(rel, content string, perm fs.FileMode) {
+	writeFile(f.t, f.base, rel, content, perm)
+}
+func (f *diffFixture) baseLink(rel, target string) { writeLink(f.t, f.base, rel, target) }
 
 // seal copies base to want; call it after the base is built and before upper operations.
 func (f *diffFixture) seal() {
