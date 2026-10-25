@@ -1,0 +1,23 @@
+# Lima VM for developing Tracekit Box: Ubuntu arm64 with nested virtualization, so Firecracker gets /dev/kvm.
+vmType: vz
+nestedVirtualization: true
+cpus: 6
+memory: "10GiB"
+disk: "40GiB"
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+mounts:
+  - location: "~/tracekit-box"
+    writable: true
+  - location: "~/Tracekit"
+    writable: false
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -q
+      apt-get install -y -q e2fsprogs git curl jq python3-venv python3-pip acl
+      [ -e /dev/kvm ] && setfacl -m u:${LIMA_CIDATA_USER}:rw /dev/kvm || true

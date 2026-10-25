@@ -1,0 +1,12 @@
+/bin/
+/dist/
+*.ext4
+*.tkb
+*.trust.json
+.claude/
+__pycache__/
+*.pyc
+/sdk/python/build/
+/sdk/python/*.egg-info/
+.venv/
+/BRIEF.md
