@@ -156,15 +156,6 @@ func (x *exchange) forward(req *http.Request, overTLS bool) bool {
 	path := req.URL.Path
 	method := req.Method
 
-	// Where the request goes must be the tunnel's host.
-	if overTLS {
-		if r := x.checkInner(req); r != nil {
-			p.deny(x.s, x.cliOut, t, method, path, *r)
-			x.endReason = r.reason
-			return false
-		}
-	}
-
 	// Placeholders: never in the method, the URL or the Host; in headers only where bound (never over plain HTTP).
 	if f := p.find(method, true); f != nil {
 		return x.leak(method, path, &leakError{secret: f[0], reason: fmt.Sprintf("a placeholder for secret %s is in the request method", f[0].Name),
@@ -177,6 +168,14 @@ func (x *exchange) forward(req *http.Request, overTLS bool) bool {
 	if f := p.find(req.Host, true); f != nil {
 		return x.leak(method, path, &leakError{secret: f[0], reason: fmt.Sprintf("a placeholder for secret %s is in the Host header", f[0].Name),
 			todo: "Never put a secret in a host name."})
+	}
+	// Where the request goes must be the tunnel's host.
+	if overTLS {
+		if r := x.checkInner(req); r != nil {
+			p.deny(x.s, x.cliOut, t, method, path, *r)
+			x.endReason = r.reason
+			return false
+		}
 	}
 	upType := ""
 	if overTLS {
@@ -256,10 +255,21 @@ func (x *exchange) forward(req *http.Request, overTLS bool) bool {
 		tooBig := x.uhl.remain == 0
 		x.uhl.unlimit()
 		if err != nil {
-			if tooBig {
-				err = fmt.Errorf("response head larger than %d bytes", maxResponseHeadBytes)
+			// Never quote the parser's error: it can carry upstream bytes, and an upstream may echo a value.
+			switch {
+			case tooBig:
+				err = fmt.Errorf("its response head is larger than %d bytes", maxResponseHeadBytes)
+			case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+				err = errors.New("it closed the connection")
+			case isTimeout(err), errors.Is(err, net.ErrClosed):
+				err = errors.New("the connection was closed")
+			default:
+				err = errors.New("its response is not valid HTTP/1.1")
 			}
 			break
+		}
+		if overTLS {
+			p.redactValues(resp.Header)
 		}
 		if resp.StatusCode >= 100 && resp.StatusCode < 200 && resp.StatusCode != http.StatusSwitchingProtocols {
 			if i >= maxInterim {
@@ -267,7 +277,7 @@ func (x *exchange) forward(req *http.Request, overTLS bool) bool {
 				break
 			}
 			if overTLS || req.ProtoAtLeast(1, 1) {
-				if _, werr := writeResponse(x.cliOut, resp, method, true, false, ""); werr != nil {
+				if _, werr := writeResponse(x.cliOut, resp, method, true, false, "", nil); werr != nil {
 					return cutOff(nil)
 				}
 			}
@@ -279,7 +289,7 @@ func (x *exchange) forward(req *http.Request, overTLS bool) bool {
 		if r := bodyLeak.Load(); r != nil {
 			return cutOff(func() { x.leak(method, path, bodyLeakError(r, overTLS, t.host)) })
 		}
-		x.endReason = "the host sent no valid response: " + printable(err.Error(), 200)
+		x.endReason = "the host sent no valid response: " + err.Error()
 		return cutOff(func() {
 			p.writeRefusal(x.cliOut, http.StatusBadGateway, t, x.endReason, "The host closed the connection or answered with something that is not HTTP/1.1.")
 		})
@@ -293,7 +303,7 @@ func (x *exchange) forward(req *http.Request, overTLS bool) bool {
 				p.writeRefusal(x.cliOut, http.StatusBadGateway, t, x.endReason, "Ask for the upgrade with Connection: Upgrade.")
 			})
 		}
-		if _, err := writeResponse(x.cliOut, resp, method, true, false, upType); err != nil {
+		if _, err := writeResponse(x.cliOut, resp, method, true, false, upType, nil); err != nil {
 			return cutOff(nil)
 		}
 		if err := <-wdone; err != nil {
@@ -305,11 +315,8 @@ func (x *exchange) forward(req *http.Request, overTLS bool) bool {
 		return false
 	}
 
-	if overTLS {
-		p.redactValues(resp.Header)
-	}
 	closeAfter := !overTLS || req.Close || resp.Close
-	_, werr := writeResponse(x.cliOut, resp, method, req.ProtoAtLeast(1, 1), closeAfter, "")
+	_, werr := writeResponse(x.cliOut, resp, method, req.ProtoAtLeast(1, 1), closeAfter, "", p.redactValues)
 	if werr != nil {
 		return cutOff(nil)
 	}
@@ -488,7 +495,7 @@ func (o outRequest) write(w io.Writer) error {
 
 // writeResponse writes resp to the guest with fresh framing and flushes every body read, so streamed (SSE) model
 // responses arrive as they are produced. chunkOK is false for HTTP/1.0 clients.
-func writeResponse(w io.Writer, resp *http.Response, method string, chunkOK, closeConn bool, upType string) (int64, error) {
+func writeResponse(w io.Writer, resp *http.Response, method string, chunkOK, closeConn bool, upType string, fixTrailer func(http.Header)) (int64, error) {
 	bw := bufio.NewWriterSize(w, 16<<10)
 	code := resp.StatusCode
 	text := printable(strings.TrimSpace(strings.TrimPrefix(resp.Status, strconv.Itoa(code))), 100)
@@ -550,7 +557,13 @@ func writeResponse(w io.Writer, resp *http.Response, method string, chunkOK, clo
 	if bodyless {
 		return 0, nil
 	}
-	return copyBody(bw, resp.Body, chunked, func() http.Header { return resp.Trailer })
+	return copyBody(bw, resp.Body, chunked, func() http.Header {
+		tr := resp.Trailer.Clone()
+		if fixTrailer != nil {
+			fixTrailer(tr)
+		}
+		return tr
+	})
 }
 
 // copyBody copies r to bw, flushing after every read; chunked frames it and ends with trailers.

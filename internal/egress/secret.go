@@ -184,10 +184,16 @@ func (p *Proxy) findTarget(target string) []*secretRule {
 	return nil
 }
 
-// redact replaces every placeholder in s with "[secret NAME]" so events never carry one.
+// redact replaces every placeholder (and every value long enough to tell apart from ordinary text) in s with
+// "[secret NAME]", so events and refusals never carry one.
 func (p *Proxy) redact(s string) string {
 	if len(p.secrets) == 0 || s == "" {
 		return s
+	}
+	for _, r := range p.secrets {
+		if len(r.Value) >= minRedactLen && strings.Contains(s, r.Value) {
+			s = strings.ReplaceAll(s, r.Value, "[secret "+r.Name+"]")
+		}
 	}
 	low := asciiLower(s)
 	if !strings.Contains(low, placeholderPrefix) {
@@ -314,11 +320,14 @@ func (p *Proxy) checkUse(r *secretRule, canon, host string, swap bool) *leakErro
 	return nil
 }
 
+// minRedactLen: shorter values cannot be told apart from ordinary text and are not redacted from output.
+const minRedactLen = 6
+
 // redactValues replaces secret values echoed in response headers with their placeholders.
 func (p *Proxy) redactValues(h http.Header) {
 	for _, r := range p.secrets {
-		if len(r.Value) < 8 {
-			continue // too short to tell from ordinary text
+		if len(r.Value) < minRedactLen {
+			continue
 		}
 		for k, vs := range h {
 			for i, v := range vs {

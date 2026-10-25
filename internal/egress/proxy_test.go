@@ -1260,3 +1260,52 @@ func TestNonTLSOnBoundHostTunnels(t *testing.T) {
 		t.Fatalf("got %q %v", line, err)
 	}
 }
+
+func TestEchoedValueNeverReachesGuestOrEvents(t *testing.T) {
+	checkGoroutines(t)
+	port := startTLS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		// A broken upstream that quotes the credential where net/http's parse error quotes it back.
+		io.WriteString(c, "HTTP/1.1 "+r.Header.Get("Authorization")+" OK\r\n\r\n")
+	}), "example.com")
+	gh := mkSecret(t, "GH", "Authorization", "example.com")
+	e := newEnv(t, func(c *Config) {
+		c.Allow = []string{"example.com:" + port}
+		c.Secrets = []Secret{gh}
+	})
+	tc, br := e.tunnelTLS("example.com:"+port, "example.com")
+	fmt.Fprintf(tc, "GET / HTTP/1.1\r\nHost: example.com:%s\r\nAuthorization: %s\r\n\r\n", port, gh.Placeholder)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := body(t, resp)
+	if resp.StatusCode != 502 || strings.Contains(b, gh.Value) || strings.Contains(fmt.Sprint(resp.Header), gh.Value) {
+		t.Errorf("%s %q", resp.Status, b)
+	}
+	e.waitKind(EventClosed) // checkEvents verifies no event holds the value
+}
+
+func TestPlaceholderInInnerHostIsLeak(t *testing.T) {
+	checkGoroutines(t)
+	e, rec, port, gh, _ := secretEnv(t, nil)
+	tc, br := e.tunnelTLS("example.com:"+port, "example.com")
+	fmt.Fprintf(tc, "GET / HTTP/1.1\r\nHost: %s.example.com\r\n\r\n", gh.Placeholder)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := body(t, resp); resp.StatusCode != 403 || !strings.Contains(b, "Host header") {
+		t.Errorf("%s %q", resp.Status, b)
+	}
+	if ev := e.waitKind(EventSecretLeak); ev.Secret != "GH" {
+		t.Errorf("leak %+v", ev)
+	}
+	if rec.count() != 0 {
+		t.Error("upstream reached")
+	}
+}
