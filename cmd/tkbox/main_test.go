@@ -311,10 +311,10 @@ func TestMCP(t *testing.T) {
 		args map[string]any
 		want string
 	}{
-		{map[string]any{"allow": []string{"pypi", "evil.example.com"}}, "may not add \"evil.example.com\""},
-		{map[string]any{"env": map[string]any{"LD_PRELOAD": "/x.so"}}, "may not set env"},
+		{map[string]any{"image": "alpine:3", "allow": []string{"pypi", "evil.example.com"}}, "may not add \"evil.example.com\""},
+		{map[string]any{"image": "alpine:3", "env": map[string]any{"LD_PRELOAD": "/x.so"}}, "may not set env"},
 		{map[string]any{"image": "python:3.12"}, "not one the operator allows"},
-		{map[string]any{"workspace": "/etc"}, "outside the dirs the operator allows"},
+		{map[string]any{"image": "alpine:3", "workspace": "/etc"}, "outside the dirs the operator allows"},
 	} {
 		n := len(fd.created)
 		out, isErr = text(call(100+i, "tools/call", map[string]any{"name": "tkbox_run", "arguments": c.args}))
