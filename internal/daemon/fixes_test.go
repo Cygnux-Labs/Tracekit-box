@@ -503,9 +503,53 @@ func TestMustRecordFailsClosed(t *testing.T) {
 	}
 }
 
+// S7 (owner's requirement): a flood of must-record events is never dropped silently: the box stops, and the loss
+// is recorded in the signed run as observe tkbox.gap.
+func TestMustRecordFloodRecordsGap(t *testing.T) {
+	old := mustQueue
+	mustQueue = 32
+	defer func() { mustQueue = old }()
+	e := newTestEnv(t, nil)
+	fc := &failingClient{Client: e.tk, slow: map[string]time.Duration{tracekit.SourceSecretUse: 5 * time.Millisecond}}
+	e.d.opts.Tracekit = fc
+	e.create(api.CreateBoxRequest{Name: "flood"})
+	sink := e.proxy(0).cfg.Sink
+	for range 500 {
+		sink.Emit(egress.Event{Kind: egress.EventSecretUse, Host: "api.example.com", Port: 443, Secret: "T"})
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for e.box("flood").state() != api.StateStopped && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	v, _ := e.d.Get("flood")
+	if v.State != api.StateStopped || !strings.Contains(v.StopReason, "could not record tkbox.secret.use") {
+		t.Fatalf("box %+v", v)
+	}
+	uses, dropped := 0, 0
+	for _, r := range e.run(0).Records {
+		if r.Method != "observe" {
+			continue
+		}
+		switch r.Source {
+		case tracekit.SourceSecretUse:
+			uses++
+		case sourceGap:
+			m := r.Value.(map[string]any)
+			if m["kind"] != tracekit.SourceSecretUse || r.Trust != trustedObs {
+				t.Fatalf("gap %+v", r)
+			}
+			dropped += m["dropped"].(int)
+		}
+	}
+	if dropped == 0 || uses+dropped != 500 {
+		t.Fatalf("%d recorded + %d in the gap, want 500 accounted for", uses, dropped)
+	}
+}
+
 type failingClient struct {
 	tracekit.Client
 	fail map[string]bool
+	slow map[string]time.Duration
 }
 
 func (c *failingClient) NewRun(ctx context.Context, a tracekit.Agent) (tracekit.Run, error) {
@@ -513,15 +557,19 @@ func (c *failingClient) NewRun(ctx context.Context, a tracekit.Agent) (tracekit.
 	if err != nil {
 		return nil, err
 	}
-	return &failingRun{Run: r, fail: c.fail}, nil
+	return &failingRun{Run: r, fail: c.fail, slow: c.slow}, nil
 }
 
 type failingRun struct {
 	tracekit.Run
 	fail map[string]bool
+	slow map[string]time.Duration
 }
 
 func (r *failingRun) Observe(ctx context.Context, source, trust string, value any) error {
+	if d := r.slow[source]; d > 0 {
+		time.Sleep(d)
+	}
 	if r.fail[source] {
 		return &tracekit.RPCError{Code: "internal", Message: "refused"}
 	}

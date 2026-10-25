@@ -371,6 +371,13 @@ func (b *box) startObserver(run tracekit.Run) {
 
 // failClosed stops a box whose must-record observe could not be recorded.
 func (b *box) failClosed(source string, err error) {
+	b.mu.Lock()
+	already := b.failedClosed
+	b.failedClosed = true
+	b.mu.Unlock()
+	if already {
+		return // the box is already going down; the loss is counted for its tkbox.gap record
+	}
 	reason := "could not record " + source + " in Tracekit, so the box was stopped (fail closed)"
 	b.event(api.EventSignerProblem, "lifecycle", reason+": "+err.Error(), nil)
 	b.d.log.Printf("%s: %s: %v", b.id, reason, err)
@@ -385,6 +392,9 @@ func (b *box) observe(source, trust string, value any) {
 	b.mu.Lock()
 	o := b.obs
 	if o == nil || b.obsClosed {
+		if o != nil && !bulk {
+			o.lost(source, "it came after the box started closing its run")
+		}
 		b.mu.Unlock()
 		if o != nil {
 			b.event(api.EventSignerProblem, "lifecycle", "not recorded, the run is closing: a "+source+" record", nil)

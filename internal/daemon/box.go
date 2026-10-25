@@ -61,6 +61,7 @@ type box struct {
 	bootCancel    context.CancelFunc
 	stopReason    string // a stop asked for while creating
 	signerTrouble bool
+	failedClosed  bool // a must-record observe was lost: the box is being stopped
 	tearingDown   bool
 	persistMu     sync.Mutex // one box.json writer at a time
 
