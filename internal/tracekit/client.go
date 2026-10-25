@@ -78,15 +78,10 @@ func Dial(ctx context.Context, opts Options) (Client, error) {
 	c := &client{t: &transport{where: d.path, timeout: timeout}, source: d.source, stream: newID(),
 		bin: opts.TracekitBin}
 	c.t.put(c0)
-	st, err := c.Status(ctx)
-	if err != nil {
+	// status.rpc_version is the signer's highest protocol; hello's range already holds ours
+	if _, err := c.Status(ctx); err != nil {
 		c.Close()
 		return nil, err
-	}
-	if st.RPCVersion != rpcVersion {
-		c.Close()
-		return nil, &Incompatible{Where: d.path, SignerVersion: st.SignerVersion, Proto: []int{st.RPCVersion,
-			st.RPCVersion}}
 	}
 	return c, nil
 }

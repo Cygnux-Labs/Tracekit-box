@@ -113,8 +113,8 @@ func TestRealSigner(t *testing.T) {
 	complete(odd, out, map[string]any{"exit_code": 2})
 
 	cont, err := r.Contained(ctx)
-	if err != nil || cont.Contained {
-		t.Fatalf("contained %+v %v", cont, err)
+	if err != nil || cont.Contained || r.(*run).readFrom < 10 {
+		t.Fatalf("contained %+v %v (read up to run_seq %d)", cont, err, r.(*run).readFrom)
 	}
 	if err := r.Observe(ctx, SourceApproval, "trusted", map[string]any{"approval_id": out.ApprovalID,
 		"target": "Bash", "decision": "approve", "approver": st.Identity}); err != nil {
