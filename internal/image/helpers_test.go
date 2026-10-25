@@ -9,6 +9,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -114,7 +116,9 @@ const testToken = "tok-123"
 func newTestRegistry(t testing.TB) *testRegistry {
 	r := &testRegistry{t: t, content: map[string][]byte{}, types: map[string]string{}, tags: map[string]string{},
 		corrupt: map[string]bool{}}
-	r.srv = httptest.NewTLSServer(http.HandlerFunc(r.serve))
+	r.srv = httptest.NewUnstartedServer(http.HandlerFunc(r.serve))
+	r.srv.Config.ErrorLog = log.New(io.Discard, "", 0) // TestHTTPSOnly's rejected handshakes
+	r.srv.StartTLS()
 	t.Cleanup(r.srv.Close)
 	return r
 }
