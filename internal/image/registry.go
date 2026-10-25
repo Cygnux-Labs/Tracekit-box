@@ -120,10 +120,14 @@ func newRegistry(opts Options, stall time.Duration) *registry {
 
 // get sends a GET for path under the repository's /v2/ API, fetching a bearer token when the registry asks for one.
 func (r *registry) get(ctx context.Context, ref reference, path, accept string) (*http.Response, error) {
+	return r.do(ctx, http.MethodGet, ref, path, accept)
+}
+
+func (r *registry) do(ctx context.Context, method string, ref reference, path, accept string) (*http.Response, error) {
 	u := "https://" + ref.apiHost() + "/v2/" + ref.Repo + path
 	key := ref.apiHost() + "/" + ref.Repo
 	for attempt := 0; ; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		req, err := http.NewRequestWithContext(ctx, method, u, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -281,6 +285,34 @@ func parseChallenge(h string) (string, map[string]string) {
 // fetchManifest GETs a manifest or index by tag or digest, capped at max bytes, and returns its body, media type and
 // sha256 digest. A digest request must match byte for byte; a tag request must match Docker-Content-Digest if sent.
 func (r *registry) fetchManifest(ctx context.Context, ref reference, tagOrDigest string, max int64) ([]byte, string, string, error) {
+	// Manifests are small: a registry that trickles one for longer than this is treated as unreachable.
+	limit := 2 * r.stall
+	tctx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
+	body, ct, dg, err := r.fetchManifestOnce(tctx, ref, tagOrDigest, max)
+	if err != nil && ctx.Err() == nil && tctx.Err() != nil {
+		err = &unreachableError{host: ref.apiHost(), err: fmt.Errorf("no complete manifest within %s", limit)}
+	}
+	return body, ct, dg, err
+}
+
+// headDigest asks for a tag's digest without fetching the manifest (Docker Hub does not count HEADs against its
+// anonymous pull limit). It returns "" when the registry does not say.
+func (r *registry) headDigest(ctx context.Context, ref reference, tag string) string {
+	tctx, cancel := context.WithTimeout(ctx, r.stall)
+	defer cancel()
+	resp, err := r.do(tctx, http.MethodHead, ref, "/manifests/"+tag, manifestAccept)
+	if err != nil {
+		return ""
+	}
+	resp.Body.Close()
+	if d := resp.Header.Get("Docker-Content-Digest"); resp.StatusCode == http.StatusOK && checkDigest(d) == nil {
+		return d
+	}
+	return ""
+}
+
+func (r *registry) fetchManifestOnce(ctx context.Context, ref reference, tagOrDigest string, max int64) ([]byte, string, string, error) {
 	resp, err := r.get(ctx, ref, "/manifests/"+tagOrDigest, manifestAccept)
 	if err != nil {
 		return nil, "", "", err

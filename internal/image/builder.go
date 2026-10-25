@@ -130,12 +130,17 @@ func NewBuilder(opts Options) (Builder, error) {
 
 func (b *builder) dir(name string) string { return filepath.Join(b.opts.CacheDir, name) }
 
-// sweepTmp removes partial downloads and staging dirs a crashed build left behind.
+// sweepTmp removes partial downloads, staging dirs and half-written files a crashed build left behind.
 func (b *builder) sweepTmp(age time.Duration) {
-	ents, _ := os.ReadDir(b.dir("tmp"))
-	for _, e := range ents {
-		if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > age {
-			os.RemoveAll(filepath.Join(b.dir("tmp"), e.Name()))
+	for _, d := range []string{"tmp", "rootfs", "blobs/sha256", "refs"} {
+		ents, _ := os.ReadDir(b.dir(d))
+		for _, e := range ents {
+			if d != "tmp" && !(strings.HasPrefix(e.Name(), ".") && strings.Contains(e.Name(), ".tmp-")) {
+				continue
+			}
+			if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > age {
+				os.RemoveAll(filepath.Join(b.dir(d), e.Name()))
+			}
 		}
 	}
 }
@@ -225,11 +230,10 @@ func (b *builder) guest(arch string) (string, string, error) {
 
 // resolve fetches the manifest for ref (through an index to the linux/arch image) and its config, all verified.
 func (b *builder) resolve(ctx context.Context, ref reference, arch string) (*resolved, error) {
-	body, mt, dg, err := b.reg.fetchManifest(ctx, ref, ref.manifestRef(), b.lim.ManifestBytes)
+	body, mt, dg, err := b.topManifest(ctx, ref)
 	if err != nil {
 		return nil, err
 	}
-	b.storeBlob(dg, body)
 	for depth := 0; ; depth++ {
 		doc, isIndex, err := parseManifest(ref, body, mt)
 		if err != nil {
@@ -284,6 +288,26 @@ func (b *builder) resolve(ctx context.Context, ref reference, arch string) (*res
 		}
 		return res, nil
 	}
+}
+
+// topManifest returns the manifest or index ref names. Digests come from the verified cache when present; a tag
+// costs a HEAD, and a GET only when its digest is not cached yet.
+func (b *builder) topManifest(ctx context.Context, ref reference) ([]byte, string, string, error) {
+	if ref.Digest != "" {
+		body, err := b.manifestByDigest(ctx, ref, ref.Digest)
+		return body, "", ref.Digest, err
+	}
+	if d := b.reg.headDigest(ctx, ref, ref.Tag); d != "" {
+		if body, err := readVerified(b.blobPath(d), d, b.lim.ManifestBytes); err == nil {
+			return body, "", d, nil
+		}
+	}
+	body, mt, dg, err := b.reg.fetchManifest(ctx, ref, ref.Tag, b.lim.ManifestBytes)
+	if err != nil {
+		return nil, "", "", err
+	}
+	b.storeBlob(dg, body)
+	return body, mt, dg, nil
 }
 
 func parseManifest(ref reference, body []byte, headerType string) (manifestDoc, bool, error) {

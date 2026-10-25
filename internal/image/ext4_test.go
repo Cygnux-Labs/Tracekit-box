@@ -149,10 +149,12 @@ func TestRootfsExt4(t *testing.T) {
 		t.Errorf("rootfs file mode: %v %v", fi, err)
 	}
 
-	// Cached: no further blob fetches, same file; the staging and temp files are gone.
+	// Cached: no blob fetches and no manifest GETs (a HEAD finds the tag's digest), same file; the staging and temp
+	// files are gone.
+	gets := reg.manGets.Load()
 	r2, err := b.Rootfs(t.Context(), ref, "arm64")
-	if err != nil || r2.Path != r.Path || reg.blobHits.Load() != 3 {
-		t.Fatalf("cached build: %+v %v (blob hits %d)", r2, err, reg.blobHits.Load())
+	if err != nil || r2.Path != r.Path || reg.blobHits.Load() != 3 || reg.manGets.Load() != gets {
+		t.Fatalf("cached build: %+v %v (blob hits %d, manifest GETs %d → %d)", r2, err, reg.blobHits.Load(), gets, reg.manGets.Load())
 	}
 	if left, _ := os.ReadDir(b.dir("tmp")); len(left) != 0 {
 		t.Errorf("tmp not cleaned: %v", left)

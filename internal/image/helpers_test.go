@@ -109,6 +109,7 @@ type testRegistry struct {
 	corrupt   map[string]bool   // digests served with a flipped byte
 	tokenHits atomic.Int32
 	blobHits  atomic.Int32
+	manGets   atomic.Int32 // manifest GETs (HEADs are free on Docker Hub)
 }
 
 const testToken = "tok-123"
@@ -174,6 +175,9 @@ func (r *testRegistry) serve(w http.ResponseWriter, req *http.Request) {
 	} else {
 		w.Header().Set("Content-Type", mt)
 		w.Header().Set("Docker-Content-Digest", digest)
+		if req.Method == http.MethodGet {
+			r.manGets.Add(1)
+		}
 	}
 	w.Write(body)
 }

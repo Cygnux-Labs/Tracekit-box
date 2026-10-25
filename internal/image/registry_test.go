@@ -155,10 +155,10 @@ func TestDigestMismatchFails(t *testing.T) {
 		t.Errorf("partial files left in tmp: %v", tmp)
 	}
 
-	// A manifest asked for by digest must hash to it.
+	// A manifest asked for by digest must hash to it (fresh cache: the verified copy would be used otherwise).
 	delete(reg.corrupt, img.layerDig[0])
 	reg.corrupt[img.manifest] = true
-	_, _, err = stageRef(t, b, reg.host()+"/x@"+img.manifest, "arm64")
+	_, _, err = stageRef(t, newTestBuilder(t, reg, nil), reg.host()+"/x@"+img.manifest, "arm64")
 	if err == nil || !strings.Contains(err.Error(), "refusing unverified content") {
 		t.Fatalf("corrupt manifest: got %v", err)
 	}
