@@ -151,9 +151,15 @@ func cmdExec(args []string, env *cliEnv) int {
 	defer signal.Stop(sigc)
 	names := make(chan string, 4)
 	go func() {
+		interrupts := 0
 		for s := range sigc {
 			switch s {
 			case os.Interrupt:
+				// Ctrl-C goes to the process in the box; the third one gives up on it here
+				if interrupts++; interrupts >= 3 {
+					fmt.Fprintln(env.stderr, "tkbox: giving up on the command (it may still run in the box; `tkbox stop` stops the box)")
+					os.Exit(130)
+				}
 				names <- "SIGINT"
 			case syscall.SIGTERM:
 				names <- "SIGTERM"

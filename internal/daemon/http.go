@@ -117,7 +117,7 @@ func readJSON(r *http.Request, v any) error {
 	dec := json.NewDecoder(io.LimitReader(r.Body, maxBody))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
-		return errf(api.CodeBadRequest, "", "request body: %v", err)
+		return errf(api.CodeBadRequest, "send the JSON body internal/api documents for this route", "request body: %v", err)
 	}
 	return nil
 }
@@ -290,7 +290,7 @@ func (d *Daemon) hExec(w http.ResponseWriter, r *http.Request) {
 	}
 	conn, brw, err := http.NewResponseController(w).Hijack()
 	if err != nil {
-		writeErr(w, errf(api.CodeInternal, "", "cannot upgrade: %v", err))
+		writeErr(w, errf(api.CodeInternal, "retry over the Unix socket with HTTP/1.1", "cannot upgrade: %v", err))
 		return
 	}
 	defer conn.Close()

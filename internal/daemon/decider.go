@@ -246,7 +246,7 @@ func (d *Daemon) DecideApproval(id string, dec api.ApprovalDecision, uid int) (a
 	case "reject", "rejected", "deny":
 		state = approvalRejected
 	default:
-		return api.Approval{}, errf(api.CodeBadRequest, "", "decision %q: use \"approve\" or \"reject\"", dec.Decision)
+		return api.Approval{}, errf(api.CodeBadRequest, "use `tkbox approve <id>` or `tkbox reject <id>`", "decision %q: use \"approve\" or \"reject\"", dec.Decision)
 	}
 	scope := dec.Scope
 	switch scope {
@@ -254,16 +254,16 @@ func (d *Daemon) DecideApproval(id string, dec api.ApprovalDecision, uid int) (a
 		scope = "once"
 	case "box":
 		if state != approvalApproved {
-			return api.Approval{}, errf(api.CodeBadRequest, "", "scope \"box\" only applies to approve")
+			return api.Approval{}, errf(api.CodeBadRequest, "drop --box when rejecting", "scope \"box\" only applies to approve")
 		}
 	default:
-		return api.Approval{}, errf(api.CodeBadRequest, "", "scope %q: use \"once\" or \"box\"", dec.Scope)
+		return api.Approval{}, errf(api.CodeBadRequest, "approve once (default) or for the rest of the box with --box", "scope %q: use \"once\" or \"box\"", dec.Scope)
 	}
 	if !d.finish(a, state, "uid:"+strconv.Itoa(uid), scope) {
 		d.mu.Lock()
 		st := a.State
 		d.mu.Unlock()
-		return api.Approval{}, errf(api.CodeConflict, "", "approval %s is already %s", id, st)
+		return api.Approval{}, errf(api.CodeConflict, "list what is still pending with `tkbox approvals`", "approval %s is already %s", id, st)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()

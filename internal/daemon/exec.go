@@ -55,19 +55,19 @@ func (d *Daemon) prepareExec(ref string, req api.ExecRequest) (*box, *api.ErrorD
 	}
 	for _, a := range req.Argv {
 		if strings.ContainsRune(a, 0) {
-			return nil, errf(api.CodeBadRequest, "", "an argument has a NUL byte")
+			return nil, errf(api.CodeBadRequest, "remove the NUL byte from the command", "an argument has a NUL byte")
 		}
 	}
 	for k, v := range req.Env {
 		if !envNameRE.MatchString(k) || strings.ContainsRune(v, 0) {
-			return nil, errf(api.CodeBadRequest, "", "env %q is not a valid KEY=VALUE", k)
+			return nil, errf(api.CodeBadRequest, "env names are letters, digits and _; values can't hold NUL", "env %q is not a valid KEY=VALUE", k)
 		}
 		if reservedEnv[k] {
 			return nil, errf(api.CodeBadRequest, "every connection goes through the box's proxy", "env %s is set by the box and can't be overridden", k)
 		}
 	}
 	if req.Cwd != "" && !strings.HasPrefix(req.Cwd, "/") {
-		return nil, errf(api.CodeBadRequest, "", "cwd %q must be an absolute path in the box", req.Cwd)
+		return nil, errf(api.CodeBadRequest, "pass --cwd /workspace/... (absolute)", "cwd %q must be an absolute path in the box", req.Cwd)
 	}
 	if t := time.Duration(req.Timeout); t < 0 || t > config.MaxExecTimeout {
 		return nil, limitErr("exec timeout %s is outside 1s..24h", "pass --timeout up to 24h", t)

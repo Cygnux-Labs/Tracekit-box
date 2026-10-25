@@ -178,7 +178,7 @@ func (d *Daemon) validate(req api.CreateBoxRequest) (*spec, *api.ErrorDetail) {
 			return bad("keep it in secrets only", "env %s is also a secret", k)
 		}
 		if strings.ContainsRune(v, 0) {
-			return bad("", "env %s has a NUL byte", k)
+			return bad("remove the NUL byte", "env %s has a NUL byte", k)
 		}
 	}
 	if req.Workspace != "" {

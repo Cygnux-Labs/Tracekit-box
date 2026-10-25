@@ -23,6 +23,20 @@ import (
 
 const secretValue = "ghp_S3CRET-value-never-on-disk"
 
+func TestCreateAbandonedByClient(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.guest.PingErr = errors.New("not yet") // booting forever
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	_, err := e.d.Create(ctx, api.CreateBoxRequest{Name: "gone", Image: "x"})
+	if err == nil || !strings.Contains(err.Error(), "the client went away") {
+		t.Fatalf("err = %v", err)
+	}
+	if b, _ := e.d.Get("gone"); b.State != api.StateFailed || e.machine(0).State != "stopped" || !e.run(0).Closed {
+		t.Fatalf("box %+v machine %s", b, e.machine(0).State)
+	}
+}
+
 func TestLifecycle(t *testing.T) {
 	e := newTestEnv(t, nil)
 	ws := t.TempDir()

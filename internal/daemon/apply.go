@@ -226,7 +226,7 @@ func (d *Daemon) Export(ctx context.Context, ref string, req api.ExportRequest) 
 		return api.ExportResult{}, errf(api.CodeBadRequest, "pass -o with an absolute path (the CLI resolves it)", "out %q is not an absolute path", out)
 	}
 	if fi, err := os.Stat(filepath.Dir(out)); err != nil || !fi.IsDir() {
-		return api.ExportResult{}, errf(api.CodeBadRequest, "", "the directory of %s does not exist", out)
+		return api.ExportResult{}, errf(api.CodeBadRequest, "create the directory first, or pass -o in an existing one", "the directory of %s does not exist", out)
 	}
 	trust := strings.TrimSuffix(out, ".tkb") + ".trust.json"
 	if err := d.opts.Tracekit.Export(ctx, v.RunID, out, trust); err != nil {

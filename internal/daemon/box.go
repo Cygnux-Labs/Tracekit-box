@@ -53,6 +53,7 @@ type box struct {
 	stopReason    string // a stop asked for while creating
 	signerTrouble bool
 	tearingDown   bool
+	persistMu     sync.Mutex // one box.json writer at a time
 
 	scrubP   atomic.Pointer[scrubber]
 	events   *eventLog
@@ -116,6 +117,8 @@ func (b *box) nextCallID(kind string) string { return fmt.Sprintf("%s-%d", kind,
 
 // persist writes box.json atomically (0600). It holds no secret values: api.Box only names secrets.
 func (b *box) persist() {
+	b.persistMu.Lock()
+	defer b.persistMu.Unlock()
 	b.mu.Lock()
 	p := persisted{Box: b.info, CID: b.cid}
 	b.mu.Unlock()
@@ -144,7 +147,7 @@ func (d *Daemon) Create(ctx context.Context, req api.CreateBoxRequest) (api.Box,
 	d.mu.Lock()
 	if d.closed {
 		d.mu.Unlock()
-		return api.Box{}, errf(api.CodeUnavailable, "", "the daemon is shutting down")
+		return api.Box{}, errf(api.CodeUnavailable, "start the daemon again (`tkbox daemon`) and retry", "the daemon is shutting down")
 	}
 	live := 0
 	used := map[uint32]bool{}
@@ -208,7 +211,18 @@ func (d *Daemon) Create(ctx context.Context, req api.CreateBoxRequest) (api.Box,
 	b.persist()
 	b.event(api.EventBoxCreated, "lifecycle", fmt.Sprintf("box %s created from %s", name, s.req.Image), map[string]any{
 		"image": s.req.Image, "allow": s.allow, "secrets": names, "unrecorded": d.opts.Unrecorded})
-	if err := b.boot(bctx, s); err != nil {
+	// a client that gives up (Ctrl-C on `tkbox run`) abandons the box rather than leaving one nobody knows about
+	unwatch := context.AfterFunc(ctx, func() {
+		b.mu.Lock()
+		if b.stopReason == "" {
+			b.stopReason = "the client went away"
+		}
+		b.mu.Unlock()
+		cancel()
+	})
+	err := b.boot(bctx, s)
+	unwatch()
+	if err != nil {
 		b.mu.Lock()
 		if b.stopReason != "" {
 			err = fmt.Errorf("stopped while creating (%s): %w", b.stopReason, err)
