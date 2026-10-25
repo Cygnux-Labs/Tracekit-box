@@ -254,7 +254,10 @@ func (d *Daemon) Apply(ctx context.Context, ref string, req api.ApplyRequest) (a
 				args["sensitive"] = true
 			}
 			g.call = tracekit.Call{ID: b.nextCallID("write"), Tool: tracekit.ToolWrite, Args: args}
-			out, err := d.opts.Gate(ctx, run, g.call, tracekit.GateHooks{})
+			out, err := d.opts.Gate(ctx, run, g.call, tracekit.GateHooks{OnAsk: func(id string) {
+				b.event(api.EventApproval, "apply", fmt.Sprintf("waiting for approval %s to write %s: approve with: tracekit approvals approve %s", id, p, id),
+					map[string]any{"approval_id": id, "path": p})
+			}})
 			if err != nil {
 				completeWrites(d, b, run, allowed, "error", map[string]any{"written": false, "reason": "the signer did not answer about another file"})
 				var rpc *tracekit.RPCError
@@ -623,4 +626,3 @@ func (d *Daemon) BuildImage(ctx context.Context, ref string) (api.Image, error) 
 	}
 	return api.Image{Ref: ref, Digest: r.Digest, Arch: r.Arch, Path: r.Path, Size: r.Size}, nil
 }
-

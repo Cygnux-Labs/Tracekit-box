@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
+	"github.com/Cygnux-Labs/tracekit-box/internal/config"
 	"github.com/Cygnux-Labs/tracekit-box/internal/proto"
 )
 
@@ -234,7 +235,7 @@ func TestMCP(t *testing.T) {
 	sock, fd := startFakeDaemon(t)
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
-	s := &mcpServer{c: newClient(sock), out: outW}
+	s := &mcpServer{c: newClient(sock), out: outW, images: []string{"alpine:3"}, base: &config.File{Allow: []string{"pypi", "github"}}}
 	done := make(chan error, 1)
 	go func() { done <- s.serve(context.Background(), inR); outW.Close() }()
 	lines := bufio.NewScanner(outR)
@@ -298,12 +299,31 @@ func TestMCP(t *testing.T) {
 	if isErr || !strings.Contains(out, "is running alpine:3") || fd.created[0].Agent != "mcp" || len(fd.created[0].Secrets) != 0 {
 		t.Fatalf("run: %q %+v", out, fd.created)
 	}
+	if strings.Join(fd.created[0].Allow, ",") != "pypi" {
+		t.Fatalf("allow not narrowed to pypi: %v", fd.created[0].Allow)
+	}
 	out, isErr = text(call(7, "tools/call", map[string]any{"name": "tkbox_run", "arguments": map[string]any{"image": "x", "secrets": map[string]any{"A": "v"}}}))
 	if !isErr || !strings.Contains(out, "unknown field") {
 		t.Fatalf("run with secrets must be refused: %q", out)
 	}
+	// the agent may only narrow what the operator set up
+	for i, c := range []struct {
+		args map[string]any
+		want string
+	}{
+		{map[string]any{"allow": []string{"pypi", "evil.example.com"}}, "may not add \"evil.example.com\""},
+		{map[string]any{"env": map[string]any{"LD_PRELOAD": "/x.so"}}, "may not set env"},
+		{map[string]any{"image": "python:3.12"}, "not one the operator allows"},
+		{map[string]any{"workspace": "/etc"}, "outside the dirs the operator allows"},
+	} {
+		n := len(fd.created)
+		out, isErr = text(call(100+i, "tools/call", map[string]any{"name": "tkbox_run", "arguments": c.args}))
+		if !isErr || !strings.Contains(out, c.want) || len(fd.created) != n {
+			t.Fatalf("widening %v: %v %q", c.args, isErr, out)
+		}
+	}
 	out, _ = text(call(8, "tools/call", map[string]any{"name": "tkbox_diff", "arguments": map[string]any{"box": "b1"}}))
-	if !strings.Contains(out, "1 files changed") || !strings.Contains(out, "PATCH") {
+	if !strings.Contains(out, "1 file changed") || !strings.Contains(out, "PATCH") {
 		t.Fatalf("diff: %q", out)
 	}
 	if out, _ = text(call(9, "tools/call", map[string]any{"name": "tkbox_stop", "arguments": map[string]any{"box": "b1"}})); !strings.Contains(out, "stopped") {

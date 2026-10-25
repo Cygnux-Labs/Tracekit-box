@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -44,16 +46,24 @@ type rpcError struct {
 	Message string `json:"message"`
 }
 
+// mcpServer is the MCP server. The agent calling it may only narrow what the operator set up: it can't add hosts to
+// the allowlist, set env for every command, pick an image the operator did not list, or copy in a host dir outside
+// the operator's workspace roots.
 type mcpServer struct {
-	c    *client
-	base *config.File // operator's tkbox.yaml: the only source of secrets for tkbox_run
-	out  io.Writer
-	mu   sync.Mutex
+	c      *client
+	base   *config.File // operator's tkbox.yaml: the only source of secrets for tkbox_run
+	images []string     // images tkbox_run may use: the config's image, then each --image
+	roots  []string     // dirs (symlinks resolved) a tkbox_run workspace must be inside
+	out    io.Writer
+	mu     sync.Mutex
 }
 
 func cmdMCP(ctx context.Context, args []string, env *cliEnv) error {
 	fs, sock := newFlags("mcp", env)
-	cfgPath := fs.String("config", "", "tkbox.yaml whose image, allowlist and secrets every tkbox_run starts from")
+	cfgPath := fs.String("config", "", "tkbox.yaml whose image, allowlist, secrets, env and limits every tkbox_run starts from")
+	var images, roots stringList
+	fs.Var(&images, "image", "an image tkbox_run may use besides the config's (repeatable)")
+	fs.Var(&roots, "workspace-root", "a host dir tkbox_run may copy a workspace from, itself or below it (repeatable; default: the config's workspace only)")
 	if _, err := parseAll(fs, args); err != nil {
 		return err
 	}
@@ -64,8 +74,119 @@ func cmdMCP(ctx context.Context, args []string, env *cliEnv) error {
 			return err
 		}
 		s.base = f
+		if f.Image != "" {
+			s.images = append(s.images, f.Image)
+		}
+	}
+	s.images = append(s.images, images.vals...)
+	for _, r := range roots.vals {
+		abs, err := filepath.Abs(r)
+		if err == nil {
+			abs, err = filepath.EvalSymlinks(abs)
+		}
+		if err != nil {
+			return fmt.Errorf("--workspace-root %s: %v", r, err)
+		}
+		s.roots = append(s.roots, abs)
 	}
 	return s.serve(ctx, env.stdin)
+}
+
+// mcpRefused is a tkbox_run argument that would widen the box past what the operator set up.
+func mcpRefused(format string, a ...any) error {
+	return &api.ErrorDetail{Code: api.CodeForbidden, Message: fmt.Sprintf(format, a...),
+		Hint: "an MCP client may only narrow what the operator set up in `tkbox mcp` (--config, --image, --workspace-root); ask the operator"}
+}
+
+// runRequest builds a tkbox_run create request from the operator's setup, narrowed by the agent's arguments.
+func (s *mcpServer) runRequest(a mcpRunArgs) (api.CreateBoxRequest, error) {
+	if len(a.Env) > 0 {
+		return api.CreateBoxRequest{}, mcpRefused("tkbox_run may not set env for every command (it would apply to commands without being decided); put env in the command itself")
+	}
+	image := a.Image
+	switch {
+	case len(s.images) == 0:
+		return api.CreateBoxRequest{}, mcpRefused("tkbox mcp was started without an image: the operator passes --config with image: or --image")
+	case image == "":
+		image = s.images[0]
+	case !slices.Contains(s.images, image):
+		return api.CreateBoxRequest{}, mcpRefused("image %q is not one the operator allows (%s)", image, strings.Join(s.images, ", "))
+	}
+	var baseAllow []string
+	if s.base != nil {
+		baseAllow = s.base.Allow
+	}
+	for _, h := range a.Allow {
+		if !slices.Contains(baseAllow, h) {
+			return api.CreateBoxRequest{}, mcpRefused("tkbox_run may not add %q to the allowlist: it is not in the operator's (%s)", h, orNone(baseAllow))
+		}
+	}
+	if a.Workspace != "" {
+		if err := s.checkWorkspace(a.Workspace); err != nil {
+			return api.CreateBoxRequest{}, err
+		}
+	}
+	if s.base != nil {
+		l := s.base.Limits
+		switch {
+		case l.CPUs != 0 && a.CPUs > l.CPUs:
+			return api.CreateBoxRequest{}, mcpRefused("cpus %d is over the operator's %d", a.CPUs, l.CPUs)
+		case l.Memory != 0 && a.Memory != "":
+			if m, err := config.ParseSize(a.Memory); err == nil && m > int(l.Memory) {
+				return api.CreateBoxRequest{}, mcpRefused("memory %s is over the operator's %dMiB", a.Memory, int(l.Memory))
+			}
+		}
+		if l.Timeout != 0 && a.Timeout != "" {
+			if d, err := config.ParseDuration(a.Timeout); err == nil && d > time.Duration(l.Timeout) {
+				return api.CreateBoxRequest{}, mcpRefused("timeout %s is over the operator's %s", a.Timeout, time.Duration(l.Timeout))
+			}
+		}
+	}
+	req, err := config.Request(s.base, config.Flags{Image: image, Name: a.Name, Workspace: a.Workspace,
+		CPUs: a.CPUs, Memory: a.Memory, Timeout: a.Timeout, Task: a.Task, Agent: "mcp"}, config.Resolver{})
+	if err != nil {
+		return api.CreateBoxRequest{}, err
+	}
+	if len(a.Allow) > 0 {
+		req.Allow = append([]string(nil), a.Allow...) // narrowed to the hosts the agent named
+	}
+	return req, nil
+}
+
+// checkWorkspace allows a workspace only inside an operator root (--workspace-root), or the config's own workspace.
+func (s *mcpServer) checkWorkspace(ws string) error {
+	if !filepath.IsAbs(ws) {
+		return &api.ErrorDetail{Code: api.CodeBadRequest, Message: "workspace must be an absolute path"}
+	}
+	real, err := filepath.EvalSymlinks(filepath.Clean(ws))
+	if err != nil {
+		return &api.ErrorDetail{Code: api.CodeBadRequest, Message: fmt.Sprintf("workspace %s: %v", ws, err)}
+	}
+	if len(s.roots) == 0 && s.base != nil {
+		if cw := s.base.WorkspacePath(); cw != "" {
+			if rr, err := filepath.EvalSymlinks(cw); err == nil && rr == real {
+				return nil // exactly the config's workspace
+			}
+		}
+	}
+	for _, r := range s.roots {
+		if real == r || strings.HasPrefix(real, r+string(filepath.Separator)) {
+			return nil
+		}
+	}
+	return mcpRefused("workspace %s is outside the dirs the operator allows (tkbox mcp --workspace-root)", ws)
+}
+
+type mcpRunArgs struct {
+	Image     string            `json:"image"`
+	Name      string            `json:"name"`
+	Allow     []string          `json:"allow"`
+	Workspace string            `json:"workspace"`
+	Env       map[string]string `json:"env"`
+	CPUs      int               `json:"cpus"`
+	Memory    string            `json:"memory"`
+	Timeout   string            `json:"timeout"`
+	Task      string            `json:"task"`
 }
 
 func (s *mcpServer) send(v any) {
@@ -78,11 +199,14 @@ func (s *mcpServer) send(v any) {
 	s.out.Write(append(b, '\n'))
 }
 
-func (s *mcpServer) serve(ctx context.Context, in io.Reader) error {
+func (s *mcpServer) serve(parent context.Context, in io.Reader) error {
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 64<<10), mcpMaxLine)
+	// when the client goes away (stdin closes) its in-flight calls are cancelled: execs stop instead of running on
+	ctx, cancel := context.WithCancel(parent)
 	var wg sync.WaitGroup
 	defer wg.Wait()
+	defer cancel()
 	for sc.Scan() {
 		line := bytes.TrimSpace(sc.Bytes())
 		if len(line) == 0 {
@@ -175,16 +299,15 @@ var (
 
 func mcpTools() []map[string]any {
 	return []map[string]any{
-		{"name": "tkbox_run", "description": "Create a box (a micro-VM) and return its id. Secrets come only from the operator's tkbox.yaml.",
+		{"name": "tkbox_run", "description": "Create a box (a micro-VM) and return its id. Image, allowlist, secrets and env come from the operator's setup; these arguments can only narrow it.",
 			"inputSchema": schema(map[string]any{
-				"image":     strProp("OCI image, e.g. python:3.12-slim (default: the operator's tkbox.yaml)"),
+				"image":     strProp("OCI image (default: the operator's; only images the operator allows)"),
 				"name":      strProp("box name: lower case letters, digits and -"),
-				"allow":     arrProp("presets (github, pypi, npm, anthropic, openai, apt-ubuntu, go-proxy) or hosts the box may reach"),
-				"workspace": strProp("absolute host dir copied into /workspace"),
-				"env":       map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "plain env for every command"},
+				"allow":     arrProp("narrow the egress allowlist to these entries of the operator's allowlist (nothing can be added)"),
+				"workspace": strProp("absolute host dir copied into /workspace (default: the operator's; only inside the operator's workspace roots)"),
 				"cpus":      map[string]any{"type": "integer", "minimum": 1, "maximum": 32},
-				"memory":    strProp("e.g. 2GiB"),
-				"timeout":   strProp("box lifetime, e.g. 1h"),
+				"memory":    strProp("e.g. 2GiB (at most the operator's limit)"),
+				"timeout":   strProp("box lifetime, e.g. 1h (at most the operator's limit)"),
 				"task":      strProp("the task, recorded in the Tracekit run"),
 			})},
 		{"name": "tkbox_exec", "description": "Run a command in a box (decided by the Tracekit signer first) and return its exit code and output.",
@@ -242,25 +365,11 @@ func (c *capWriter) String() string {
 func (s *mcpServer) call(ctx context.Context, name string, raw json.RawMessage) (string, bool, error) {
 	switch name {
 	case "tkbox_run":
-		var a struct {
-			Image     string            `json:"image"`
-			Name      string            `json:"name"`
-			Allow     []string          `json:"allow"`
-			Workspace string            `json:"workspace"`
-			Env       map[string]string `json:"env"`
-			CPUs      int               `json:"cpus"`
-			Memory    string            `json:"memory"`
-			Timeout   string            `json:"timeout"`
-			Task      string            `json:"task"`
-		}
+		var a mcpRunArgs
 		if err := strictDecode(raw, &a); err != nil {
 			return "", true, err
 		}
-		if a.Workspace != "" && !strings.HasPrefix(a.Workspace, "/") {
-			return "", true, &api.ErrorDetail{Code: api.CodeBadRequest, Message: "workspace must be an absolute path"}
-		}
-		req, err := config.Request(s.base, config.Flags{Image: a.Image, Name: a.Name, Allow: a.Allow, Workspace: a.Workspace,
-			Env: a.Env, CPUs: a.CPUs, Memory: a.Memory, Timeout: a.Timeout, Task: a.Task, Agent: "mcp"}, config.Resolver{})
+		req, err := s.runRequest(a)
 		if err != nil {
 			return "", true, err
 		}
@@ -319,7 +428,7 @@ func (s *mcpServer) call(ctx context.Context, name string, raw json.RawMessage) 
 			printErr(&b, err)
 			return strings.TrimSpace(b.String()), true, nil
 		}
-		code := execExitCode(st.Code, st.Signal, st.TimedOut, nil, &cliEnv{stderr: io.Discard})
+		code := execExitCode(st, nil, &cliEnv{stderr: io.Discard})
 		fmt.Fprintf(&b, "exit code %d", code)
 		if st.TimedOut {
 			b.WriteString(" (timed out)")
@@ -344,7 +453,7 @@ func (s *mcpServer) call(ctx context.Context, name string, raw json.RawMessage) 
 		}
 		cw := &capWriter{n: mcpMaxDiff}
 		cw.Write(patch)
-		return fmt.Sprintf("%d files changed\n%s", len(sum.Files), cw), false, nil
+		return fmt.Sprintf("%s changed\n%s", plural(len(sum.Files), "file"), cw), false, nil
 	case "tkbox_stop":
 		var a struct {
 			Box  string `json:"box"`
