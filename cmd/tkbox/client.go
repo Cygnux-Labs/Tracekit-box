@@ -160,6 +160,9 @@ func (c *client) exec(ctx context.Context, box string, req api.ExecRequest, eio 
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
+	if req.StdinData != nil {
+		eio.Stdin = nil // the whole stdin is in the request (and in the decision); nothing is streamed
+	}
 	req.Stdin = eio.Stdin != nil
 	body, _ := json.Marshal(req)
 	hreq, _ := http.NewRequest("POST", "http://tkbox"+boxPath(box, "/exec"), bytes.NewReader(body))

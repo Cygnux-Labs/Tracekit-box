@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -113,8 +114,16 @@ func writeErr(w http.ResponseWriter, err error) {
 	writeJSON(w, httpStatus(e.Code), api.ErrorBody{Error: *e})
 }
 
-func readJSON(r *http.Request, v any) error {
-	dec := json.NewDecoder(io.LimitReader(r.Body, maxBody))
+// maxExecBody caps an exec request: maxBody for the command, plus room for api.MaxStdinData of stdin_data in base64.
+var maxExecBody = int64(maxBody + base64.StdEncoding.EncodedLen(api.MaxStdinData))
+
+var errExecTooLarge = errf(api.CodeLimit, "put long commands in a script in /workspace and run that; stream input over 1 MiB (`tkbox exec -i`) or write it to a file",
+	"the exec request is too large: the command is too long to record (over 1 MiB) or stdin_data is over 1 MiB")
+
+func readJSON(r *http.Request, v any) error { return readJSONLimit(r, v, maxBody) }
+
+func readJSONLimit(r *http.Request, v any, limit int64) error {
+	dec := json.NewDecoder(io.LimitReader(r.Body, limit))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		return errf(api.CodeBadRequest, "send the JSON body internal/api documents for this route", "request body: %v", err)
@@ -279,9 +288,9 @@ func (d *Daemon) hExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req api.ExecRequest
-	if err := readJSON(r, &req); err != nil {
-		if strings.Contains(err.Error(), "http: request body too large") || r.ContentLength > maxBody {
-			writeErr(w, errTooLong)
+	if err := readJSONLimit(r, &req, maxExecBody); err != nil {
+		if strings.Contains(err.Error(), "http: request body too large") || r.ContentLength > maxExecBody {
+			writeErr(w, errExecTooLarge)
 			return
 		}
 		writeErr(w, err)

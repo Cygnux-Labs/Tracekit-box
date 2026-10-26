@@ -3,6 +3,7 @@ request, and the exec stream (Upgrade: tkbox-exec/1, then frames)."""
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import socket as _socket
@@ -18,6 +19,7 @@ __all__ = ["Client", "ExecResult", "Diff", "Secret", "Limits", "default_socket"]
 
 VERSION = "0.1.0"
 EXEC_UPGRADE = "tkbox-exec/1"
+MAX_STDIN_DATA = 1 << 20  # api.MaxStdinData: stdin known up front, sent in the exec request and decided with it
 DIFF_SUMMARY_HEADER = "x-tkbox-diff-summary"
 
 StdinLike = Union[bytes, bytearray, str, BinaryIO, None]
@@ -501,8 +503,11 @@ class Client:
     ) -> ExecResult:
         """Run argv in the box and wait for it. The signer decides the command before it starts.
 
-        stdin: bytes, str or a binary file object sent to the process (else its stdin is /dev/null); the daemon holds
-        up to 4 MiB the process has not read yet, and past that closes its stdin and drops the rest, with a notice.
+        stdin: bytes, str or a binary file object sent to the process (else its stdin is /dev/null). bytes or str of
+        at most 1 MiB go in the request (stdin_data): the signer decides them with the command (their sha256 and size,
+        and the text itself when it is UTF-8 of at most 4 KiB). Larger input and file objects are streamed: the daemon
+        holds up to 4 MiB the process has not read yet (past that the process is stopped, stdin_truncated), and the
+        sha256 of what the process was given is recorded with the outcome instead.
         env: per-command env; it may not set LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT, BASH_ENV, ENV, PROMPT_COMMAND,
         PATH, NODE_OPTIONS, PYTHONPATH, PERL5OPT, RUBYOPT, JAVA_TOOL_OPTIONS, GCONV_PATH, GIT_CONFIG or any GIT_CONFIG_*
         name (BadRequest). timeout: seconds or a Go duration string, 1s to 24h (default: the box's exec timeout).
@@ -523,7 +528,14 @@ class Client:
             req["cwd"] = cwd
         if timeout is not None:
             req["timeout"] = _duration(timeout)
-        if stdin is not None:
+        if isinstance(stdin, str):
+            stdin = stdin.encode("utf-8")
+        if isinstance(stdin, (bytes, bytearray)) and len(stdin) <= MAX_STDIN_DATA:
+            # known up front: sent in the request, so the signer decides it with the command (stdin_sha256, and
+            # stdin_text when short), and exactly that is the process's stdin
+            req["stdin_data"] = base64.b64encode(bytes(stdin)).decode("ascii")
+            stdin = None
+        elif stdin is not None:
             req["stdin"] = True
 
         resp = self._send("POST", self._box_path(box, "/exec"), req, upgrade=True, timeout=None)

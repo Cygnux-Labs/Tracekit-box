@@ -1,9 +1,13 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
+	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -12,6 +16,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/agentrpc"
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
@@ -412,6 +417,98 @@ func TestReview1StopClosesEgressFirst(t *testing.T) {
 	}
 	if v := b.view(); v.State != api.StateStopped || !v.DiffSaved {
 		t.Fatalf("box after the stop: %+v", v)
+	}
+}
+
+// catGuest's execs copy their stdin to stdout.
+func catGuest(ctx context.Context, req proto.ExecRequest, xio agentrpc.ExecIO) (proto.ExitStatus, error) {
+	if xio.Stdin != nil {
+		io.Copy(xio.Stdout, xio.Stdin)
+	}
+	return proto.ExitStatus{}, nil
+}
+
+func sha(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }
+
+// lastBash is the args of the last Bash decision and the result of the last exec complete in run 0.
+func lastBash(e *testEnv) (args map[string]any, result map[string]any) {
+	for _, r := range e.run(0).Records {
+		if r.Call.Tool != tracekit.ToolBash {
+			continue
+		}
+		switch r.Method {
+		case "decide":
+			args = r.Call.Args
+		case "complete":
+			result, _ = r.Value.(map[string]any)
+		}
+	}
+	return args, result
+}
+
+// M4: stdin known up front (stdin_data) is decided with the command (its sha256 and size, and its text when short
+// UTF-8, secrets redacted) and is exactly what the process reads; streamed stdin's digest is recorded in the complete.
+func TestReview1StdinInTheDecision(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.guest.ExecFunc = catGuest
+	e.create(api.CreateBoxRequest{Name: "in", Secrets: map[string]api.SecretSpec{"TOK": {Value: "s3cret-value-1234", Hosts: []string{"api.example.com"}}}})
+	var ph string
+	for _, s := range e.box("in").secrets {
+		ph = s.Placeholder
+	}
+	sock := e.serve()
+
+	script := []byte("import os\nprint(os.environ['TOK'] == '" + ph + "')\n")
+	_, frames := execStream(t, sock, "in", api.ExecRequest{Argv: []string{"python3"}, StdinData: script}, nil)
+	if frames[len(frames)-1].Type != proto.TypeExit || stdoutOf(frames) != string(script) {
+		t.Fatalf("stdin_data exec: stdout %q, last %s", stdoutOf(frames), frames[len(frames)-1].Payload)
+	}
+	args, _ := lastBash(e)
+	if args["stdin"] != true || args["stdin_sha256"] != sha(script) || args["stdin_bytes"] != len(script) ||
+		args["stdin_text"] != "import os\nprint(os.environ['TOK'] == 'tkbox_TOK_…')\n" {
+		t.Fatalf("decided args %v", args)
+	}
+	if g := e.guest.Execs[len(e.guest.Execs)-1]; !g.Stdin {
+		t.Fatalf("guest exec %+v", g)
+	}
+
+	// long or binary stdin: only its digest is in the decision
+	for _, data := range [][]byte{bytes.Repeat([]byte("a"), api.MaxStdinText+1), {0xff, 0xfe, 'x'}} {
+		_, frames = execStream(t, sock, "in", api.ExecRequest{Argv: []string{"python3"}, StdinData: data}, nil)
+		args, _ = lastBash(e)
+		if stdoutOf(frames) != string(data) || args["stdin_sha256"] != sha(data) || args["stdin_bytes"] != len(data) {
+			t.Fatalf("stdin_data of %d bytes: args %v", len(data), args)
+		}
+		if _, ok := args["stdin_text"]; ok {
+			t.Fatalf("stdin_text for %d bytes (utf-8 %v)", len(data), utf8.Valid(data))
+		}
+	}
+
+	// past the cap, and with both kinds of stdin: refused before anything is decided
+	n := len(e.run(0).Records)
+	resp, _ := execStream(t, sock, "in", api.ExecRequest{Argv: []string{"python3"}, StdinData: make([]byte, api.MaxStdinData+1)}, nil)
+	var body api.ErrorBody
+	json.NewDecoder(resp.Body).Decode(&body)
+	if resp.StatusCode != http.StatusUnprocessableEntity || body.Error.Code != api.CodeLimit || !strings.Contains(body.Error.Message, "stdin_data") || body.Error.Hint == "" {
+		t.Fatalf("stdin_data over the cap: %d %+v", resp.StatusCode, body)
+	}
+	resp, _ = execStream(t, sock, "in", api.ExecRequest{Argv: []string{"cat"}, Stdin: true, StdinData: []byte("x")}, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("stdin and stdin_data: %d", resp.StatusCode)
+	}
+	if len(e.run(0).Records) != n {
+		t.Fatal("a refused exec request was decided")
+	}
+
+	// streamed stdin: the digest of what the process was given goes into the complete
+	streamed := []byte("streamed input\n")
+	_, frames = execStream(t, sock, "in", api.ExecRequest{Argv: []string{"cat"}, Stdin: true}, streamed)
+	args, result := lastBash(e)
+	if stdoutOf(frames) != string(streamed) || args["stdin"] != true || args["stdin_sha256"] != nil {
+		t.Fatalf("streamed: stdout %q args %v", stdoutOf(frames), args)
+	}
+	if result["stdin_sha256"] != sha(streamed) || result["stdin_bytes"] != int64(len(streamed)) {
+		t.Fatalf("streamed complete %v", result)
 	}
 }
 

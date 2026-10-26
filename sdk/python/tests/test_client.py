@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import os
@@ -143,7 +144,26 @@ def test_exec_stdin(client, box, daemon, stdin):
     if isinstance(expected, str):
         expected = expected.encode()
     assert r.stdout == expected
-    assert daemon.exec_requests[-1]["stdin"] is True
+    sent = daemon.exec_requests[-1]
+    if isinstance(stdin, io.BytesIO):
+        assert sent["stdin"] is True and "stdin_data" not in sent
+    else:  # known up front: in the request, so the signer decides it with the command
+        assert base64.b64decode(sent["stdin_data"]) == expected and "stdin" not in sent
+
+
+def test_exec_stdin_data_is_decided(client, box, daemon):
+    script = b"import os\nos.system('id')\n"
+    r = client.exec("demo", ["cat"], stdin=script)
+    assert r.stdout == script
+    sent = daemon.exec_requests[-1]
+    assert sent == {"argv": ["cat"], "stdin_data": base64.b64encode(script).decode()}
+    # up to 1 MiB goes in the request; larger input is streamed
+    at_cap = b"z" * (1 << 20)
+    assert client.exec("demo", ["cat"], stdin=at_cap).stdout == at_cap
+    assert "stdin_data" in daemon.exec_requests[-1]
+    over = at_cap + b"!"
+    assert client.exec("demo", ["cat"], stdin=over).stdout == over
+    assert daemon.exec_requests[-1]["stdin"] is True and "stdin_data" not in daemon.exec_requests[-1]
 
 
 def test_exec_stdin_larger_than_a_frame(client, box):

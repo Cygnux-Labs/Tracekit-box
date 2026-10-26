@@ -18,6 +18,7 @@ Exec behaviour is scripted by argv[0]:
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
@@ -401,7 +402,11 @@ class FakeDaemon:
             send(_frame(T_STDOUT, (" ".join(argv[1:]) + "\n").encode()))
             return send(_jframe(T_EXIT, {"code": 0, "duration_ms": 3}))
         if cmd == "cat":
-            data = read_stdin() if req.get("stdin") else b""
+            if "stdin_data" in req:
+                assert not req.get("stdin"), "stdin_data and a streamed stdin"
+                data = base64.b64decode(req["stdin_data"], validate=True)
+            else:
+                data = read_stdin() if req.get("stdin") else b""
             for i in range(0, len(data), MAX_FRAME):
                 send(_frame(T_STDOUT, data[i : i + MAX_FRAME]))
             return send(_jframe(T_EXIT, {"code": 0}))

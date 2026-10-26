@@ -194,8 +194,19 @@ type ExecRequest struct {
 	Env     map[string]string `json:"env,omitempty"`
 	Cwd     string            `json:"cwd,omitempty"`
 	Timeout Duration          `json:"timeout,omitempty"` // 0: the box's exec timeout
-	Stdin   bool              `json:"stdin,omitempty"`
+	// Stdin streams stdin over the exec connection (TypeStdin frames); the complete records its sha256 and size.
+	Stdin bool `json:"stdin,omitempty"`
+	// StdinData is the whole stdin when it is known before the command starts (base64 in JSON, at most MaxStdinData):
+	// the signer decides it with the command (stdin_sha256 and stdin_bytes, and stdin_text when it is UTF-8 of at most
+	// MaxStdinText bytes), then it is the process's stdin. Use StdinData or Stdin, not both.
+	StdinData []byte `json:"stdin_data,omitempty"`
 }
+
+// MaxStdinData caps ExecRequest.StdinData; stream larger input (ExecRequest.Stdin) or put it in a file.
+const MaxStdinData = 1 << 20
+
+// MaxStdinText is the largest StdinData whose text goes into the decision as stdin_text (when it is valid UTF-8).
+const MaxStdinText = 4 << 10
 
 // Exec states sent as TypeJSON ExecEvent frames.
 const (
