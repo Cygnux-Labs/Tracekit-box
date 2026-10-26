@@ -220,6 +220,13 @@ func TestBlockPrefixSpanningMappedRange(t *testing.T) {
 			t.Errorf("refused(%s) = %v %q with BlockPrefixes ::/23, want %q", s, bad, why, operatorBlocked)
 		}
 	}
+	// ::/0 is every IPv6 address, so every IPv4 one too
+	p.blockPrefixes, _ = normPrefixes("", []netip.Prefix{netip.MustParsePrefix("::/0")})
+	for _, s := range []string{"8.8.8.8", "1.1.1.1", "::ffff:1.1.1.1", "2606:4700::1111"} {
+		if bad, why := p.refused(netip.MustParseAddr(s)); !bad || why != operatorBlocked {
+			t.Errorf("refused(%s) = %v %q with BlockPrefixes ::/0, want %q", s, bad, why, operatorBlocked)
+		}
+	}
 	p.blockPrefixes, _ = normPrefixes("", []netip.Prefix{netip.MustParsePrefix("2001:db8::/32")})
 	for _, s := range []string{"::ffff:8.8.8.8", "8.8.8.8", "2606:4700::1111"} {
 		if bad, why := p.refused(netip.MustParseAddr(s)); bad {
