@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
 	"github.com/Cygnux-Labs/tracekit-box/internal/egress"
@@ -223,6 +224,54 @@ func TestReview1RecordedDaemonRefusesUnrecordedPatch(t *testing.T) {
 	}
 	if _, err := e.d.Apply(context.Background(), "u", api.ApplyRequest{}); err != nil {
 		t.Fatalf("the unrecorded daemon itself: %v", err)
+	}
+}
+
+// L14: an approval that could not be recorded in Tracekit allows nothing: the waiting connection is refused, the
+// approver is told, and "approve for the rest of the box" opens nothing for later connections.
+func TestReview1UnrecordedApprovalAllowsNothing(t *testing.T) {
+	e := newTestEnv(t, func(o *Options) { o.ApprovalTimeout = time.Minute })
+	fc := &flakyClient{Client: e.tk, failObserve: map[string]bool{tracekit.SourceApproval: true}}
+	e.d.opts.Tracekit = fc
+	e.create(api.CreateBoxRequest{Name: "ap"})
+	dec := e.proxy(0).cfg.Decider
+	req := egress.Request{Host: "x.example", Port: 443, URL: "https://x.example:443"}
+	got := make(chan egress.Verdict, 1)
+	go func() {
+		v, _ := dec.Decide(context.Background(), req)
+		got <- v
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(e.d.Approvals()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	pend := e.d.Approvals()
+	if len(pend) != 1 {
+		t.Fatalf("approvals %+v", pend)
+	}
+	_, err := e.d.DecideApproval(pend[0].ID, api.ApprovalDecision{Decision: "approve", Scope: "box"}, 1000)
+	if errCode(err) != api.CodeUnavailable || !strings.Contains(err.Error(), "allows nothing") {
+		t.Fatalf("approving an approval that can't be recorded: %v", err)
+	}
+	select {
+	case v := <-got:
+		if v.Allow || !strings.Contains(v.Reason, "could not be recorded") {
+			t.Fatalf("the waiting connection: %+v", v)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the waiting connection got no answer")
+	}
+	b := e.box("ap")
+	b.mu.Lock()
+	open := b.approvedHosts["x.example:443"]
+	b.mu.Unlock()
+	if open {
+		t.Fatal("an unrecorded box-scope approval opened the host for the rest of the box")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if v, _ := dec.Decide(ctx, req); v.Allow {
+		t.Fatalf("a later connection was let through on the unrecorded approval: %+v", v)
 	}
 }
 
