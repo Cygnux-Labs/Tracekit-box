@@ -51,7 +51,7 @@ tkbox daemon [--state-dir DIR] [--signer SOCKET] [--unrecorded] [--max-boxes N] 
 | `--unrecorded` | off | Run boxes without a signer. Nothing is recorded or decided by a signer and boxes cannot be exported; the allowlist and Box approvals still apply. Box warns at start and on every box. For debugging Box only |
 | `--max-boxes` | 8 | Boxes alive at once (1 to 1024). Stopped boxes do not count |
 | `--approval-timeout` | `2m` | How long a connection to a host off the allowlist waits for `tkbox approve` (1s to 4m) |
-| `--egress-block` | none | Repeatable. A range boxes never connect to, on top of the built-in private and metadata ranges and this host's own interface addresses. On a cloud VM (EC2, GCE, Azure, GitHub-hosted runners) the host's public IP is NAT'd and on no interface, so Box can't see it: pass it here (`--egress-block 203.0.113.7/32`), or a box allowed to reach that IP could reach services the host listens on |
+| `--egress-block` | none | Repeatable or comma-separated. A range (`203.0.113.0/24`) or a bare address (`203.0.113.7`, taken as a single address) that boxes never connect to, on top of the built-in private and metadata ranges and this host's own interface addresses; a connection there is refused with `it resolves to an address of this host or one the operator blocked, which Box never connects to`. On a cloud VM (EC2, GCE, Azure, GitHub-hosted runners) the host's public IP is NAT'd and on no interface, so Box can't see it and does not block it unless you pass it here (`--egress-block 203.0.113.7`); otherwise a box allowed to reach that IP could reach services the host listens on. A bad value exits 2: `--egress-block "x": want a CIDR like 203.0.113.7/32 or an address` |
 | `--tracekit-bin` | `tracekit` on `PATH` | The `tracekit` CLI that `tkbox export` runs |
 | `--firecracker` | the pinned Firecracker v1.17.0, downloaded and checked by SHA-256 | A local `firecracker` binary instead |
 | `--kernel` | the pinned guest kernel 6.1.155, downloaded and checked by SHA-256 | A local `vmlinux` instead |
@@ -139,20 +139,31 @@ as is, with no shell: use `sh -c '…'` for pipes and variables. `--` is needed 
 
 The signer decides the command before it starts, as a `Bash` decision with the arguments `{command, cwd, env, stdin}`:
 the shell-quoted command line, the working directory, this exec's `--env` (a secret's placeholder shown as
-`tkbox_NAME_…`, a secret's real value pasted into a value shown as `[secret NAME]`) and whether stdin was given. A
-first word that contains `=` or is a shell reserved word (`if`, `then`, `for`, `do`, …) is recorded quoted
-(`'X=1' echo hi`), so the signer's shell parser sees the program that runs, not an assignment or a keyword. Stdin
-given up front (MCP's `tkbox_exec`, the SDK given bytes) is in the decision as `stdin_sha256`, with the text itself
-when it is at most 4 KiB; streamed stdin (`-i`) can't be known before the start, so its sha256 and byte count are in the
-exec's completion record. The box's own `--env` is not repeated per exec; it is recorded once, when the box is created.
-Commands that the command itself starts inside the box are not decided one by one. Box prints approvals to give, egress refusals and other
-notices on stderr as `tkbox: …` lines.
+`tkbox_NAME_…`; a value that holds a secret's real value is refused, `env TOKEN holds the value of secret GH`) and
+`stdin`, true when the exec has stdin of either kind below. A first word that contains `=` or is a shell reserved word
+(`if`, `then`, `for`, `do`, …) is recorded quoted (`'X=1' echo hi`), so the signer's shell parser sees the program
+that runs, not an assignment or a keyword.
+
+Stdin comes in one of two kinds:
+
+- **Known before the start.** The API's `stdin_data` (at most 1 MiB, base64 in the JSON request) is decided with the
+  command as `stdin_sha256` and `stdin_bytes`, plus `stdin_text` when it is UTF-8 of at most 4 KiB (a secret's
+  placeholder shown as `tkbox_NAME_…`, its value as `[secret NAME]`), and exactly that data is the process's stdin.
+  MCP's `tkbox_exec` sends its `stdin` this way, and so does the SDK for bytes or str of at most 1 MiB.
+- **Streamed** (`-i`; in the SDK, larger input and file objects). It can't be known before the start, so the exec's
+  completion record has its `stdin_sha256` and `stdin_bytes`: what the process was given.
+
+`stdin_data` over 1 MiB is refused (`stdin_data is 1100000 bytes, over the 1 MiB limit`, or for a body too large to
+read, `the exec request is too large: the command is too long to record (over 1 MiB) or stdin_data is over 1 MiB`), and
+so is a request with both kinds at once (`stdin and stdin_data are both set`). The box's own `--env` is not repeated
+per exec; it is recorded once, when the box is created. Commands that the command itself starts inside the box are not
+decided one by one. Box prints approvals to give, egress refusals and other notices on stderr as `tkbox: …` lines.
 
 | Flag | Meaning |
 |---|---|
 | `-i` | Send this terminal's stdin to the command (there is no TTY). The daemon holds up to 4 MiB the process has not read yet (the guest 1 MiB more, while the process keeps reading). A process that does not take its stdin fast enough is never handed a false end of input: it is killed, and `tkbox exec` prints `tkbox: stdin was not consumed fast enough (N bytes dropped); the command was stopped: write large input to a file in /workspace and read it from there` and exits 125 |
 | `--timeout` | This exec's time limit, 1s to 24h (default: the box's exec timeout, 30m) |
-| `--env` | Repeatable `K=V` for this exec only. Variables that change what runs without showing in the decided command are refused (`env LD_PRELOAD can't be set per command`): `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `BASH_ENV`, `ENV`, `PROMPT_COMMAND`, `PATH`, `NODE_OPTIONS`, `PYTHONPATH`, `PERL5OPT`, `RUBYOPT`, `JAVA_TOOL_OPTIONS`, `GCONV_PATH` and `GIT_CONFIG_*`, as are the proxy and CA variables Box sets |
+| `--env` | Repeatable `K=V` for this exec only. Variables that change what runs without showing in the decided command are refused (`env LD_PRELOAD can't be set per command`): `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `BASH_ENV`, `ENV`, `PROMPT_COMMAND`, `PATH`, `NODE_OPTIONS`, `PYTHONPATH`, `PERL5OPT`, `RUBYOPT`, `JAVA_TOOL_OPTIONS`, `GCONV_PATH`, `GIT_CONFIG` and any `GIT_CONFIG_*` name, as are the proxy and CA variables Box sets. A value that holds a secret's real value is refused too (`env TOKEN holds the value of secret GH`): use the secret's placeholder |
 | `--cwd` | The working directory in the box (default `/workspace`) |
 
 SIGINT, SIGTERM, SIGHUP and SIGQUIT are passed to the command in the box at once, whatever the command does with its
@@ -200,8 +211,10 @@ shuts the VM down cleanly (the guest syncs and unmounts) and keeps the box's sta
 saved; when it was not, it prints the reason and `tkbox: WARNING: nothing can be applied from this box`. The Tracekit run stays open, so `tkbox apply` can still record its file decisions;
 `tkbox export` closes it. `--kill` kills the VM at once: no patch is saved, so there is nothing to apply. Stopping a
 stopped box prints its state again. A box's egress closes the moment any stop starts (`tkbox stop`, the box timeout,
-a fail-closed stop, containment): open connections are closed and new ones are refused, so no secret is swapped in
-while the commands end and the patch is saved (the patch comes over the guest channel, not the network).
+a fail-closed stop, the events log's hard cap, containment): the egress proxy with its open connections and sessions
+and the vsock egress listener are closed, and every egress decision from then on is refused (`the box is going down,
+so nothing more leaves it`), so no secret is swapped in while the commands end and the patch is saved (the patch comes
+over the guest channel, not the network).
 
 ## tkbox rm
 
@@ -223,11 +236,13 @@ tkbox diff <box> [--stat]
 Prints a git-format patch of what changed under `/workspace` (added, modified, deleted, mode changes, symlinks, binary
 files) and `tkbox: N files changed` on stderr. `--stat` lists the changed files only, one `status path` line each. On a
 running box the guest computes it from the workspace overlay, so the image needs no git; on a stopped box it is the
-patch saved at stop. The file list is built on the host from the patch itself, not taken from the guest, and clients
-(`--stat`, the SDK, MCP) read it as JSON from `GET /v1/boxes/{box}/diff/summary`, so a patch with very many or very
-long paths still reviews. Paths that the
-workspace's `.gitignore` ignores and generated directories (`node_modules`, `__pycache__`, `.venv`, `venv`, `.tox`,
-`.mypy_cache`, `.pytest_cache`, `.gradle`, `.next`, `.cache`, at any depth) are left out.
+patch saved at stop. The file list is built on the host from the patch itself, not taken from the guest, and is
+served as JSON at `GET /v1/boxes/{box}/diff/summary`, which `--stat` reads. The diff response carries it in the
+`X-Tkbox-Diff-Summary` header only when that JSON is at most 8 KiB; otherwise it sends
+`X-Tkbox-Diff-Summary-Omitted: 1`, and clients (`tkbox diff`, the SDK's `diff()`, MCP's `tkbox_diff`) fetch the
+endpoint, so a patch with very many or very long paths still reviews. Paths that the workspace's `.gitignore` ignores
+and generated directories (`node_modules`, `__pycache__`, `.venv`, `venv`, `.tox`, `.mypy_cache`, `.pytest_cache`,
+`.gradle`, `.next`, `.cache`, at any depth) are left out.
 
 When stdout is a terminal, control characters (escape sequences, carriage returns, C1 controls) and Unicode bidi
 overrides in the patch are printed as escapes (`\x1b`, `‮`), so a patch cannot redraw what you review. Redirected
@@ -244,20 +259,28 @@ Applies a stopped box's saved patch to the host checkout (default: the box's `--
 stopped box, from the patch saved at stop, while the box's Tracekit run is open: after `tkbox stop` and before
 `tkbox export` or `tkbox rm`, and not on a box from before a daemon restart. On a running box it is refused (`box demo
 is running`, hint ``stop the box first so the patch can't change under you: `tkbox stop demo` ``). A daemon that has a
-signer refuses the patch of a box that ran `--unrecorded`: its files would be written with no `Write` decisions; review
-the saved patch and apply it by hand.
+signer refuses the patch of a box that ran `--unrecorded`, since its files would be written with no `Write` decisions:
+`box demo ran unrecorded, so this recording daemon can't decide or record its writes; apply the saved patch by hand
+after review: <state dir>/boxes/<id>/diff.patch`.
+
+`git apply` never runs on the checkout. Box checks the patch, has the signer decide every file, and then writes the
+files itself:
 
 - Every path is validated (relative, no `..`, no `.git` in any case or spelling a file system reads as `.git`, inside
   `DIR`, no writes through symlinks). Copy and rename sections are refused, and so is a section whose old and new names
-  differ without a rename header (`git apply` would delete the old file). Every path `git apply` touches, old and new,
+  differ without a rename header (`git apply` would delete the old file). Every path the patch touches, old and new,
   is decided.
+- The patch is parsed strictly: anything git could read as a header outside a git file section is refused, and a
+  `GIT binary patch` section is read exactly as git reads it: a `literal N` or `delta N` line, base85 lines whose
+  length character matches their length, a terminating empty line, and at most one more (reverse) hunk. Anything else
+  in it refuses the patch.
 - Changes to files the checkout's `.gitignore` ignores are refused (ignored files never reach the box). New files the
   checkout ignores are left out of the apply and listed: `tkbox: left out 2 new files the checkout ignores
   (.gitignore): …`. When the box's workspace was a git work tree and `DIR` is not one (or git fails there), the apply
   is refused: what `DIR` ignores can't be checked.
-- Writes inside the checkout's git dir or hooks dir are refused. The hooks dir is the one git itself would use
-  (`git rev-parse --git-path hooks` with the repo's, global and system config, running no other program), compared
-  without regard to case.
+- Writes inside the checkout's git dir or hooks dir are refused. The hooks dir is the one git itself would use:
+  `core.hooksPath` as the repo's, global and system config set it, passed to `git rev-parse --git-path hooks`. It is
+  compared without regard to case and by file identity.
 - Changes to `.gitignore`, `.gitattributes`, `.gitmodules`, `tkbox.yaml`, `tkbox.yml`, `.envrc`,
   `.pre-commit-config.yaml`, `.gitlab-ci.yml`, `.yarnrc.yml` and `lefthook.yml` (in any directory), to
   `.vscode/tasks.json` and `.cargo/config.toml`, to anything under `.husky/`, `.github/workflows/`, `.github/actions/`,
@@ -265,17 +288,40 @@ the saved patch and apply it by hand.
   files a workspace never copies into a box, see [limits.md](limits.md#behaviour)) steer the next run or host
   automation. They are refused unless you pass `--allow-sensitive`, and listed after a successful apply.
 - Two applies of the same box run one after the other.
+- Git must read the patch as Box does. On the filtered patch (without the left-out new files), with an empty git dir
+  and an empty work tree, `git apply --numstat -z` and `git apply --summary -z` must report the same paths in the same
+  order, the same binary flags and the same creations, deletions and modes as Box's parser. Any difference, or anything
+  git writes on stderr, refuses the patch: `git reads the patch differently than tkbox does, so it is refused: …`.
+- The result is built in a scratch copy of the files the patch touches, outside the checkout, by `git apply --binary`
+  with a fresh, empty bare git dir and with `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` and
+  `GIT_ATTR_NOSYSTEM=1` (no filter drivers, hooks or LFS). A patch that does not apply there is refused: `the patch
+  does not apply to <dir>: …`.
 - The signer decides every file as a `Write` with the arguments `{file_path, sha256, mode, symlink, deleted,
   patch_sha256}` (plus `sensitive: true` for the files above) before anything is written. If the signer denies any
   file, nothing is applied and the denied paths are listed (`tkbox: denied by the signer: <path>`). If the signer holds
   a file for approval, `tkbox apply` prints the approval to give.
-- `git apply --binary` runs with a fresh, empty bare git dir and with `GIT_CONFIG_GLOBAL=/dev/null`,
-  `GIT_CONFIG_NOSYSTEM=1` and `GIT_ATTR_NOSYSTEM=1`, so neither the checkout's `.git/config` nor the host's global or
-  system git config or attributes are read: no filter drivers, hooks or LFS run.
-  Once every file is decided it runs to the end (at most 2 minutes) even if the client goes away. If it fails after
-  writing some files, they are named (`git apply failed after writing 1 file: a.txt: …`).
+- Before anything is written, each path in the scratch copy is checked again against what the signer decided
+  (sha256, mode, symlink, deleted), and the checkout must be unchanged since the decisions; otherwise nothing is
+  written (`the patched 2 files differ from what was decided: …`, `the checkout changed while the patch was
+  decided: …`).
+- Only then does Box write the files, deletions first: each file goes to a temp file in its own directory (opened
+  `O_EXCL|O_NOFOLLOW`), gets its mode and is renamed over the target; a symlink is made under a temp name and renamed;
+  every parent is checked with lstat just before the write and may not be a symlink; a deletion removes only a file or
+  a symlink. Once every file is decided this runs to the end even if the client goes away. A failure names exactly
+  which paths were written: `writing the patched files failed after writing 1 file: a.txt: …`.
 - Afterwards every written file is checked against what the signer decided; a file that differs is reported
   (`applied, but … differ from what was decided: …`).
+
+The git commands apply runs in the real checkout (`rev-parse`, `check-ignore`), like the work-tree check when a box
+is created, run so that no program the checkout's config names can run:
+
+- every `GIT_*` variable of the daemon's environment removed, and `GIT_PAGER=cat`, `PAGER=cat`,
+  `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` and `GIT_ATTR_NOSYSTEM=1` set;
+- `--no-pager` and
+  `-c core.fsmonitor=false -c core.pager=cat -c diff.external= -c core.untrackedCache=false`, plus
+  `-c core.hooksPath=/dev/null` where hooks don't matter;
+- the two settings they need from outside the checkout, `core.excludesFile` and `core.hooksPath`, read first with
+  `git config --type=path --get` and passed back with `-c`.
 
 `--check` validates and decides only, and writes nothing. `tkbox apply` prints the paths written on stdout and
 `tkbox: applied N files` on stderr (with `--check`, `tkbox: would apply (check only, nothing written) N files`).
@@ -358,15 +404,22 @@ not inside a box. It talks to the daemon at `--socket` like every other command.
 
 | Tool | What it does |
 |---|---|
-| `tkbox_run` | Create a box and return its id |
-| `tkbox_exec` | Run a command in a box this session created (decided by the signer first) and return its exit code and output (64 KiB of each stream) |
+| `tkbox_run` | Create a box and return its id (it takes no `name` and no `task`) |
+| `tkbox_exec` | Run a command in a box this session created (decided by the signer first) and return its exit code and output (64 KiB of each stream). Its `stdin` is sent as `stdin_data`, so the signer decides it with the command (at most 1 MiB; see [tkbox exec](#tkbox-exec)) |
 | `tkbox_diff` | Show the workspace changes of a box this session created, as a git patch (up to 256 KiB) |
 | `tkbox_stop` | Stop a box this session created (its patch is saved first unless `kill` is set) |
 | `tkbox_ls` | List the boxes this session created |
 
 `tkbox_exec`, `tkbox_diff`, `tkbox_stop` and `tkbox_ls` reach only the boxes this `tkbox mcp` process created with
-`tkbox_run`, by id or name; every other box on the daemon (another job's, one a person started) is refused and not
-listed, so an MCP client can't use another box's allowlist, secrets or workspace, or kill it.
+`tkbox_run`: a `box` argument (id or name) is resolved through those boxes to the owned box's id, and every other box
+on the daemon (another job's, one a person started, a later box that reused a name) is refused (`box demo was not
+created by this tkbox mcp session: it may only use the boxes its tkbox_run created`) and not listed, so an MCP client
+can't use another box's allowlist, secrets or workspace, or kill it. A second key that spells `box` in another case
+(`"BOX"`) is refused (`argument "BOX": use "box"`), so it can't decide which box is used.
+
+When the session ends (the client closes `tkbox mcp`'s stdin), `tkbox mcp` stops every box the session created, since
+no later session can reach them: their patches are saved and their Tracekit runs stay open, so the operator can still
+`tkbox apply` and `tkbox export` them.
 
 `--config FILE` is the operator's [tkbox.yaml](config.md): every `tkbox_run` starts from its image, allowlist, secrets,
 env and limits. A `tkbox_run` call can only narrow those settings:
@@ -381,8 +434,10 @@ env and limits. A `tkbox_run` call can only narrow those settings:
   at the daemon's default (2 cpus, 2GiB, 1h), never the maximum.
 - `tkbox_exec`'s `timeout`: at most the config's `exec_timeout` (default 30m).
 - `env`: refused. The box gets the config's `env` and `secrets`; a call can add to neither.
-- `task`: not taken. The box records the config's `task` (the operator's), the only task recorded as trusted; what the
-  orchestrator asks of the agent goes in its commands, which are decided one by one.
+- `task`: refused (`tkbox_run takes no task: …`). The box records the config's `task` (the operator's), the only task
+  recorded as trusted; what the orchestrator asks of the agent goes in its commands, which are decided one by one.
+- `name`: refused (`tkbox_run takes no name: a box created over MCP is named by its id`). The box gets its id as its
+  name, unless the config sets `name`.
 
 A refused call says what it would have widened, with the hint ``an MCP client may only narrow what the operator set up
 in `tkbox mcp` (--config, --image, --workspace-root); ask the operator``. Boxes made over MCP record the agent name

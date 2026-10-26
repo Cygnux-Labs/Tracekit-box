@@ -60,7 +60,8 @@ ignores, left out) and `sha256` (of the patch that was decided).
 | `list_boxes()`, `get_box(box)` | `GET /v1/boxes`, `GET /v1/boxes/{box}` |
 | `exec(box, argv, stdin=None, env=None, cwd=None, timeout=None, *, on_output=None, on_event=None)` | `POST /v1/boxes/{box}/exec`, upgraded to `tkbox-exec/1` |
 | `stop(box, *, kill=False, reason=None)`, `rm(box)` | `POST …/stop`, `DELETE /v1/boxes/{box}` |
-| `diff(box)` | `GET …/diff` → `Diff(patch, summary)` |
+| `diff(box)` | `GET …/diff` → `Diff(patch, summary)`; the summary comes from the `X-Tkbox-Diff-Summary` header when it is at most 8 KiB, else from `GET …/diff/summary` |
+| `diff_summary(box)` | `GET …/diff/summary` → the summary (`files`, `bytes`) without the patch |
 | `apply(box, *, dir=None, check=False, allow_sensitive=False)` | `POST …/apply` |
 | `export(box, out)` | `POST …/export` |
 | `events(box, *, follow=False)` | `GET …/events` (a generator of dicts) |
@@ -71,12 +72,19 @@ Boxes, approvals and results are returned as plain dicts with the field names of
 ([`internal/api/api.go`](../../internal/api/api.go)).
 
 `exec` returns an `ExecResult` (`exit_code`, `stdout`, `stderr`, `signal`, `timed_out`, `notices`, `events`,
-`duration_ms`, `truncated`) whatever the exit code. `exit_code` is the raw status: the process's code, or -1 with
-`signal` set when a signal killed it (`timed_out` too when the exec timeout did); `tkbox exec` maps the same outcomes to
-128+n and 124. `notices` are messages the daemon wants a person to see, such as an egress refusal, an approval to give
-with `tkbox approve <id>`, or stdin cut off: the daemon holds at most 4 MiB of stdin the process has not read yet, then
-closes its stdin and drops the rest. A per-command `env` may not set `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`,
-`BASH_ENV`, `ENV` or `PROMPT_COMMAND`. The exec stream has no client-side timeout: the daemon enforces the exec timeout
+`duration_ms`, `truncated`, `stdin_truncated`, `stdin_dropped_bytes`) whatever the exit code. `exit_code` is the raw
+status: the process's code, or -1 with `signal` set when a signal killed it (`timed_out` too when the exec timeout
+did); `tkbox exec` maps the same outcomes to 128+n and 124. `notices` are messages the daemon wants a person to see,
+such as an egress refusal or an approval to give with `tkbox approve <id>`.
+
+`stdin` as bytes or str of at most 1 MiB is sent in the request (`stdin_data`): the signer decides it with the command
+(its sha256 and size, and the text itself when it is UTF-8 of at most 4 KiB), and exactly that data is the process's
+stdin. Larger input and file objects are streamed, and the sha256 and size of what the process was given are recorded
+with the outcome instead; the daemon holds at most 4 MiB the process has not read yet, and past that stops the process
+rather than hand it a false end of input (`stdin_truncated`, and `ok` is false). A per-command `env` may not set
+`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `BASH_ENV`, `ENV`, `PROMPT_COMMAND`, `PATH`, `NODE_OPTIONS`,
+`PYTHONPATH`, `PERL5OPT`, `RUBYOPT`, `JAVA_TOOL_OPTIONS`, `GCONV_PATH`, `GIT_CONFIG` or any `GIT_CONFIG_*` name, and no
+value may hold a secret's value (`BadRequest`). The exec stream has no client-side timeout: the daemon enforces the exec timeout
 (default 30 minutes, 1s to 24h) and approval waits. Closing the connection (for example on `KeyboardInterrupt`) cancels
 the command if it has not started and stops it if it has.
 
