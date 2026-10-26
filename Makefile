@@ -7,7 +7,7 @@ GOARCH    ?= $(shell $(GO) env GOARCH)
 BIN       := bin
 FUZZTIME  ?= 60s
 
-.PHONY: all build guest host linux test race lint fuzz e2e clean
+.PHONY: all build guest host linux test race lint fuzz runs e2e clean
 
 all: build
 
@@ -56,6 +56,12 @@ fuzz:
 	$(GO) test -run='^$$' -fuzz='^FuzzAddrForms$$' -fuzztime=$(FUZZTIME) ./internal/egress
 	$(GO) test -run='^$$' -fuzz='^FuzzHostText$$' -fuzztime=$(FUZZTIME) ./internal/egress
 	$(GO) test -run='^$$' -fuzz='^FuzzClientHello$$' -fuzztime=$(FUZZTIME) ./internal/egress
+
+# Verified Runs: verify every signed run in runs/ (and recipes/, once it exists) with the Tracekit 1.4.2 CLI and rewrite
+# the table in its README.md from the verified records (see runs/README.md). CI runs it with -check.
+runs:
+	$(GO) run ./cmd/tkbox-runs runs
+	@if [ -d recipes ]; then $(GO) run ./cmd/tkbox-runs recipes; fi
 
 # end-to-end on a Linux host with /dev/kvm, mkfs.ext4 and a running Tracekit 1.4.2 signer (see docs/development.md)
 e2e: build

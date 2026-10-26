@@ -10,3 +10,8 @@ __pycache__/
 /sdk/python/*.egg-info/
 .venv/
 /BRIEF.md
+# the signed runs in runs/ and recipes/ are kept (runs/README.md)
+!/runs/**/run.tkb
+!/runs/**/run.trust.json
+!/recipes/**/run.tkb
+!/recipes/**/run.trust.json

@@ -54,6 +54,11 @@ one target at a time (`make fuzz FUZZTIME=10m` for longer; `make -k fuzz` runs t
 input is saved under that package's `testdata/fuzz/<target>/`, so commit it with the fix. The `fuzz` workflow runs
 `make -k fuzz` nightly and on demand, and uploads any new failing inputs as an artifact.
 
+`make runs` verifies every signed run in [runs/](../runs/README.md) with the Tracekit 1.4.2 CLI
+(`pip install tracekit-ai==1.4.2`) and rewrites the table in its README from the verified records. The `runs` workflow
+checks the same on each pull request that touches `runs/`, and fails on a run that does not verify or a table that is
+out of date.
+
 The SDK tests need only `pytest` (`python3 -m venv .venv && .venv/bin/pip install pytest`); they run on Python 3.9 and
 newer and need no Linux host.
 

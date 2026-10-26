@@ -205,6 +205,9 @@ A verified bundle proves that the record is intact and was signed by the signer 
 that the agent did nothing the doors could not see; see [SECURITY.md](SECURITY.md#what-box-does-not-guarantee). Pin the
 trust file you expect (commit it, or keep it outside CI) rather than trusting the one shipped next to a bundle.
 
+[Verified Runs](runs/README.md) lists agents' runs in Box that CI verifies this way, with the commands, connections,
+holds and refusals counted from each record; add yours with one PR.
+
 ## GitHub Action
 
 [`action/`](action/action.yml) runs an agent in a box on a GitHub-hosted runner: it enables KVM, starts a dev signer and
