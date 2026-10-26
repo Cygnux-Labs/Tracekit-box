@@ -43,6 +43,7 @@ type box struct {
 	machine       vmm.Machine
 	guest         agentrpc.Guest
 	proxy         Proxy
+	egressL       net.Listener // the vsock egress listener (also in listeners); closed first when the box stops
 	listeners     []net.Listener
 	run           tracekit.Run
 	runClosed     bool   // close_run accepted
@@ -440,6 +441,9 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 		return fmt.Errorf("listen for egress: %w", err)
 	}
 	b.addListener(le)
+	b.mu.Lock()
+	b.egressL = le
+	b.mu.Unlock()
 	go func() {
 		if err := proxy.Serve(le); err != nil && !errors.Is(err, net.ErrClosed) && alive(b.state()) {
 			b.event(api.EventBoxFailed, "egress", "egress proxy stopped: "+err.Error(), nil)
@@ -793,6 +797,9 @@ func (b *box) stop(ctx context.Context, reason string, kill bool) {
 		b.ctlMu.Unlock()
 		return
 	}
+	// egress closes first, before the guest gets its say (ending commands, sending the diff, up to a minute): nothing
+	// leaves a box that is going down, whatever the guest does meanwhile. The diff comes over its own vsock port.
+	b.closeEgress()
 	b.persist()
 	sctx := context.WithoutCancel(ctx)
 	switch {
@@ -805,6 +812,32 @@ func (b *box) stop(ctx context.Context, reason string, kill bool) {
 		b.saveDiff(sctx)
 	}
 	b.teardown(sctx, reason, "", kill, false)
+}
+
+// closeEgress shuts the box's egress door: the vsock egress listener (no new connection) and the proxy (every open
+// tunnel and keep-alive session, so no secret is swapped in any more). Idempotent; teardown closes both again. Never
+// called from a proxy goroutine (Proxy.Close waits for them).
+func (b *box) closeEgress() {
+	b.mu.Lock()
+	le, proxy := b.egressL, b.proxy
+	b.mu.Unlock()
+	if le != nil {
+		le.Close()
+	}
+	if proxy != nil {
+		proxy.Close()
+	}
+}
+
+// egressDown reports whether the box is going down (stopping, failed closed, torn down): Decide then refuses.
+func (b *box) egressDown() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch b.info.State {
+	case api.StateCreating, api.StateRunning, api.StatePaused:
+		return b.failedClosed || b.tearingDown
+	}
+	return true
 }
 
 // endExecs asks the box's running commands to end (SIGTERM, then SIGKILL) so the diff is not taken from files they

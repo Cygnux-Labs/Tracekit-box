@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Cygnux-Labs/tracekit-box/internal/agentrpc"
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
 	"github.com/Cygnux-Labs/tracekit-box/internal/egress"
 	"github.com/Cygnux-Labs/tracekit-box/internal/proto"
@@ -322,6 +324,94 @@ func TestReview1ContainmentPollBacksOff(t *testing.T) {
 	}
 	if fc.containedCalls() == fast {
 		t.Fatal("a decision that named an incident did not trigger a containment check")
+	}
+}
+
+// heldDiffGuest holds its diff answer until release is closed (a hostile guest stalling its stop).
+type heldDiffGuest struct {
+	agentrpc.Guest
+	asked   chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (g *heldDiffGuest) DiffWith(ctx context.Context, req proto.DiffRequest, w io.Writer) (proto.DiffSummary, error) {
+	g.once.Do(func() { close(g.asked) })
+	select {
+	case <-g.release:
+	case <-ctx.Done():
+		return proto.DiffSummary{}, ctx.Err()
+	}
+	return g.Guest.DiffWith(ctx, req, w)
+}
+
+// M1: once a box starts stopping (here: fail closed after a lost must-record observe) its egress is shut at once,
+// while the guest still holds its diff: the proxy and the vsock egress listener are closed and every decision is
+// refused, even for an allowlisted host.
+func TestReview1StopClosesEgressFirst(t *testing.T) {
+	e := newTestEnv(t, nil)
+	fc := &flakyClient{Client: e.tk, failObserve: map[string]bool{tracekit.SourceSecretUse: true}}
+	e.d.opts.Tracekit = fc
+	e.guest.Patch = modify("a.txt")
+	e.create(api.CreateBoxRequest{Name: "fc", Allow: []string{"pypi.org"}})
+	g := &heldDiffGuest{Guest: e.guest, asked: make(chan struct{}), release: make(chan struct{})}
+	b := e.box("fc")
+	b.mu.Lock()
+	b.guest = g
+	b.mu.Unlock()
+	defer func() {
+		select {
+		case <-g.release:
+		default:
+			close(g.release)
+		}
+	}()
+	dec := e.proxy(0).cfg.Decider
+	allowed := egress.Request{Host: "pypi.org", Port: 443, URL: "https://pypi.org:443", OnAllowlist: true}
+	if v, _ := dec.Decide(context.Background(), allowed); !v.Allow {
+		t.Fatalf("before the stop: %+v", v)
+	}
+
+	e.proxy(0).cfg.Sink.Emit(egress.Event{Kind: egress.EventSecretUse, Host: "api.example.com", Port: 443, Secret: "T"})
+	select {
+	case <-g.asked:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the stop never asked for the diff (state %s)", b.state())
+	}
+	// the guest holds its diff: the box is stopping and egress must already be shut
+	if st := b.state(); st != api.StateStopping {
+		t.Fatalf("state %s", st)
+	}
+	p := e.proxy(0)
+	p.mu.Lock()
+	closed := p.closed
+	p.mu.Unlock()
+	if !closed {
+		t.Fatal("the egress proxy is still open while the guest holds its diff")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if c, err := e.machine(0).GuestDial(ctx, proto.PortEgress); err == nil {
+		c.Close()
+		t.Fatal("the vsock egress listener still accepts while the guest holds its diff")
+	}
+	start := time.Now()
+	for _, r := range []egress.Request{allowed, {Host: "x.example", Port: 443, URL: "https://x.example:443"}} {
+		v, _ := dec.Decide(context.Background(), r)
+		if v.Allow || !strings.Contains(v.Reason, "going down") {
+			t.Fatalf("decision for %s while stopping: %+v", r.URL, v)
+		}
+	}
+	if time.Since(start) > time.Second || len(e.d.Approvals()) != 0 {
+		t.Fatalf("refusals took %s, approvals %v", time.Since(start), e.d.Approvals())
+	}
+	close(g.release)
+	deadline := time.Now().Add(10 * time.Second)
+	for b.state() != api.StateStopped && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if v := b.view(); v.State != api.StateStopped || !v.DiffSaved {
+		t.Fatalf("box after the stop: %+v", v)
 	}
 }
 

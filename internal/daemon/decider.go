@@ -51,6 +51,9 @@ func (bd *boxDecider) Decide(ctx context.Context, req egress.Request) (egress.Ve
 	b := (*box)(bd)
 	b.calls.begin()
 	defer b.calls.end()
+	if b.egressDown() {
+		return egress.Verdict{Reason: "the box is going down, so nothing more leaves it"}, nil
+	}
 	b.mu.Lock()
 	run := b.run
 	b.mu.Unlock()
