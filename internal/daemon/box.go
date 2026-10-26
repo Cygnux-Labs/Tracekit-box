@@ -172,7 +172,7 @@ func (d *Daemon) Create(ctx context.Context, req api.CreateBoxRequest) (api.Box,
 		return api.Box{}, errf(api.CodeInternal, "check the host's network interfaces; a box can't start without knowing which addresses to keep it away from",
 			"could not list this host's addresses: %v", err)
 	}
-	s.blockPrefixes = prefixes
+	s.blockPrefixes = append(prefixes, d.opts.EgressBlock...)
 	var notices []string
 	if ws := s.req.Workspace; ws != "" && !gitWorkTree(ws) {
 		notices = append(notices, ws+notGitNotice)

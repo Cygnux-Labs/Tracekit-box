@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 
@@ -48,5 +50,20 @@ func TestReview1CAHostsNeverUnconstrained(t *testing.T) {
 	got := caHosts([]egress.Secret{{Name: "T", Hosts: []string{"api.example.com"}}}, []string{"pypi.org", "h.example:8443"}, egress.InspectAll)
 	if strings.Join(got, ",") != "api.example.com,pypi.org,h.example" {
 		t.Fatalf("caHosts = %v", got)
+	}
+}
+
+// L6: the daemon's extra block prefixes (--egress-block: e.g. a cloud VM's NAT'd public IP, which is on no interface)
+// reach every box's proxy alongside the host's own addresses.
+func TestReview1EgressBlockReachesEveryBox(t *testing.T) {
+	pub := netip.MustParsePrefix("203.0.113.7/32")
+	e := newTestEnv(t, func(o *Options) { o.EgressBlock = []netip.Prefix{pub, netip.MustParsePrefix("198.51.100.9/24")} })
+	e.create(api.CreateBoxRequest{Name: "b1"})
+	e.create(api.CreateBoxRequest{Name: "b2"})
+	for i := range 2 {
+		bp := e.proxy(i).cfg.BlockPrefixes
+		if !slices.Contains(bp, pub) || !slices.Contains(bp, netip.MustParsePrefix("198.51.100.0/24")) {
+			t.Fatalf("box %d BlockPrefixes %v", i, bp)
+		}
 	}
 }

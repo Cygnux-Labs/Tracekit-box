@@ -38,6 +38,9 @@ func cmdDaemon(args []string, env *cliEnv) error {
 	var allowPrivate stringList
 	allowPrivate.split = true
 	fs.Var(&allowPrivate, "egress-allow-private", "TEST ONLY, DANGEROUS: a private CIDR boxes may reach (repeatable)")
+	var egressBlock stringList
+	egressBlock.split = true
+	fs.Var(&egressBlock, "egress-block", "a CIDR no box may reach, e.g. this host's NAT'd public IP on a cloud VM (repeatable)")
 	upstreamCA := fs.String("upstream-ca", "", "TEST ONLY, DANGEROUS: PEM file of roots trusted for upstream TLS instead of the system's")
 	if pos, err := parseAll(fs, args); err != nil {
 		return err
@@ -58,9 +61,12 @@ func cmdDaemon(args []string, env *cliEnv) error {
 	if *approvalTimeout < time.Second || *approvalTimeout > 4*time.Minute {
 		return usagef("--approval-timeout %s: use 1s..4m (a connection waits for its approval at most that long plus 30s)", *approvalTimeout)
 	}
+	blocked, err := parseEgressBlock(egressBlock.vals)
+	if err != nil {
+		return err
+	}
 	socketSet := false
 	fs.Visit(func(f *flag.Flag) { socketSet = socketSet || f.Name == "socket" })
-	var err error
 	if err = os.MkdirAll(*stateDir, 0o700); err != nil {
 		return err
 	}
@@ -176,7 +182,7 @@ func cmdDaemon(args []string, env *cliEnv) error {
 	d, err := daemon.New(daemon.Options{
 		StateDir: *stateDir, Launcher: launcher, Builder: builder, Tracekit: tk, Unrecorded: *unrecorded,
 		KernelPath: *kernel, Arch: arch, Version: version, ApprovalTimeout: *approvalTimeout, MaxBoxes: *maxBoxes,
-		EgressAllowPrivate: prefixes, EgressUpstreamRoots: roots, Logger: logger,
+		EgressAllowPrivate: prefixes, EgressUpstreamRoots: roots, EgressBlock: blocked, Logger: logger,
 		// GuestClient, NewProxy and Gate default to agentrpc.New, egress.New and tracekit.Gate
 	})
 	if err != nil {
@@ -189,6 +195,24 @@ func cmdDaemon(args []string, env *cliEnv) error {
 	defer cancel()
 	d.Shutdown(sctx)
 	return serveErr
+}
+
+// parseEgressBlock parses --egress-block values: CIDRs (or single addresses) no box may reach.
+func parseEgressBlock(vals []string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, v := range vals {
+		p, err := netip.ParsePrefix(v)
+		if err != nil {
+			a, aerr := netip.ParseAddr(v)
+			if aerr != nil || a.Zone() != "" {
+				return nil, usagef("--egress-block %q: want a CIDR like 203.0.113.7/32 or an address", v)
+			}
+			a = a.Unmap()
+			p = netip.PrefixFrom(a, a.BitLen())
+		}
+		out = append(out, p.Masked())
+	}
+	return out, nil
 }
 
 // checkKVM fails fast on a host that can't run Firecracker.
