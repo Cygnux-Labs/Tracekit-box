@@ -172,10 +172,11 @@ func (m *matcher) findString(s string) []*pattern {
 
 // valueForms returns a secret value as it may travel: verbatim, percent-encoded, JSON-escaped, hex and base64
 // (standard and URL alphabets, at each of the three byte alignments, so the value is found inside a longer encoded
-// string such as Basic credentials). The proxy matches every form without regard to ASCII case, so an upper- or
-// lower-cased echo and upper-case hex are caught too. Other encodings are not: HTML or XML character references,
-// a value split across lines (MIME or PEM wrapping), the base64 or hex of a case-changed value, and any encoding a
-// host invents. A value shorter than minRedactLen can't be told apart from ordinary text and has none.
+// string such as Basic credentials; also with "/" JSON-escaped and percent-encoded). The proxy matches every form
+// without regard to ASCII case, so an upper- or lower-cased echo and upper-case hex are caught too. Other encodings
+// are not: HTML or XML character references, a value split across lines (MIME or PEM wrapping), the base64 or hex
+// of a case-changed value, and any encoding a host invents. A value shorter than minRedactLen can't be told apart
+// from ordinary text and has none.
 func valueForms(v string) []string {
 	if len(v) < minRedactLen {
 		return nil
@@ -208,6 +209,8 @@ func valueForms(v string) []string {
 			// Only the characters whose 6 bits all come from the value.
 			start, end := (8*o+5)/6, 8*(o+len(v))/6
 			add(e[start:end])
+			add(strings.ReplaceAll(e[start:end], "/", `\/`)) // inside JSON from PHP and others that escape "/"
+			add(url.QueryEscape(e[start:end]))               // in a URL query: "+" and "/" percent-encoded
 		}
 	}
 	return forms
