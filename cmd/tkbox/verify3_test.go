@@ -129,6 +129,29 @@ func TestVerify3MCPStopsItsBoxesOnSignal(t *testing.T) {
 	}
 }
 
+// M4 coverage (verify3): an exec whose stdin is in the request (stdin_data) streams nothing, even when the caller
+// also hands the client a stdin reader: the request says stdin false and the reader is never read.
+func TestVerify3ExecStdinDataStreamsNothing(t *testing.T) {
+	sock, fd := startFakeDaemon(t)
+	read := false
+	r := readFunc(func(p []byte) (int, error) { read = true; return 0, io.EOF })
+	st, err := newClient(sock).exec(context.Background(), "b1", api.ExecRequest{Argv: []string{"echo"}, StdinData: []byte("x")},
+		execIO{Stdin: r, Stdout: io.Discard, Stderr: io.Discard})
+	if err != nil || st.Code != 0 {
+		t.Fatalf("exec: %+v %v", st, err)
+	}
+	fd.mu.Lock()
+	req := fd.execs[len(fd.execs)-1]
+	fd.mu.Unlock()
+	if req.Stdin || string(req.StdinData) != "x" || read {
+		t.Fatalf("exec request: stdin %v, stdin_data %q; the stdin reader was read: %v", req.Stdin, req.StdinData, read)
+	}
+}
+
+type readFunc func([]byte) (int, error)
+
+func (f readFunc) Read(p []byte) (int, error) { return f(p) }
+
 func errString(err error) string {
 	if err == nil {
 		return ""

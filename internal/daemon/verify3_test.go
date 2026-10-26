@@ -8,6 +8,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -223,6 +225,29 @@ func TestVerify3ExecEnvInTheDecidedCommand(t *testing.T) {
 	if _, e2 := e.d.prepareExec("a", api.ExecRequest{Argv: []string{"X=1", "echo"}, Env: map[string]string{"A": "b"}}); e2 == nil ||
 		e2.Code != api.CodeBadRequest {
 		t.Fatalf("a program name with = and a per-command env: %v", e2)
+	}
+}
+
+// L1 coverage (verify3): the box's created record is scrubbed: a box named after a secret's value, with a workspace
+// dir named after it, is recorded with [secret NAME] in both places, never the value.
+func TestVerify3CreatedRecordScrubbed(t *testing.T) {
+	const val = "s3cret-value-1234"
+	e := newTestEnv(t, nil)
+	ws := filepath.Join(t.TempDir(), val)
+	if err := os.Mkdir(ws, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.create(api.CreateBoxRequest{Name: val, Workspace: ws, Secrets: map[string]api.SecretSpec{"TOK": {Value: val, Hosts: []string{"api.example.com"}}}})
+	var created map[string]any
+	for _, r := range e.run(0).Records {
+		if m, _ := r.Value.(map[string]any); r.Method == "observe" && r.Source == tracekit.SourceBox && m["event"] == "created" {
+			created = m
+		}
+	}
+	js, _ := json.Marshal(created)
+	if created == nil || strings.Contains(string(js), val) || created["name"] != "[secret TOK]" ||
+		created["workspace"] != filepath.Join(filepath.Dir(ws), "[secret TOK]") {
+		t.Fatalf("created record: %s", js)
 	}
 }
 
