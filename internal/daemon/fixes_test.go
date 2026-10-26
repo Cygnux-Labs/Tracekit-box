@@ -455,7 +455,7 @@ func TestBashArgsCoverEverythingThatRuns(t *testing.T) {
 		placeholder = s.Placeholder
 	}
 	sock := e.serve()
-	execStream(t, sock, "a", api.ExecRequest{Argv: []string{"env"}, Cwd: "/workspace/sub", Env: map[string]string{"X": "1", "T": placeholder, "V": "s3cret-value"}}, nil)
+	execStream(t, sock, "a", api.ExecRequest{Argv: []string{"env"}, Cwd: "/workspace/sub", Env: map[string]string{"X": "1", "T": placeholder}}, nil)
 	var args map[string]any
 	for _, r := range e.run(0).Records {
 		if r.Method == "decide" && r.Call.Tool == tracekit.ToolBash {
@@ -464,7 +464,7 @@ func TestBashArgsCoverEverythingThatRuns(t *testing.T) {
 	}
 	env, _ := args["env"].(map[string]any)
 	if args["command"] != "env" || args["cwd"] != "/workspace/sub" || args["stdin"] != false || env["X"] != "1" ||
-		env["T"] != "tkbox_TOK_…" || env["V"] != "[secret TOK]" {
+		env["T"] != "tkbox_TOK_…" {
 		t.Fatalf("bash args %v", args)
 	}
 	if _, e2 := e.d.prepareExec("a", api.ExecRequest{Argv: []string{"ls"}, Env: map[string]string{"LD_PRELOAD": "/x.so"}}); e2 == nil || !strings.Contains(e2.Message, "LD_PRELOAD") {

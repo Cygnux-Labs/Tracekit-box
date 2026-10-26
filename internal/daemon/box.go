@@ -327,6 +327,19 @@ func gitWorkTree(dir string) bool {
 // boot does the work of Create after the box is registered.
 func (b *box) boot(ctx context.Context, s *spec) error {
 	d := b.d
+	// the scrubber goes in before anything is recorded: no record (not even the first, trusted ones) ever holds a
+	// secret value or placeholder
+	for i := range s.secrets {
+		ph, err := d.eg.placeholder(s.secrets[i].Name)
+		if err != nil {
+			return fmt.Errorf("secret %s placeholder: %w", s.secrets[i].Name, err)
+		}
+		s.secrets[i].Placeholder = ph
+	}
+	b.mu.Lock()
+	b.secrets = s.secrets
+	b.mu.Unlock()
+	b.scrubP.Store(newScrubber(s.secrets))
 	if d.opts.Tracekit != nil {
 		run, err := d.opts.Tracekit.NewRun(ctx, tracekit.Agent{Name: s.agent})
 		if err != nil {
@@ -337,15 +350,15 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 		b.info.RunID = run.ID()
 		b.mu.Unlock()
 		b.startObserver(run)
-		if err := run.Observe(ctx, tracekit.SourceBox, trustedObs, map[string]any{
+		if err := run.Observe(ctx, tracekit.SourceBox, trustedObs, b.scrub().value(map[string]any{
 			"event": "created", "box_id": b.id, "name": b.info.Name, "image": s.req.Image, "allow": s.allow,
 			"limits": s.limits, "secrets": b.info.Secrets, "workspace": s.req.Workspace, "inspect": s.inspect,
 			"env": envValue(s.req.Env),
-		}); err != nil {
+		})); err != nil {
 			return fmt.Errorf("record the box in Tracekit: %w", err)
 		}
 		if s.req.Task != "" {
-			if err := run.Observe(ctx, tracekit.SourceTask, trustedObs, map[string]any{"task": s.req.Task}); err != nil {
+			if err := run.Observe(ctx, tracekit.SourceTask, trustedObs, b.scrub().value(map[string]any{"task": s.req.Task})); err != nil {
 				return fmt.Errorf("record the task in Tracekit: %w", err)
 			}
 		}
@@ -375,18 +388,6 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 	if err := d.opts.Builder.Scratch(ctx, upper, int64(s.limits.DiskMiB)<<20); err != nil {
 		return fmt.Errorf("create the %dMiB workspace disk: %w", s.limits.DiskMiB, err)
 	}
-
-	for i := range s.secrets {
-		ph, err := d.eg.placeholder(s.secrets[i].Name)
-		if err != nil {
-			return fmt.Errorf("secret %s placeholder: %w", s.secrets[i].Name, err)
-		}
-		s.secrets[i].Placeholder = ph
-	}
-	b.mu.Lock()
-	b.secrets = s.secrets
-	b.mu.Unlock()
-	b.scrubP.Store(newScrubber(s.secrets))
 
 	var ca *egress.CA
 	caPEM := ""

@@ -51,6 +51,17 @@ func checkLimits(l api.Limits) *api.ErrorDetail {
 	return nil
 }
 
+// secretIn names the first secret whose value appears in v ("" when none does). Callers name the env key and the
+// secret in their refusal, never the value.
+func secretIn(v string, secrets []egress.Secret) string {
+	for _, s := range secrets {
+		if s.Value != "" && strings.Contains(v, s.Value) {
+			return s.Name
+		}
+	}
+	return ""
+}
+
 // spec is a validated create request.
 type spec struct {
 	req        api.CreateBoxRequest
@@ -186,6 +197,10 @@ func (d *Daemon) validate(req api.CreateBoxRequest) (*spec, *api.ErrorDetail) {
 		}
 		if strings.ContainsRune(v, 0) {
 			return bad("remove the NUL byte", "env %s has a NUL byte", k)
+		}
+		if name := secretIn(v, s.secrets); name != "" {
+			return bad("pass the value only as a secret (the box sees its placeholder, $"+name+"), never in env",
+				"env %s holds the value of secret %s", k, name)
 		}
 	}
 	if req.Workspace != "" {

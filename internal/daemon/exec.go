@@ -88,9 +88,16 @@ func (d *Daemon) prepareExec(ref string, req api.ExecRequest) (*box, *api.ErrorD
 			return nil, errf(api.CodeBadRequest, "remove the NUL byte from the command", "an argument has a NUL byte")
 		}
 	}
+	b.mu.Lock()
+	secrets := b.secrets
+	b.mu.Unlock()
 	for k, v := range req.Env {
 		if !envNameRE.MatchString(k) || strings.ContainsRune(v, 0) {
 			return nil, errf(api.CodeBadRequest, "env names are letters, digits and _; values can't hold NUL", "env %q is not a valid KEY=VALUE", k)
+		}
+		if name := secretIn(v, secrets); name != "" {
+			return nil, errf(api.CodeBadRequest, "use the secret's placeholder ($"+name+" in the box) instead; its value never enters the box",
+				"env %s holds the value of secret %s", k, name)
 		}
 		if reservedEnv[k] {
 			return nil, errf(api.CodeBadRequest, "every connection goes through the box's proxy", "env %s is set by the box and can't be overridden", k)
