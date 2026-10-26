@@ -48,8 +48,8 @@ const (
 	// after DefaultContainmentFastFor a box's containment is checked every DefaultContainmentSlowPoll instead
 	DefaultContainmentFastFor  = time.Minute
 	DefaultContainmentSlowPoll = 15 * time.Second
-	shutdownTimeout        = 10 * time.Second
-	maxDiffBytes           = proto.DefaultMaxDiffBytes
+	shutdownTimeout            = 10 * time.Second
+	maxDiffBytes               = proto.DefaultMaxDiffBytes
 )
 
 // Proxy is what the daemon needs from a box's egress proxy (*egress.Proxy).
@@ -88,7 +88,7 @@ type Options struct {
 	EgressUpstreamRoots *x509.CertPool
 	// EgressBlock are extra prefixes no box may reach, on top of the built-in ranges and this host's own interface
 	// addresses: e.g. the host's NAT'd public IP on a cloud VM, which is on no interface (`tkbox daemon --egress-block`).
-	EgressBlock []netip.Prefix
+	EgressBlock         []netip.Prefix
 	Now                 func() time.Time
 	ReadyTimeout        time.Duration // guest readiness (default 60s)
 	ContainmentPoll     time.Duration // default 2s, for the first ContainmentFastFor of a box

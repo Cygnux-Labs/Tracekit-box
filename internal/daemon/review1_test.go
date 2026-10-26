@@ -122,8 +122,6 @@ type flakyClient struct {
 	contained    int // Contained calls
 }
 
-func (c *flakyClient) set(failComplete bool) { c.mu.Lock(); c.failComplete = failComplete; c.mu.Unlock() }
-
 func (c *flakyClient) NewRun(ctx context.Context, a tracekit.Agent) (tracekit.Run, error) {
 	r, err := c.Client.NewRun(ctx, a)
 	if err != nil {
