@@ -15,6 +15,7 @@ import (
 	"github.com/Cygnux-Labs/tracekit-box/internal/agentrpc"
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
 	"github.com/Cygnux-Labs/tracekit-box/internal/proto"
+	"github.com/Cygnux-Labs/tracekit-box/internal/tracekit"
 )
 
 // waitCompletes waits until run 0 holds n complete records (synchronising with the run's mutex, so the records may
@@ -136,5 +137,90 @@ func TestVerify3SecretValueInCommandCwdOrStdinRefused(t *testing.T) {
 		if _, e2 := e.d.prepareExec("l1", req); e2 != nil {
 			t.Errorf("exec %+v refused: %v", req, e2)
 		}
+	}
+}
+
+// L10 (verify3): a per-exec env may not set names that change what runs (by prefix: LD_, DYLD_, GIT_, XDG_, PYTHON,
+// PERL, RUBY, NODE_, JAVA_, JDK_, _JAVA_, LUA_, BASH_, npm config; and exact names such as SHELLOPTS, PS4, HOME,
+// CLASSPATH, MAKEFILES, GOFLAGS, RUSTC_WRAPPER), while plain settings (DEBIAN_FRONTEND, PIP_ROOT_USER_ACTION, …) pass.
+func TestVerify3ExecEnvDenyList(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.create(api.CreateBoxRequest{Name: "env"})
+	for _, k := range []string{"LD_BIND_NOW", "LD_DEBUG", "GLIBC_TUNABLES", "DYLD_INSERT_LIBRARIES", "PYTHONHOME",
+		"PYTHONUSERBASE", "PYTHONWARNINGS", "PYTHONPLATLIBDIR", "PYTHONSTARTUP", "PYTHONINSPECT", "PERL5LIB", "PERLLIB",
+		"PERL5DB", "RUBYLIB", "GEM_PATH", "GEM_HOME", "BUNDLE_GEMFILE", "NODE_PATH", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
+		"CLASSPATH", "SHELLOPTS", "BASHOPTS", "PS4", "IFS", "CDPATH", "GLOBIGNORE", "ZDOTDIR", "HOME", "XDG_CONFIG_HOME",
+		"XDG_DATA_HOME", "GIT_SSH_COMMAND", "GIT_SSH", "GIT_EXEC_PATH", "GIT_DIR", "GIT_WORK_TREE", "GIT_TEMPLATE_DIR",
+		"GIT_EXTERNAL_DIFF", "GIT_ASKPASS", "GIT_EDITOR", "GIT_PAGER", "GIT_PROXY_COMMAND", "SSH_ASKPASS", "EDITOR",
+		"VISUAL", "PAGER", "LESSOPEN", "MAKEFILES", "MAKEFLAGS", "GOFLAGS", "GOTOOLCHAIN", "RUSTC_WRAPPER", "CC",
+		"LUA_INIT", "LUA_INIT_5_4", "PHPRC", "PHP_INI_SCAN_DIR", "npm_config_script_shell", "NPM_CONFIG_USERCONFIG",
+		"PIP_CONFIG_FILE", "BASH_ENV", "BASH_FUNC_x", "LD_PRELOAD", "PYTHONPATH", "NODE_OPTIONS", "JAVA_TOOL_OPTIONS",
+		"GIT_CONFIG_COUNT", "PATH"} {
+		_, e2 := e.d.prepareExec("env", api.ExecRequest{Argv: []string{"ls"}, Env: map[string]string{k: "/x"}})
+		if e2 == nil || e2.Code != api.CodeBadRequest || !strings.Contains(e2.Message, "env "+k+" can't be set per command") {
+			t.Errorf("per-exec env %s: %v", k, e2)
+		}
+	}
+	for _, k := range []string{"DEBIAN_FRONTEND", "PIP_ROOT_USER_ACTION", "PIP_DISABLE_PIP_VERSION_CHECK", "LANG",
+		"GIT_AUTHOR_NAME", "GIT_COMMITTER_EMAIL", "NODE_ENV", "PYTHONUNBUFFERED", "MY_PATH", "CI", "TERM"} {
+		if _, e2 := e.d.prepareExec("env", api.ExecRequest{Argv: []string{"ls"}, Env: map[string]string{k: "x"}}); e2 != nil {
+			t.Errorf("per-exec env %s refused: %v", k, e2)
+		}
+	}
+}
+
+// L10 (verify3): an exec's own env is in its decided command line as a leading `env K=V …` (sorted, placeholders
+// redacted) as well as in the env argument; the guest runs the argv as given with that env, and the complete carries
+// exactly the decided args (so their digests match). A program name with = can't take a per-command env.
+func TestVerify3ExecEnvInTheDecidedCommand(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.create(api.CreateBoxRequest{Name: "a", Secrets: map[string]api.SecretSpec{"TOK": {Value: "s3cret-value", Hosts: []string{"api.example.com"}}}})
+	var ph string
+	for _, s := range e.box("a").secrets {
+		ph = s.Placeholder
+	}
+	sock := e.serve()
+	_, frames := execStream(t, sock, "a", api.ExecRequest{Argv: []string{"sh", "-c", "apt-get install -y curl"},
+		Env: map[string]string{"DEBIAN_FRONTEND": "noninteractive", "T": ph, "Z": "a b"}}, nil)
+	if frames[len(frames)-1].Type != proto.TypeExit {
+		t.Fatalf("exec: %s", frames[len(frames)-1].Payload)
+	}
+	var decided, completed map[string]any
+	for _, r := range e.run(0).Records {
+		if r.Call.Tool != tracekit.ToolBash {
+			continue
+		}
+		switch r.Method {
+		case "decide":
+			decided = r.Call.Args
+		case "complete":
+			completed = r.Call.Args
+		}
+	}
+	want := "env DEBIAN_FRONTEND=noninteractive 'T=tkbox_TOK_…' 'Z=a b' sh -c 'apt-get install -y curl'"
+	if decided["command"] != want {
+		t.Fatalf("decided command %q, want %q", decided["command"], want)
+	}
+	if env, _ := decided["env"].(map[string]any); env["DEBIAN_FRONTEND"] != "noninteractive" || env["T"] != "tkbox_TOK_…" {
+		t.Fatalf("decided env %v", decided["env"])
+	}
+	d1, err1 := tracekit.ArgsDigest(tracekit.ToolBash, decided)
+	d2, err2 := tracekit.ArgsDigest(tracekit.ToolBash, completed)
+	if err1 != nil || err2 != nil || d1 != d2 {
+		t.Fatalf("complete args digest %s (%v), decided %s (%v)", d2, err2, d1, err1)
+	}
+	g := e.guest.Execs[len(e.guest.Execs)-1]
+	if strings.Join(g.Argv, "|") != "sh|-c|apt-get install -y curl" || strings.Join(g.Env, "|") != "DEBIAN_FRONTEND=noninteractive|T="+ph+"|Z=a b" {
+		t.Fatalf("guest exec %+v", g)
+	}
+
+	// no env: the command line is the argv alone
+	execStream(t, sock, "a", api.ExecRequest{Argv: []string{"ls", "-la"}}, nil)
+	if args, _ := lastBash(e); args["command"] != "ls -la" {
+		t.Fatalf("command without env: %q", args["command"])
+	}
+	if _, e2 := e.d.prepareExec("a", api.ExecRequest{Argv: []string{"X=1", "echo"}, Env: map[string]string{"A": "b"}}); e2 == nil ||
+		e2.Code != api.CodeBadRequest {
+		t.Fatalf("a program name with = and a per-command env: %v", e2)
 	}
 }

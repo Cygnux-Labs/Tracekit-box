@@ -143,7 +143,10 @@ the shell-quoted command line, the working directory, this exec's `--env` (a sec
 a command, cwd or up-front stdin that holds one: `the command, its cwd or its stdin holds the value of secret GH`) and
 `stdin`, true when the exec has stdin of either kind below. A first word that contains `=` or is a shell reserved word
 (`if`, `then`, `for`, `do`, …) is recorded quoted (`'X=1' echo hi`), so the signer's shell parser sees the program
-that runs, not an assignment or a keyword.
+that runs, not an assignment or a keyword. With `--env`, the command line starts with `env K=V …` (sorted), as if the
+command had been typed with them, so the signer's own env rules see them too:
+`tkbox exec b --env DEBIAN_FRONTEND=noninteractive -- apt-get install -y curl` is decided as
+`env DEBIAN_FRONTEND=noninteractive apt-get install -y curl`.
 
 Stdin comes in one of two kinds:
 
@@ -165,7 +168,7 @@ decided one by one. Box prints approvals to give, egress refusals and other noti
 |---|---|
 | `-i` | Send this terminal's stdin to the command (there is no TTY). The daemon holds up to 4 MiB the process has not read yet (the guest 1 MiB more, while the process keeps reading). A process that does not take its stdin fast enough is never handed a false end of input: it is killed, and `tkbox exec` prints `tkbox: stdin was not consumed fast enough (N bytes dropped); the command was stopped: write large input to a file in /workspace and read it from there` and exits 125 |
 | `--timeout` | This exec's time limit, 1s to 24h (default: the box's exec timeout, 30m) |
-| `--env` | Repeatable `K=V` for this exec only. Variables that change what runs without showing in the decided command are refused (`env LD_PRELOAD can't be set per command`): `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `BASH_ENV`, `ENV`, `PROMPT_COMMAND`, `PATH`, `NODE_OPTIONS`, `PYTHONPATH`, `PERL5OPT`, `RUBYOPT`, `JAVA_TOOL_OPTIONS`, `GCONV_PATH`, `GIT_CONFIG` and any `GIT_CONFIG_*` name, as are the proxy and CA variables Box sets. A value that holds a secret's real value is refused too (`env TOKEN holds the value of secret GH`): use the secret's placeholder |
+| `--env` | Repeatable `K=V` for this exec only, decided as a leading `env K=V …` on the command line. Variables that change what runs are refused (`env LD_PRELOAD can't be set per command`): every name starting `LD_`, `DYLD_`, `GIT_`, `XDG_`, `PYTHON`, `PERL`, `RUBY`, `NODE_`, `JAVA_`, `JDK_`, `_JAVA_`, `LUA_`, `BASH_` or `NPM_CONFIG_` (a few harmless ones such as `GIT_AUTHOR_NAME`, `NODE_ENV` and `PYTHONUNBUFFERED` excepted), and `PATH`, `HOME`, `SHELLOPTS`, `PS4`, `CLASSPATH`, `MAKEFILES`, `GOFLAGS`, `RUSTC_WRAPPER`, `CC`, `EDITOR`, `PAGER` and the rest listed in [limits](limits.md), as are the proxy and CA variables Box sets. Plain settings such as `DEBIAN_FRONTEND` or `PIP_ROOT_USER_ACTION` are fine. A value that holds a secret's real value is refused too (`env TOKEN holds the value of secret GH`): use the secret's placeholder |
 | `--cwd` | The working directory in the box (default `/workspace`) |
 
 SIGINT, SIGTERM, SIGHUP and SIGQUIT are passed to the command in the box at once, whatever the command does with its

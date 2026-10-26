@@ -514,9 +514,9 @@ class Client:
         and the text itself when it is UTF-8 of at most 4 KiB). Larger input and file objects are streamed: the daemon
         holds up to 4 MiB the process has not read yet (past that the process is stopped, stdin_truncated), and the
         sha256 of what the process was given is recorded with the outcome instead.
-        env: per-command env; it may not set LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT, BASH_ENV, ENV, PROMPT_COMMAND,
-        PATH, NODE_OPTIONS, PYTHONPATH, PERL5OPT, RUBYOPT, JAVA_TOOL_OPTIONS, GCONV_PATH, GIT_CONFIG or any GIT_CONFIG_*
-        name (BadRequest). timeout: seconds or a Go duration string, 1s to 24h (default: the box's exec timeout).
+        env: per-command env, decided as a leading `env K=V ...` on the command line; it may not set names that change
+        what runs (LD_*, GIT_*, XDG_*, PYTHON*, NODE_*, PATH, HOME, SHELLOPTS, CLASSPATH, ...: the full list is in
+        docs/limits.md) (BadRequest). timeout: seconds or a Go duration string, 1s to 24h (default: the box's exec timeout).
         on_output(stream, data) is called with "stdout" or "stderr" as output arrives; on_event(event) with each
         ExecEvent (deciding, waiting_approval, running, notice).
 

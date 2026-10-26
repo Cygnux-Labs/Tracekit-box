@@ -81,10 +81,10 @@ such as an egress refusal or an approval to give with `tkbox approve <id>`.
 (its sha256 and size, and the text itself when it is UTF-8 of at most 4 KiB), and exactly that data is the process's
 stdin. Larger input and file objects are streamed, and the sha256 and size of what the process was given are recorded
 with the outcome instead; the daemon holds at most 4 MiB the process has not read yet, and past that stops the process
-rather than hand it a false end of input (`stdin_truncated`, and `ok` is false). A per-command `env` may not set
-`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `BASH_ENV`, `ENV`, `PROMPT_COMMAND`, `PATH`, `NODE_OPTIONS`,
-`PYTHONPATH`, `PERL5OPT`, `RUBYOPT`, `JAVA_TOOL_OPTIONS`, `GCONV_PATH`, `GIT_CONFIG` or any `GIT_CONFIG_*` name, and no
-value may hold a secret's value (`BadRequest`). The exec stream has no client-side timeout: the daemon enforces the exec timeout
+rather than hand it a false end of input (`stdin_truncated`, and `ok` is false). A per-command `env` is decided as a
+leading `env K=V …` on the command line, and may not set names that change what runs (`LD_*`, `GIT_*`, `XDG_*`,
+`PYTHON*`, `NODE_*`, `PATH`, `HOME`, `SHELLOPTS`, `CLASSPATH`, … : the full list is in docs/limits.md); no value may
+hold a secret's value (`BadRequest`). The exec stream has no client-side timeout: the daemon enforces the exec timeout
 (default 30 minutes, 1s to 24h) and approval waits. Closing the connection (for example on `KeyboardInterrupt`) cancels
 the command if it has not started and stops it if it has.
 

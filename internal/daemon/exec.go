@@ -60,16 +60,48 @@ func (b *box) notice(msg string) {
 
 var signalNames = map[string]bool{"SIGINT": true, "SIGTERM": true, "SIGKILL": true, "SIGHUP": true, "SIGQUIT": true}
 
-// loaderEnv are env names that change what a decided command runs without changing its argv (the dynamic loader,
-// shell startup files, which program a name resolves to, interpreter preloads and git's config); a per-exec env may
-// not set them (an operator's box env may). Every GIT_CONFIG_* name is refused too (see isLoaderEnv).
-var loaderEnv = map[string]bool{"LD_PRELOAD": true, "LD_LIBRARY_PATH": true, "LD_AUDIT": true, "BASH_ENV": true,
-	"ENV": true, "PROMPT_COMMAND": true, "PATH": true, "NODE_OPTIONS": true, "PYTHONPATH": true, "PERL5OPT": true,
-	"RUBYOPT": true, "JAVA_TOOL_OPTIONS": true, "GCONV_PATH": true, "GIT_CONFIG": true}
+// loaderEnv are env names that change what a decided command runs without changing its argv (shell startup and
+// tracing, which program a name resolves to, where config and modules are read from, build-tool wrappers, editors
+// and pagers); a per-exec env may not set them, nor any name under loaderEnvPrefixes (an operator's box env may).
+// The env a command does get is also in its decided command line (`env K=V … cmd`, see commandLine), so the signer's
+// own env rules see it; these lists refuse up front what no command needs per exec.
+var loaderEnv = map[string]bool{"ENV": true, "PROMPT_COMMAND": true, "PATH": true, "GCONV_PATH": true,
+	"SHELLOPTS": true, "BASHOPTS": true, "PS4": true, "IFS": true, "CDPATH": true, "GLOBIGNORE": true, "ZDOTDIR": true,
+	"FPATH": true, "HOME": true, "GLIBC_TUNABLES": true, "CLASSPATH": true, "GEM_PATH": true, "GEM_HOME": true,
+	"BUNDLE_GEMFILE": true, "MAKEFILES": true, "MAKEFLAGS": true, "GOFLAGS": true, "GOENV": true, "GOTOOLCHAIN": true,
+	"RUSTC": true, "RUSTC_WRAPPER": true, "RUSTC_WORKSPACE_WRAPPER": true, "RUSTFLAGS": true, "CARGO_HOME": true,
+	"CARGO_BUILD_RUSTC": true, "CARGO_BUILD_RUSTC_WRAPPER": true, "CC": true, "CXX": true, "CPP": true, "LD": true,
+	"PHPRC": true, "PHP_INI_SCAN_DIR": true, "LESSOPEN": true, "LESSCLOSE": true, "EDITOR": true, "VISUAL": true,
+	"PAGER": true, "MANPAGER": true, "SSH_ASKPASS": true, "PIP_CONFIG_FILE": true}
 
-// isLoaderEnv reports whether a per-exec env may not set k: a loaderEnv name, or any GIT_CONFIG_ name
-// (GIT_CONFIG_COUNT, GIT_CONFIG_KEY_n, GIT_CONFIG_VALUE_n, GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, GIT_CONFIG_PARAMETERS, …).
-func isLoaderEnv(k string) bool { return loaderEnv[k] || strings.HasPrefix(k, "GIT_CONFIG_") }
+// loaderEnvPrefixes are name prefixes a per-exec env may not set: the dynamic loader (LD_, and DYLD_), GIT_ (config,
+// hooks, ssh, exec path, editor, pager, …), XDG_ base dirs (config is read there), interpreters' options and module
+// paths (PYTHON, PERL, RUBY, NODE_, JAVA_, JDK_, _JAVA_, LUA_) and BASH_ (BASH_ENV, …). npm reads its config from
+// NPM_CONFIG_ names in any case, so that prefix is matched in any case too.
+var loaderEnvPrefixes = []string{"LD_", "DYLD_", "GIT_", "XDG_", "PYTHON", "PERL", "RUBY", "NODE_", "JAVA_", "JDK_",
+	"_JAVA_", "LUA_", "BASH_"}
+
+// loaderEnvAllowed are names under a loaderEnvPrefixes prefix that change no program and may be set per exec.
+var loaderEnvAllowed = map[string]bool{"GIT_AUTHOR_NAME": true, "GIT_AUTHOR_EMAIL": true, "GIT_AUTHOR_DATE": true,
+	"GIT_COMMITTER_NAME": true, "GIT_COMMITTER_EMAIL": true, "GIT_COMMITTER_DATE": true, "NODE_ENV": true,
+	"PYTHONUNBUFFERED": true, "PYTHONDONTWRITEBYTECODE": true, "PYTHONIOENCODING": true, "PYTHONUTF8": true,
+	"PYTHONHASHSEED": true, "PYTHONFAULTHANDLER": true}
+
+// isLoaderEnv reports whether a per-exec env may not set k.
+func isLoaderEnv(k string) bool {
+	if loaderEnv[k] || strings.HasPrefix(strings.ToUpper(k), "NPM_CONFIG_") {
+		return true
+	}
+	if loaderEnvAllowed[k] {
+		return false
+	}
+	for _, p := range loaderEnvPrefixes {
+		if strings.HasPrefix(k, p) {
+			return true
+		}
+	}
+	return false
+}
 
 // prepareExec checks an exec request before the connection is upgraded, so a refusal is a plain JSON error.
 func (d *Daemon) prepareExec(ref string, req api.ExecRequest) (*box, *api.ErrorDetail) {
@@ -117,6 +149,11 @@ func (d *Daemon) prepareExec(ref string, req api.ExecRequest) (*box, *api.ErrorD
 			return nil, errf(api.CodeBadRequest, "it changes what the command runs without showing in the command the signer decides; put it in the command itself (e.g. sh -c '"+k+"=… cmd') so it is decided",
 				"env %s can't be set per command", k)
 		}
+	}
+	if len(req.Env) > 0 && strings.Contains(req.Argv[0], "=") {
+		// the decided line is `env K=V … argv`: env would read a first word with = as one more variable, not the program
+		return nil, errf(api.CodeBadRequest, "run it through a shell instead, e.g. sh -c '…'",
+			"a program name with = can't take a per-command env")
 	}
 	if req.Stdin && req.StdinData != nil {
 		return nil, errf(api.CodeBadRequest, "send the input as stdin_data (known up front) or stream it (stdin: true), not both",
@@ -251,17 +288,13 @@ func (q *stdinQueue) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// bashArgs is what the signer decides for an exec: the command line and everything else that changes what runs.
-func (b *box) bashArgs(req api.ExecRequest, line string) map[string]any {
-	cwd := req.Cwd
-	if cwd == "" {
-		cwd = proto.DefaultWorkspacePath
-	}
-	env := map[string]any{}
+// redactor returns what the decision shows of a value: a secret's placeholder as tkbox_NAME_…, its value as
+// [secret NAME].
+func (b *box) redactor() func(string) string {
 	b.mu.Lock()
 	secrets := b.secrets
 	b.mu.Unlock()
-	redact := func(v string) string {
+	return func(v string) string {
 		for _, s := range secrets {
 			if s.Placeholder != "" {
 				v = strings.ReplaceAll(v, s.Placeholder, "tkbox_"+s.Name+"_…")
@@ -272,6 +305,38 @@ func (b *box) bashArgs(req api.ExecRequest, line string) map[string]any {
 		}
 		return v
 	}
+}
+
+// commandLine is the command line the signer decides for an exec: argv shell-quoted, led by `env K=V …` with the
+// exec's own env (sorted, placeholders redacted) when it has any, so the signer's shell parser and its env rules see
+// the variables the command runs with, as they would in a command typed with them.
+func (b *box) commandLine(req api.ExecRequest) string {
+	if len(req.Env) == 0 {
+		return tracekit.ShellQuote(req.Argv)
+	}
+	redact := b.redactor()
+	keys := make([]string, 0, len(req.Env))
+	for k := range req.Env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	argv := make([]string, 0, 1+len(keys)+len(req.Argv))
+	argv = append(argv, "env")
+	for _, k := range keys {
+		argv = append(argv, k+"="+redact(req.Env[k]))
+	}
+	return tracekit.ShellQuote(append(argv, req.Argv...))
+}
+
+// bashArgs is what the signer decides for an exec: the command line (commandLine) and everything else that changes
+// what runs.
+func (b *box) bashArgs(req api.ExecRequest, line string) map[string]any {
+	cwd := req.Cwd
+	if cwd == "" {
+		cwd = proto.DefaultWorkspacePath
+	}
+	env := map[string]any{}
+	redact := b.redactor()
 	for k, v := range req.Env {
 		env[k] = redact(v)
 	}
@@ -413,7 +478,7 @@ func (b *box) runExec(parent context.Context, conn net.Conn, r io.Reader, w io.W
 	if req.Timeout > 0 {
 		timeout = time.Duration(req.Timeout)
 	}
-	line := tracekit.ShellQuote(req.Argv)
+	line := b.commandLine(req)
 	cancelled := func() {
 		if over, n := stdin.truncated(); over {
 			b.event(api.EventExecDecided, "exec", "exec not started, stdin overflowed before it started: "+line,
