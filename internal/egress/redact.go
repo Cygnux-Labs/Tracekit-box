@@ -318,23 +318,36 @@ func (x *redactReader) Read(b []byte) (int, error) {
 			return 0, x.srcErr
 		}
 		n, err := x.r.Read(x.tmp)
-		if n > 0 {
+		if n > 0 || err != nil {
 			x.buf = append(x.buf, x.tmp[:n]...)
-			end := 0
+			final := err != nil // nothing more comes: a pattern gets only what is here
+			end, wait := 0, -1
 			for i := 0; ; {
 				j, p := x.m.index(x.buf, i)
 				if j < 0 {
+					break
+				}
+				// a pattern starting at or before j that runs past what has arrived may still match, and would win
+				// (leftmost, then longest, as when the body is read whole): the rest waits for more
+				if h := x.m.hold(x.buf, i); !final && h > 0 && len(x.buf)-h <= j {
+					wait = len(x.buf) - h
 					break
 				}
 				copy(x.buf[j:], x.m.marker(len(p.s)))
 				i = j + len(p.s)
 				end = i
 			}
-			x.ready = len(x.buf) - x.m.hold(x.buf, end)
+			switch {
+			case final:
+				x.ready = len(x.buf)
+			case wait >= 0:
+				x.ready = wait
+			default:
+				x.ready = len(x.buf) - x.m.hold(x.buf, end)
+			}
 		}
 		if err != nil {
 			x.srcErr = err
-			x.ready = len(x.buf)
 		}
 	}
 }

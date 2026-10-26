@@ -23,7 +23,8 @@ jobs:
       - name: Run every fuzz target
         env:
           FUZZTIME: ${{ inputs.fuzztime || '60s' }}
-        run: make fuzz FUZZTIME="$FUZZTIME"
+        # -k: a failing target does not stop the rest, so every new failing input is collected below
+        run: make -k fuzz FUZZTIME="$FUZZTIME"
       # A failing input is written under its package's testdata/fuzz; keep only the new ones.
       - name: Collect new failing inputs
         if: failure()

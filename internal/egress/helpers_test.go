@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -225,5 +226,37 @@ func TestHeaderPlaceholderNeverCompletesValue(t *testing.T) {
 	}
 	if got := h.Get("X-Other"); got != "plain "+b.Placeholder {
 		t.Errorf("an exact echo redacts to %q, want its placeholder", got)
+	}
+}
+
+// B2 (final check): a match complete at the end of what has arrived waits while a longer pattern at its place, or
+// one starting earlier, may still complete, so a body read in pieces redacts exactly as read whole. Secret B's
+// value inside A's, echoed and cut right after B, left A's other parts in the clear ("AKIAXK7Q:[…]:Zq9Pw"), and the
+// raw value "00000%" before "25" (the tail of its percent form) came out as a marker followed by "25".
+func TestRedactReaderPiecesMatchWhole(t *testing.T) {
+	for _, c := range []struct {
+		values []string
+		body   string
+		first  byte // the first piece is first+1 bytes
+	}{
+		{[]string{"AKIAXK7Q:tok-123456:Zq9Pw", "tok-123456"}, "echo AKIAXK7Q:tok-123456:Zq9Pw end", 23},
+		{[]string{"00000%"}, "00000%25", 5},
+	} {
+		var rules []*secretRule
+		for i, v := range c.values {
+			s := mkSecret(t, "S"+strconv.Itoa(i), "", "a.example.com")
+			s.Value = v
+			r, err := newSecretRule(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rules = append(rules, r)
+		}
+		m := newMatcher((&Proxy{secrets: rules}).valuePatterns())
+		whole, _ := io.ReadAll(newRedactReader(m, strings.NewReader(c.body)))
+		pieces, _ := io.ReadAll(newRedactReader(m, &chunkReader{data: []byte(c.body), sizes: []byte{c.first, 60}}))
+		if string(pieces) != string(whole) || m.findString(string(whole)) != nil {
+			t.Errorf("%q read in pieces gives %q, read whole %q", c.body, pieces, whole)
+		}
 	}
 }
