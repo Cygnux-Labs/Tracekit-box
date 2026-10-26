@@ -314,10 +314,15 @@ func TestFailClosed(t *testing.T) {
 	if bin == "" {
 		t.Skip("TKBOX_BIN not set")
 	}
-	c := exec.Command(filepath.Join(bin, "tkbox"), "daemon", "--state-dir", t.TempDir(),
+	state := t.TempDir()
+	c := exec.Command(filepath.Join(bin, "tkbox"), "daemon", "--state-dir", state,
 		"--signer", filepath.Join(t.TempDir(), "nothing.sock"))
 	out, err := c.CombinedOutput()
 	if err == nil || !strings.Contains(string(out), "tracekit up") {
 		t.Fatalf("daemon started without a signer: %v\n%s", err, out)
+	}
+	// it refuses before downloading anything: no signer must not wait on (or be masked by) the network
+	if _, err := os.Stat(filepath.Join(state, "images", "assets")); !os.IsNotExist(err) {
+		t.Fatalf("the daemon fetched assets before checking the signer (%v)", err)
 	}
 }

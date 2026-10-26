@@ -89,6 +89,34 @@ func cmdDaemon(args []string, env *cliEnv) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// the signer comes before any download: no signer means no box, and saying so must not wait on the network
+	var tk tracekit.Client
+	if *unrecorded {
+		logger.Printf("WARNING: --unrecorded: boxes record NOTHING in Tracekit and cannot be exported; the allowlist and Box approvals still apply")
+	} else {
+		noSigner := func(err error) error {
+			var u *tracekit.Unavailable
+			if errors.As(err, &u) {
+				err = u.Err // "no signer answering at …", without the wrapper's own words
+			}
+			return fmt.Errorf("the daemon needs a Tracekit signer: %v\nstart one with `tracekit up`, or pass --unrecorded to run boxes that record nothing", err)
+		}
+		dctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		tk, err = tracekit.Dial(dctx, tracekit.Options{Signer: *signer, TracekitBin: *tracekitBin})
+		cancel()
+		if err != nil {
+			return noSigner(err)
+		}
+		defer tk.Close()
+		sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		st, err := tk.Status(sctx)
+		cancel()
+		if err != nil {
+			return noSigner(err)
+		}
+		logger.Printf("signer %s %s at %s (rpc %d, identity %s)", st.SignerName, st.SignerVersion, st.Where, st.RPCVersion, st.Identity)
+	}
+
 	arch := runtime.GOARCH
 	assetDir := filepath.Join(*stateDir, "images", "assets")
 	if *fcBin == "" {
@@ -128,33 +156,6 @@ func cmdDaemon(args []string, env *cliEnv) error {
 	builder, err := image.NewBuilder(image.Options{CacheDir: filepath.Join(*stateDir, "images"), GuestBinary: guestBinary})
 	if err != nil {
 		return fmt.Errorf("image builder: %w", err)
-	}
-
-	var tk tracekit.Client
-	if *unrecorded {
-		logger.Printf("WARNING: --unrecorded: boxes record NOTHING in Tracekit and cannot be exported; the allowlist and Box approvals still apply")
-	} else {
-		noSigner := func(err error) error {
-			var u *tracekit.Unavailable
-			if errors.As(err, &u) {
-				err = u.Err // "no signer answering at …", without the wrapper's own words
-			}
-			return fmt.Errorf("the daemon needs a Tracekit signer: %v\nstart one with `tracekit up`, or pass --unrecorded to run boxes that record nothing", err)
-		}
-		dctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		tk, err = tracekit.Dial(dctx, tracekit.Options{Signer: *signer, TracekitBin: *tracekitBin})
-		cancel()
-		if err != nil {
-			return noSigner(err)
-		}
-		defer tk.Close()
-		sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		st, err := tk.Status(sctx)
-		cancel()
-		if err != nil {
-			return noSigner(err)
-		}
-		logger.Printf("signer %s %s at %s (rpc %d, identity %s)", st.SignerName, st.SignerVersion, st.Where, st.RPCVersion, st.Identity)
 	}
 
 	var prefixes []netip.Prefix
