@@ -998,7 +998,8 @@ func gitDirs(ctx context.Context, dir string) (gitDir, hooks string, err error) 
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	var conf []string
-	if hp := hostGitConfig(cctx, dir, "core.hooksPath"); hp != "" {
+	hp := hostGitConfig(cctx, dir, "core.hooksPath")
+	if hp != "" {
 		conf = []string{"core.hooksPath=" + hp}
 	}
 	cmd := checkoutGit(cctx, dir, conf, "rev-parse", "--path-format=absolute", "--absolute-git-dir", "--git-path", "hooks")
@@ -1006,18 +1007,6 @@ func gitDirs(ctx context.Context, dir string) (gitDir, hooks string, err error) 
 	cmd.Stderr = &stderr
 	out, rerr := cmd.Output()
 	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
-	if rerr != nil || len(lines) < 2 {
-		if !image.InGitWorkTree(dir) {
-			return "", "", nil
-		}
-		why := strings.TrimSpace(stderr.String())
-		if why == "" && rerr != nil {
-			why = rerr.Error()
-		}
-		return "", "", errf(api.CodeConflict, "fix git there (`git status` as the daemon's user; for another owner, add the checkout to safe.directory in that user's global git config); nothing was applied",
-			"%s is in a git repository, but git can't say where its git and hooks dirs are (%s), so writes into them can't be refused", dir, strings.SplitN(why, "\n", 2)[0])
-	}
-	lines = lines[len(lines)-2:] // a git without --path-format echoes it first
 	abs := func(p string) string {
 		if p == "" {
 			return ""
@@ -1032,6 +1021,20 @@ func gitDirs(ctx context.Context, dir string) (gitDir, hooks string, err error) 
 		}
 		return resolveExisting(filepath.Clean(p))
 	}
+	if rerr != nil || len(lines) < 2 {
+		if !image.InGitWorkTree(dir) {
+			// no repository here, but the daemon user's own core.hooksPath (the hooks each of their repositories runs)
+			// may still lie inside dir: writes there are refused like those into a checkout's hooks dir
+			return "", abs(hp), nil
+		}
+		why := strings.TrimSpace(stderr.String())
+		if why == "" && rerr != nil {
+			why = rerr.Error()
+		}
+		return "", "", errf(api.CodeConflict, "fix git there (`git status` as the daemon's user; for another owner, add the checkout to safe.directory in that user's global git config); nothing was applied",
+			"%s is in a git repository, but git can't say where its git and hooks dirs are (%s), so writes into them can't be refused", dir, strings.SplitN(why, "\n", 2)[0])
+	}
+	lines = lines[len(lines)-2:] // a git without --path-format echoes it first
 	return abs(lines[0]), abs(lines[1]), nil
 }
 

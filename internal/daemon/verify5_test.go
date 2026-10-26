@@ -150,3 +150,34 @@ func TestVerify5ApprovalLostAfterGapsTakenIsRecorded(t *testing.T) {
 		t.Errorf("tkbox.gap for %s = %d after the approval record failed late, want 1: %v", tracekit.SourceApproval, n, e.run(0).Methods())
 	}
 }
+
+// R6 (verify5): a target dir that is no git repository still gets the hooks-dir check when the daemon user's global
+// core.hooksPath (the hooks every repository of that user runs) lies inside it.
+func TestVerify5GlobalHooksPathInNonGitTarget(t *testing.T) {
+	needGit(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	target, _ := filepath.EvalSymlinks(t.TempDir())
+	os.MkdirAll(filepath.Join(target, "hooks"), 0o755)
+	os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[core]\n\thooksPath = "+filepath.Join(target, "hooks")+"\n"), 0o644)
+	e := newTestEnv(t, nil)
+	e.guest.Patch = newFileSection("hooks/pre-commit", "evil") + newFileSection("notes.txt", "fine")
+	e.create(api.CreateBoxRequest{Name: "gh"})
+	e.d.Stop(context.Background(), "gh", api.StopRequest{})
+	res, err := e.d.Apply(context.Background(), "gh", api.ApplyRequest{Dir: target})
+	if err == nil || !strings.Contains(err.Error(), `writes "hooks/pre-commit", inside the checkout's git hooks dir`) {
+		t.Fatalf("a write into the global core.hooksPath: %+v %v", res, err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "notes.txt")); err == nil {
+		t.Fatal("part of a refused patch was written")
+	}
+	// without a hooksPath inside it, the same kind of target takes the patch
+	os.WriteFile(filepath.Join(home, ".gitconfig"), nil, 0o644)
+	e.guest.Patch = newFileSection("hooks/pre-commit", "fine")
+	e.create(api.CreateBoxRequest{Name: "gh2"})
+	e.d.Stop(context.Background(), "gh2", api.StopRequest{})
+	if res, err := e.d.Apply(context.Background(), "gh2", api.ApplyRequest{Dir: target}); err != nil {
+		t.Fatalf("apply to a plain dir: %+v %v", res, err)
+	}
+}

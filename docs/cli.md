@@ -306,7 +306,8 @@ files itself:
   is refused: what `DIR` ignores can't be checked.
 - Writes inside the checkout's git dir or hooks dir are refused. The hooks dir is the one git itself would use:
   `core.hooksPath` as the repo's, global and system config set it, passed to `git rev-parse --git-path hooks`. It is
-  compared without regard to case and by file identity. When `DIR` is in a git repository but git can't say where
+  compared without regard to case and by file identity. When `DIR` is in no git repository, a global or system
+  `core.hooksPath` inside it (the hooks every repository of the daemon's user runs) is refused the same way. When `DIR` is in a git repository but git can't say where
   those dirs are (it refuses the repository, for example for its owner), the apply is refused: `… is in a git
   repository, but git can't say where its git and hooks dirs are (…), so writes into them can't be refused`.
 - Changes to `.gitignore`, `.gitattributes`, `.gitmodules`, `tkbox.yaml`, `tkbox.yml`, `.envrc`,
