@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
+	"github.com/Cygnux-Labs/tracekit-box/internal/egress"
 )
 
 // L10: a per-exec env may not set anything that changes which program runs or what it loads.
@@ -24,5 +25,28 @@ func TestReview1ExecEnvDenyList(t *testing.T) {
 		if _, e2 := e.d.prepareExec("env", api.ExecRequest{Argv: []string{"ls"}, Env: map[string]string{k: "x"}}); e2 != nil {
 			t.Errorf("per-exec env %s refused: %v", k, e2)
 		}
+	}
+}
+
+// L2 (daemon part): inspect all with no allow entries and no secrets gives a CA that may impersonate nothing, never an
+// unconstrained one (egress.CAOptions reads nil hosts as unconstrained).
+func TestReview1CAHostsNeverUnconstrained(t *testing.T) {
+	hosts := caHosts(nil, []string{}, egress.InspectAll)
+	if hosts == nil || len(hosts) != 0 {
+		t.Fatalf("caHosts = %#v, want an empty non-nil list", hosts)
+	}
+	ca, err := egress.NewCAWith("tkb-test", egress.CAOptions{Hosts: hosts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []string{"evil.example", "8.8.8.8", "api.github.com"} {
+		if ca.Permits(h) {
+			t.Errorf("the CA of a box with nothing to inspect may impersonate %s", h)
+		}
+	}
+	// what it may impersonate is still exactly the bound and (inspect all) allowed hosts
+	got := caHosts([]egress.Secret{{Name: "T", Hosts: []string{"api.example.com"}}}, []string{"pypi.org", "h.example:8443"}, egress.InspectAll)
+	if strings.Join(got, ",") != "api.example.com,pypi.org,h.example" {
+		t.Fatalf("caHosts = %v", got)
 	}
 }

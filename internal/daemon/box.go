@@ -1168,10 +1168,11 @@ func (d *Daemon) Remove(ctx context.Context, ref string) error {
 }
 
 // caHosts are the hosts a box's CA may impersonate: the bound secrets' hosts and, with inspect all, the allowlist's
-// (ports dropped: name constraints have none).
+// (ports dropped: name constraints have none). Never nil: egress.CAOptions reads nil as "unconstrained", so a box
+// with nothing to impersonate (inspect all, no allow entries, no secrets) gets a CA that may impersonate nothing.
 func caHosts(secrets []egress.Secret, allow []string, inspect string) []string {
 	seen := map[string]bool{}
-	var out []string
+	out := []string{}
 	add := func(h string) {
 		if !seen[h] {
 			seen[h] = true
