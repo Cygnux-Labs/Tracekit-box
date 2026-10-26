@@ -300,8 +300,10 @@ func (b *builder) listWorkspace(ctx context.Context, src string) ([]string, erro
 	// git in the host checkout must run nothing the checkout's (or a global) config names: no pager, fsmonitor, hooks
 	// or external diff. The excludes file the system or global config names still applies, read first (as apply reads
 	// it) and passed back with -c, because it keeps files like .env out of the box.
+	// The operator's safe.directory values (system and global config) are passed back the same way, so a daemon user
+	// that does not own the checkout can still list it where the operator allowed that.
 	args := []string{"--no-pager"}
-	for _, c := range append(append([]string{}, HostGitConf...), "core.hooksPath=/dev/null") {
+	for _, c := range append(append(append([]string{}, HostGitConf...), "core.hooksPath=/dev/null"), SafeDirectoryConf(ctx, gitBin)...) {
 		args = append(args, "-c", c)
 	}
 	if ex := HostExcludesFile(ctx, gitBin, src); ex != "" {
@@ -346,7 +348,7 @@ func (b *builder) listWorkspace(ctx context.Context, src string) ([]string, erro
 		msg := strings.TrimSpace(stderr.String())
 		hint := ""
 		if strings.Contains(msg, "dubious ownership") {
-			hint = "; run tkbox as the user who owns the checkout, or add it to git's safe.directory"
+			hint = "; run tkbox as the user who owns the checkout, or add it to safe.directory in the daemon user's global git config (git config --global --add safe.directory " + src + ") or the system one"
 		}
 		return nil, fmt.Errorf("workspace: git ls-files in %s failed: %v: %s%s", src, werr, msg, hint)
 	}

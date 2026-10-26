@@ -62,3 +62,21 @@ func HostExcludesFile(ctx context.Context, gitBin, dir string) string {
 	}
 	return vals[len(vals)-1]
 }
+
+// SafeDirectoryConf is "safe.directory=V" for every value of the host's system and then global config (git honours
+// safe.directory only there and on the command line, never from a repository's own config, so only those scopes are
+// read). Passed back with -c, it keeps working for git commands that read no system or global config, so a daemon that
+// runs as another user than the checkout's owner works where the operator allowed it.
+func SafeDirectoryConf(ctx context.Context, gitBin string) []string {
+	var out []string
+	for _, scope := range []string{"--system", "--global"} {
+		for _, v := range GitConfigValues(ctx, gitBin, "/", scope, "safe.directory", false) {
+			out = append(out, "safe.directory="+v)
+		}
+	}
+	return out
+}
+
+// InGitWorkTree reports whether dir or one of its parents has a .git entry: git would treat dir as part of a
+// repository (whether or not it trusts it).
+func InGitWorkTree(dir string) bool { return inGitWorkTree(dir) }

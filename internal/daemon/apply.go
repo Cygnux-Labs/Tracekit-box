@@ -229,7 +229,11 @@ func (d *Daemon) Apply(ctx context.Context, ref string, req api.ApplyRequest) (a
 	if err != nil {
 		return api.ApplyResult{}, asAPIError(err)
 	}
-	gitDir, hooks := gitDirs(ctx, dir)
+	gitDir, hooks, err := gitDirs(ctx, dir)
+	if err != nil {
+		b.event(api.EventApplyDecided, "apply", "apply refused: "+err.Error(), map[string]any{"dir": dir})
+		return api.ApplyResult{}, err
+	}
 	for _, p := range paths {
 		if into := insideDir(realDir, p, hooks); into {
 			return refuse("the patch writes %q, inside the checkout's git hooks dir (%s)", p, hooks)
@@ -706,7 +710,10 @@ func hostGitEnv() []string { return image.HostGitEnv() }
 // the command needs from the global config, read with hostGitConfig, and core.hooksPath).
 func checkoutGit(ctx context.Context, dir string, conf []string, args ...string) *exec.Cmd {
 	a := []string{"--no-pager"}
-	for _, c := range append(append([]string{}, checkoutGitConf...), conf...) {
+	// the operator's safe.directory values (system and global config, read with image.SafeDirectoryConf) go back with
+	// -c: a daemon user that does not own the checkout works where the operator allowed it
+	pre := append(append([]string{}, checkoutGitConf...), image.SafeDirectoryConf(ctx, "git")...)
+	for _, c := range append(pre, conf...) {
 		a = append(a, "-c", c)
 	}
 	cmd := exec.CommandContext(ctx, "git", append(a, args...)...)
@@ -951,8 +958,10 @@ func checkIgnored(ctx context.Context, dir string, paths []string, wsWasGit bool
 // gitDirs are the checkout's git dir and hooks dir as git itself resolves them: `git rev-parse --absolute-git-dir
 // --git-path hooks` with core.hooksPath as the real config sets it (the repo's, global or system: read with
 // hostGitConfig and passed with -c, since checkoutGit reads no global or system config). Both are absolute,
-// symlinks resolved where they exist; "" when dir is not in a git repository.
-func gitDirs(ctx context.Context, dir string) (gitDir, hooks string) {
+// symlinks resolved where they exist; "" when dir is in no git repository (no .git in it or a parent). When dir is in
+// one but git can't say where those dirs are (it refuses the repository, e.g. for its owner), it fails closed: an
+// error, and the apply is refused, since writes into them could not be refused.
+func gitDirs(ctx context.Context, dir string) (gitDir, hooks string, err error) {
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	var conf []string
@@ -960,13 +969,20 @@ func gitDirs(ctx context.Context, dir string) (gitDir, hooks string) {
 		conf = []string{"core.hooksPath=" + hp}
 	}
 	cmd := checkoutGit(cctx, dir, conf, "rev-parse", "--path-format=absolute", "--absolute-git-dir", "--git-path", "hooks")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", ""
-	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, rerr := cmd.Output()
 	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
-	if len(lines) < 2 {
-		return "", ""
+	if rerr != nil || len(lines) < 2 {
+		if !image.InGitWorkTree(dir) {
+			return "", "", nil
+		}
+		why := strings.TrimSpace(stderr.String())
+		if why == "" && rerr != nil {
+			why = rerr.Error()
+		}
+		return "", "", errf(api.CodeConflict, "fix git there (`git status` as the daemon's user; for another owner, add the checkout to safe.directory in that user's global git config); nothing was applied",
+			"%s is in a git repository, but git can't say where its git and hooks dirs are (%s), so writes into them can't be refused", dir, strings.SplitN(why, "\n", 2)[0])
 	}
 	lines = lines[len(lines)-2:] // a git without --path-format echoes it first
 	abs := func(p string) string {
@@ -983,7 +999,7 @@ func gitDirs(ctx context.Context, dir string) (gitDir, hooks string) {
 		}
 		return resolveExisting(filepath.Clean(p))
 	}
-	return abs(lines[0]), abs(lines[1])
+	return abs(lines[0]), abs(lines[1]), nil
 }
 
 // resolveExisting resolves the symlinks of p's longest existing ancestor (p itself may not exist yet).

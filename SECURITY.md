@@ -71,7 +71,8 @@ With a signer the agent cannot reach, and within the limits below:
 
 - **v0 has no jailer.** Firecracker runs as the daemon's user with its default seccomp filter, but without the jailer's
   chroot, namespaces and cgroups. A guest that escapes Firecracker through a VMM or KVM bug would have the daemon's
-  user's privileges. Run the daemon as a dedicated unprivileged user on hosts that matter. The jailer is listed in
+  user's privileges. Run the daemon as a dedicated unprivileged user on hosts that matter (list the checkouts it may
+  read in that user's global `safe.directory`; see [docs/cli.md](docs/cli.md#tkbox-daemon)). The jailer is listed in
   [docs/limits.md](docs/limits.md#not-in-v0).
 - **Code the agent wrote runs wherever you run it.** `tkbox apply` writes the agent's changes to your checkout;
   building or testing them on the host runs them outside the box. Test them in a box, or in a CI job with no write

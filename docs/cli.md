@@ -87,7 +87,10 @@ written to disk. So after a restart:
 
 In both cases you can still review the saved patch (`<state dir>/boxes/<id>/diff.patch`) and apply it by hand. Run the
 daemon in the foreground under systemd as a dedicated user (stopped with SIGTERM, never SIGKILL), or in the background
-for a dev session.
+for a dev session. A dedicated user does not own your checkouts, so git refuses them ("dubious ownership") unless they
+are in `safe.directory` in that user's global git config or the system one (`git config --global --add
+safe.directory /path/to/checkout`, run as that user): Box reads those values (never a repository's own) and passes
+them to its contained git. Without that, a box can't be built from the checkout, and apply into it is refused.
 
 ## tkbox run
 
