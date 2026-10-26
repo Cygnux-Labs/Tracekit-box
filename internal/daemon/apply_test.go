@@ -54,7 +54,7 @@ func TestParsePatchAndCheckPaths(t *testing.T) {
 		"hunk hides hdr":  {"diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,2 +1,2 @@\n-a\ndiff --git a/../x b/../x\n", "inside a hunk"},
 		"binary no data":  {"diff --git a/b b/b\nBinary files a/b and b/b differ\n", "without its data"},
 		"deleted":         {"diff --git a/gone b/gone\ndeleted file mode 100644\nindex 1111111..0000000\n--- a/gone\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n", ""},
-		"binary ok":       {"diff --git a/b.bin b/b.bin\nnew file mode 100644\nindex 0000000..1111111\nGIT binary patch\nliteral 3\nKcmZ?wWME_f\n\nliteral 0\nHcmV?d00001\n\n", ""},
+		"binary ok":       {"diff --git a/b.bin b/b.bin\nnew file mode 100644\nindex 0000000..1111111\nGIT binary patch\nliteral 3\nLc-mrMWC9ET00#gB\n\nliteral 0\nHcmV?d00001\n\n", ""},
 		"commit message":  {"From abc Mon Sep 17 00:00:00 2001\nSubject: [PATCH] x\n\nbody text\n---\n a | 1 +\n" + modify("a") + "-- \n2.40.0\n", ""},
 	}
 	for name, c := range cases {
