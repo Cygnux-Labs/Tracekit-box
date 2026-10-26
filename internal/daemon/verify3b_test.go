@@ -8,8 +8,10 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
+	"github.com/Cygnux-Labs/tracekit-box/internal/egress"
 	"github.com/Cygnux-Labs/tracekit-box/internal/tracekit"
 )
 
@@ -77,6 +79,46 @@ func TestVerify3bTwoSectionsForOnePathRefused(t *testing.T) {
 		if r.Call.Tool == tracekit.ToolWrite {
 			t.Fatalf("a Write was decided: %+v", r)
 		}
+	}
+}
+
+// verify3b docs item 15, settled in code: an approval the signer can't record is a lost must-record observe like the
+// others: the waiting connection is refused, the box is stopped (fail closed) and the loss is in its tkbox.gap record.
+func TestVerify3bUnrecordedApprovalStopsTheBox(t *testing.T) {
+	e := newTestEnv(t, func(o *Options) { o.ApprovalTimeout = time.Minute })
+	fc := &flakyClient{Client: e.tk, failObserve: map[string]bool{tracekit.SourceApproval: true}}
+	e.d.opts.Tracekit = fc
+	e.create(api.CreateBoxRequest{Name: "ap"})
+	dec := e.proxy(0).cfg.Decider
+	got := make(chan egress.Verdict, 1)
+	go func() {
+		v, _ := dec.Decide(context.Background(), egress.Request{Host: "x.example", Port: 443, URL: "https://x.example:443"})
+		got <- v
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(e.d.Approvals()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	pend := e.d.Approvals()
+	if len(pend) != 1 {
+		t.Fatalf("approvals %+v", pend)
+	}
+	if _, err := e.d.DecideApproval(pend[0].ID, api.ApprovalDecision{Decision: "approve"}, 1000); errCode(err) != api.CodeUnavailable {
+		t.Fatalf("approving: %v", err)
+	}
+	if v := <-got; v.Allow {
+		t.Fatalf("the waiting connection was let through: %+v", v)
+	}
+	b := e.box("ap")
+	deadline = time.Now().Add(10 * time.Second)
+	for b.state() != api.StateStopped && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if st := b.state(); st != api.StateStopped {
+		t.Fatalf("the box is %s after an approval could not be recorded", st)
+	}
+	if n := gapsOf(e, 0, tracekit.SourceApproval); n != 1 {
+		t.Fatalf("tkbox.gap for %s = %d, want 1: %v", tracekit.SourceApproval, n, e.run(0).Methods())
 	}
 }
 

@@ -252,6 +252,16 @@ func (d *Daemon) finish(a *approval, state, by, scope string) bool {
 			b.approvedHosts[a.hostPort] = true
 			b.mu.Unlock()
 		}
+		if recErr != nil {
+			// a lost approval is a lost must-record observe like any other: counted in the box's tkbox.gap record, and
+			// the box is stopped (fail closed); the waiting connection is refused below
+			b.mu.Lock()
+			if o := b.obs; o != nil {
+				o.lost(tracekit.SourceApproval, "the signer refused it or did not answer: "+recErr.Error())
+			}
+			b.mu.Unlock()
+			b.failClosed(tracekit.SourceApproval, recErr)
+		}
 	} else {
 		b.observe(tracekit.SourceApproval, trustedObs, value)
 	}

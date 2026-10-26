@@ -58,7 +58,8 @@ Each box is one Tracekit run. Every door records into it.
 **Fail closed.** No signer, no daemon: `tkbox daemon` exits at start when no signer answers (unless you start it with
 `--unrecorded`, which warns and records nothing). A signer that stops answering refuses every later command,
 connection and file write. If Box cannot record an event it must keep (a secret use or leak, a model call, an
-approval, a containment or lifecycle event), it stops the box and records the loss in the run as `tkbox.gap`.
+approval, a containment or lifecycle event), it stops the box and records the loss in the run as `tkbox.gap`; an
+approval it cannot record also lets nothing through.
 
 The design, protocols and disks are in [docs/architecture.md](docs/architecture.md).
 

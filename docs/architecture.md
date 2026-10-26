@@ -46,8 +46,10 @@ Every door writes to the signer (one Tracekit run per box).
 
 Fail closed everywhere: no signer → no daemon (unless it runs with `--unrecorded`, which warns and records nothing); a
 signer that stops answering refuses every later decision. Observes Box must keep (secret use and leaks, model calls,
-Box approvals, containment) go through a queue of 4096 and are never dropped silently: if one cannot be queued or the
-signer refuses it, the box is stopped and the loss is recorded as observe `tkbox.gap {kind, dropped, reason}`, or, if
+Box rejections and expiries, containment) go through a queue of 4096 and are never dropped silently: if one cannot be
+queued or the signer refuses it, the box is stopped and the loss is recorded as observe `tkbox.gap {kind, dropped,
+reason}`. A Box approval that allows a connection is recorded synchronously, before the connection uses it; if the
+signer refuses it, the connection is refused, the box is stopped and the loss goes into `tkbox.gap` the same way, or, if
 even that fails, the run is closed with the loss as its reason. A `complete` the signer refuses or never answers is
 counted into `tkbox.gap` too, with kind `complete` (it does not stop the box). Lifecycle observes are sent synchronously, and a Box approval is
 recorded before any connection uses it. Box's own egress refusal observes are limited to 20 a second per
