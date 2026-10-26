@@ -45,6 +45,9 @@ const (
 	DefaultMaxBoxes        = 8
 	DefaultReadyTimeout    = 60 * time.Second
 	DefaultContainmentPoll = 2 * time.Second
+	// after DefaultContainmentFastFor a box's containment is checked every DefaultContainmentSlowPoll instead
+	DefaultContainmentFastFor  = time.Minute
+	DefaultContainmentSlowPoll = 15 * time.Second
 	shutdownTimeout        = 10 * time.Second
 	maxDiffBytes           = proto.DefaultMaxDiffBytes
 )
@@ -88,7 +91,9 @@ type Options struct {
 	EgressBlock []netip.Prefix
 	Now                 func() time.Time
 	ReadyTimeout        time.Duration // guest readiness (default 60s)
-	ContainmentPoll     time.Duration // default 2s
+	ContainmentPoll     time.Duration // default 2s, for the first ContainmentFastFor of a box
+	ContainmentFastFor  time.Duration // default 1m
+	ContainmentSlowPoll time.Duration // default 15s (never shorter than ContainmentPoll)
 	Logger              *log.Logger
 }
 
@@ -177,6 +182,12 @@ func New(opts Options) (*Daemon, error) {
 	}
 	if opts.ContainmentPoll <= 0 {
 		opts.ContainmentPoll = DefaultContainmentPoll
+	}
+	if opts.ContainmentFastFor <= 0 {
+		opts.ContainmentFastFor = DefaultContainmentFastFor
+	}
+	if opts.ContainmentSlowPoll <= 0 {
+		opts.ContainmentSlowPoll = DefaultContainmentSlowPoll
 	}
 	if opts.Logger == nil {
 		opts.Logger = log.New(os.Stderr, "tkbox: ", log.LstdFlags)

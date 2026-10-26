@@ -64,6 +64,7 @@ func (bd *boxDecider) Decide(ctx context.Context, req egress.Request) (egress.Ve
 		if err != nil {
 			return egress.Verdict{Reason: "the Tracekit signer did not answer, so nothing leaves the box (fail closed): " + err.Error()}, nil
 		}
+		b.pokeContainment(out.Decision)
 		if !out.Allowed {
 			msg, _ := denial(out)
 			return egress.Verdict{Reason: msg, RuleIDs: out.RuleIDs}, nil

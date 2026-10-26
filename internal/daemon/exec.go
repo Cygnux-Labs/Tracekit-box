@@ -424,6 +424,7 @@ func (b *box) runExec(parent context.Context, conn net.Conn, r io.Reader, w io.W
 			}
 			return
 		}
+		b.pokeContainment(out.Decision)
 		if !out.Allowed {
 			if dctx.Err() != nil {
 				cancelled() // Gate withdrew the approval

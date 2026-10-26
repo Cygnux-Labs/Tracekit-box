@@ -75,13 +75,14 @@ type box struct {
 	doneOnce sync.Once
 	seq      atomic.Uint64
 	pollNow  chan chan struct{} // tests: run one containment check now
+	poke     chan struct{}      // cap 1: a decision named an incident, check containment now
 	bootCfg  proto.BootConfig
 }
 
 func newBox(d *Daemon, info api.Box, dir string, cid uint32) *box {
 	b := &box{d: d, id: info.ID, dir: dir, cid: cid, info: info, approvedHosts: map[string]bool{},
 		sessions: map[*execSession]struct{}{}, events: openEventLog(dir), stopCh: make(chan struct{}),
-		done: make(chan struct{}), pollNow: make(chan chan struct{}), applySem: make(chan struct{}, 1)}
+		done: make(chan struct{}), pollNow: make(chan chan struct{}), poke: make(chan struct{}, 1), applySem: make(chan struct{}, 1)}
 	b.scrubP.Store(&scrubber{})
 	b.events.onHardCap = func() {
 		b.d.log.Printf("%s: events.ndjson reached its hard cap of %d MiB: stopping the box", b.id, b.events.hardMax>>20)
@@ -632,9 +633,32 @@ func (b *box) onTimeout() {
 	b.stop(context.Background(), fmt.Sprintf("timeout: the box reached its %s limit (raise it with --timeout)", time.Duration(t)), false)
 }
 
+// containmentInterval is how long the containment loop waits before its next check, elapsed after the box started:
+// ContainmentPoll for the first ContainmentFastFor, then ContainmentSlowPoll. Each check makes the signer read the
+// whole run, so a long, busy box is polled less often; a decision that opened an incident triggers a check at once
+// (pokeContainment).
+func (d *Daemon) containmentInterval(elapsed time.Duration) time.Duration {
+	if elapsed < d.opts.ContainmentFastFor {
+		return d.opts.ContainmentPoll
+	}
+	return max(d.opts.ContainmentSlowPoll, d.opts.ContainmentPoll)
+}
+
+// pokeContainment asks the containment loop for a check now (a decision named an incident). It never blocks.
+func (b *box) pokeContainment(dec tracekit.Decision) {
+	if dec.IncidentID == "" {
+		return
+	}
+	select {
+	case b.poke <- struct{}{}:
+	default: // a check is already due
+	}
+}
+
 // containmentLoop polls the signer's containment state: held pauses the VM, quarantined kills it.
 func (b *box) containmentLoop() {
-	t := time.NewTicker(b.d.opts.ContainmentPoll)
+	start := time.Now()
+	t := time.NewTimer(b.d.containmentInterval(0))
 	defer t.Stop()
 	for {
 		select {
@@ -642,10 +666,13 @@ func (b *box) containmentLoop() {
 			return
 		case <-t.C:
 			b.checkContainment()
+		case <-b.poke:
+			b.checkContainment()
 		case ack := <-b.pollNow:
 			b.checkContainment()
 			close(ack)
 		}
+		t.Reset(b.d.containmentInterval(time.Since(start)))
 	}
 }
 

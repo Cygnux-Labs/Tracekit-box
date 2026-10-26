@@ -112,6 +112,7 @@ type flakyClient struct {
 	mu           sync.Mutex
 	failComplete bool
 	failObserve  map[string]bool
+	contained    int // Contained calls
 }
 
 func (c *flakyClient) set(failComplete bool) { c.mu.Lock(); c.failComplete = failComplete; c.mu.Unlock() }
@@ -148,6 +149,15 @@ func (r *flakyRun) Observe(ctx context.Context, source, trust string, value any)
 	}
 	return r.Run.Observe(ctx, source, trust, value)
 }
+
+func (r *flakyRun) Contained(ctx context.Context) (tracekit.Containment, error) {
+	r.c.mu.Lock()
+	r.c.contained++
+	r.c.mu.Unlock()
+	return r.Run.Contained(ctx)
+}
+
+func (c *flakyClient) containedCalls() int { c.mu.Lock(); defer c.mu.Unlock(); return c.contained }
 
 // gapsOf sums the tkbox.gap records of kind in run i.
 func gapsOf(e *testEnv, i int, kind string) int {
@@ -272,6 +282,46 @@ func TestReview1UnrecordedApprovalAllowsNothing(t *testing.T) {
 	defer cancel()
 	if v, _ := dec.Decide(ctx, req); v.Allow {
 		t.Fatalf("a later connection was let through on the unrecorded approval: %+v", v)
+	}
+}
+
+// L11: containment is polled every ContainmentPoll (2s) for the first minute, then every ContainmentSlowPoll (15s),
+// and at once after a decision that named an incident.
+func TestReview1ContainmentPollBacksOff(t *testing.T) {
+	e0 := newTestEnv(t, func(o *Options) { o.ContainmentPoll = 0 })
+	for _, c := range []struct{ elapsed, want time.Duration }{{0, 2 * time.Second}, {59 * time.Second, 2 * time.Second},
+		{time.Minute, 15 * time.Second}, {3 * time.Hour, 15 * time.Second}} {
+		if got := e0.d.containmentInterval(c.elapsed); got != c.want {
+			t.Errorf("interval after %s = %s, want %s", c.elapsed, got, c.want)
+		}
+	}
+
+	e := newTestEnv(t, func(o *Options) {
+		o.ContainmentPoll, o.ContainmentFastFor, o.ContainmentSlowPoll = 20*time.Millisecond, 200*time.Millisecond, time.Hour
+	})
+	fc := &flakyClient{Client: e.tk}
+	e.d.opts.Tracekit = fc
+	e.create(api.CreateBoxRequest{Name: "cp"})
+	time.Sleep(400 * time.Millisecond)
+	fast := fc.containedCalls()
+	if fast < 3 {
+		t.Fatalf("%d containment checks in the first 200ms at a 20ms poll", fast)
+	}
+	time.Sleep(400 * time.Millisecond)
+	if slow := fc.containedCalls(); slow != fast {
+		t.Fatalf("containment still polled fast after ContainmentFastFor: %d checks, then %d", fast, slow)
+	}
+	e.tk.DecideFunc = func(c tracekit.Call) tracekit.Decision {
+		return tracekit.Decision{Decision: "deny", IncidentID: "inc-1", Reason: "held"}
+	}
+	sock := e.serve()
+	execStream(t, sock, "cp", api.ExecRequest{Argv: []string{"rm", "-rf", "/"}}, nil)
+	deadline := time.Now().Add(2 * time.Second)
+	for fc.containedCalls() == fast && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if fc.containedCalls() == fast {
+		t.Fatal("a decision that named an incident did not trigger a containment check")
 	}
 }
 
