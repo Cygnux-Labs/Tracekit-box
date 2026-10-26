@@ -44,12 +44,16 @@ are decided by the signer and recorded; the processes they start inside the box 
 A secret is bound to exact host names (no wildcards, no ports) and is swapped into one header, `Authorization` when
 `header` is empty.
 
-`apply` writes every file the signer allows, or nothing. A patch that changes files which steer the next run or host
-automation (`.gitignore`, `.gitattributes`, `.gitmodules`, `tkbox.yaml`, `tkbox.yml`, `.envrc`,
-`.pre-commit-config.yaml`, anything under `.husky/` or `.github/workflows/`) is refused with `BadRequest` unless you
-pass `allow_sensitive=True` after reading those changes. The result is the daemon's `ApplyResult`: `applied`, `denied`,
-`patch`, `checked`, `sensitive` (the applied paths of that kind), `ignored` (new files the checkout's `.gitignore`
-ignores, left out) and `sha256` (of the patch that was decided).
+`apply` writes nothing unless the signer allows every file; then it writes them one at a time, each atomically. A
+write that fails part way is not rolled back: the error (`Conflict`) names the files already written. A patch that
+changes files which steer the next run or host automation (`.gitignore`, `.gitattributes`, `.gitmodules`,
+`tkbox.yaml`, `tkbox.yml`, `.envrc`, `.pre-commit-config.yaml`, `.gitlab-ci.yml`, `.yarnrc*`, the lefthook files,
+anything under `.husky/`, `.github/workflows/`, `.github/actions/`, `.circleci/` or `.devcontainer/`,
+`.vscode/tasks.json`, `.cargo/config*`, and credential files such as `.npmrc` or `*.pem`; the full list is in
+docs/cli.md) is refused with `BadRequest` unless you pass `allow_sensitive=True` after reading those changes. The
+result is the daemon's `ApplyResult`: `applied`, `denied`, `patch`, `checked`, `sensitive` (the patch's paths of that
+kind, also on a check or a denied apply), `ignored` (new files the checkout's `.gitignore` ignores, left out) and
+`sha256` (of the patch that was decided).
 
 ## API
 
@@ -60,8 +64,8 @@ ignores, left out) and `sha256` (of the patch that was decided).
 | `list_boxes()`, `get_box(box)` | `GET /v1/boxes`, `GET /v1/boxes/{box}` |
 | `exec(box, argv, stdin=None, env=None, cwd=None, timeout=None, *, on_output=None, on_event=None)` | `POST /v1/boxes/{box}/exec`, upgraded to `tkbox-exec/1` |
 | `stop(box, *, kill=False, reason=None)`, `rm(box)` | `POST …/stop`, `DELETE /v1/boxes/{box}` |
-| `diff(box)` | `GET …/diff` → `Diff(patch, summary)`; the summary comes from the `X-Tkbox-Diff-Summary` header when it is at most 8 KiB, else from `GET …/diff/summary` |
-| `diff_summary(box)` | `GET …/diff/summary` → the summary (`files`, `bytes`) without the patch |
+| `diff(box)` | `GET …/diff` → `Diff(patch, summary)`; the summary comes from the `X-Tkbox-Diff-Summary` header when it is at most 8 KiB, else from `GET …/diff/summary`. Its `patch_sha256` must be the patch's sha256: for a running box the two are separate guest diffs, so on a mismatch both are read once more, then `Conflict` (`the workspace changed while the diff was read; run it again`) |
+| `diff_summary(box)` | `GET …/diff/summary` → the summary (`files`, `bytes`, `patch_sha256`) without the patch |
 | `apply(box, *, dir=None, check=False, allow_sensitive=False)` | `POST …/apply` |
 | `export(box, out)` | `POST …/export` |
 | `events(box, *, follow=False)` | `GET …/events` (a generator of dicts) |
@@ -79,12 +83,14 @@ such as an egress refusal or an approval to give with `tkbox approve <id>`.
 
 `stdin` as bytes or str of at most 1 MiB is sent in the request (`stdin_data`): the signer decides it with the command
 (its sha256 and size, and the text itself when it is UTF-8 of at most 4 KiB), and exactly that data is the process's
-stdin. Larger input and file objects are streamed, and the sha256 and size of what the process was given are recorded
+stdin. That text is signed verbatim, and only Box secrets are redacted from it: pass a credential that is not a Box
+secret as a file object (`stdin=io.BytesIO(password)`, for `docker login --password-stdin`), so it is streamed and only
+its sha256 is recorded. Larger input and file objects are streamed, and the sha256 and size of what the process was given are recorded
 with the outcome instead; the daemon holds at most 4 MiB the process has not read yet, and past that stops the process
-rather than hand it a false end of input (`stdin_truncated`, and `ok` is false). A per-command `env` may not set
-`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `BASH_ENV`, `ENV`, `PROMPT_COMMAND`, `PATH`, `NODE_OPTIONS`,
-`PYTHONPATH`, `PERL5OPT`, `RUBYOPT`, `JAVA_TOOL_OPTIONS`, `GCONV_PATH`, `GIT_CONFIG` or any `GIT_CONFIG_*` name, and no
-value may hold a secret's value (`BadRequest`). The exec stream has no client-side timeout: the daemon enforces the exec timeout
+rather than hand it a false end of input (`stdin_truncated`, and `ok` is false). A per-command `env` is decided as a
+leading `env K=V …` on the command line, and may not set names that change what runs (`LD_*`, `GIT_*`, `XDG_*`,
+`PYTHON*`, `NODE_*`, `PATH`, `HOME`, `SHELLOPTS`, `CLASSPATH`, … : the full list is in docs/limits.md); no value may
+hold a secret's value (`BadRequest`). The exec stream has no client-side timeout: the daemon enforces the exec timeout
 (default 30 minutes, 1s to 24h) and approval waits. Closing the connection (for example on `KeyboardInterrupt`) cancels
 the command if it has not started and stops it if it has.
 

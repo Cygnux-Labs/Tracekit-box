@@ -1,12 +1,15 @@
 package daemon
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +26,7 @@ type patchFile struct {
 	NewMode      string // "new file mode" / "new mode"
 	OldMode      string // "old mode" / "deleted file mode"
 	IndexMode    string // mode on the index line (unchanged mode)
+	NewFile      bool   // a "new file mode" line
 	Deleted      bool
 	Rename, Copy bool
 	Binary       bool
@@ -193,6 +197,14 @@ func parsePatch(patch string) ([]*patchFile, error) {
 				return nil, bad("%v", err)
 			}
 			if name == "/dev/null" {
+				// git reads /dev/null as "no file" only after "new file mode" (---) or "deleted file mode" (+++);
+				// otherwise it is a file named dev/null (a rename of x to it), not the deletion or creation it looks like
+				switch {
+				case ln[0] == '-' && !cur.NewFile:
+					return nil, bad("--- /dev/null without \"new file mode\" (git reads it as a file named dev/null); a box never makes such patches")
+				case ln[0] == '+' && !cur.Deleted:
+					return nil, bad("+++ /dev/null without \"deleted file mode\" (git reads it as a file named dev/null); a box never makes such patches")
+				}
 				if ln[0] == '-' {
 					cur.Old = ""
 				} else {
@@ -231,6 +243,7 @@ func parsePatch(patch string) ([]*patchFile, error) {
 			}
 		case strings.HasPrefix(ln, "new file mode "):
 			cur.NewMode = strings.TrimPrefix(ln, "new file mode ")
+			cur.NewFile = true
 			cur.Old = ""
 		case strings.HasPrefix(ln, "deleted file mode "):
 			cur.Deleted = true
@@ -453,6 +466,7 @@ func gitLike(c string) bool {
 func checkPatch(files []*patchFile, dir string) ([]string, []string) {
 	var problems []string
 	seen := map[string]bool{}
+	touched := map[string]bool{} // every path an earlier section wrote or read
 	var out []string
 	for _, f := range files {
 		for _, n := range f.Names {
@@ -476,6 +490,18 @@ func checkPatch(files []*patchFile, dir string) ([]string, []string) {
 		}
 		if f.Old != "" && !f.Copy {
 			targets = append(targets, f.Old)
+		}
+		// each path is in one section only: git applies sections in turn, so a second section for a path (a symlink
+		// created, then retargeted) would be judged here against the checkout, not against the first one's result
+		names := slices.Compact(slices.Sorted(slices.Values(append(append([]string{}, targets...), f.Old))))
+		for _, n := range names {
+			if n == "" {
+				continue
+			}
+			if touched[n] {
+				problems = append(problems, fmt.Sprintf("the patch has more than one section for %q; a box never makes such patches", n))
+			}
+			touched[n] = true
 		}
 		for _, t := range targets {
 			if err := checkParents(dir, t); err != nil {
@@ -572,9 +598,12 @@ func checkSymlink(f *patchFile, dir string) error {
 	return nil
 }
 
-// summarize is the host's own summary of a patch (the guest's is never trusted): one entry per file section.
+// summarize is the host's own summary of a patch (the guest's is never trusted): one entry per file section, and the
+// patch's sha256, so a client can tell whether a patch it holds is the one summarized (for a running box, the patch
+// and a summary read separately come from two guest diffs).
 func summarize(patch []byte) api.DiffSummary {
-	sum := api.DiffSummary{Files: []proto.DiffFile{}, Bytes: int64(len(patch))}
+	ps := sha256.Sum256(patch)
+	sum := api.DiffSummary{Files: []proto.DiffFile{}, Bytes: int64(len(patch)), PatchSHA256: hex.EncodeToString(ps[:])}
 	files, err := parsePatch(string(patch))
 	if err != nil {
 		return sum

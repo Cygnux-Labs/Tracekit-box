@@ -112,15 +112,28 @@ func TestApplyLeadsGitIsTheOracle(t *testing.T) {
 	if _, err := parsePatch(bad); err != nil {
 		t.Fatalf("the parser refuses the probe patch already: %v", err)
 	}
+	if err := oracle(t, bad, mustParse(t, bad)); err == nil || !strings.Contains(err.Error(), "does not read the patch cleanly") {
+		t.Fatalf("the oracle on a patch git reads as corrupt: %v", err)
+	}
+
+	// through apply, on a patch git applies cleanly but the parser (made to misread it) reads as another file: refused
+	// because the two disagree, before anything is decided or written. Without the oracle, b.txt would be decided and
+	// git's change to a.txt would never be.
 	e := newTestEnv(t, nil)
 	ws := t.TempDir()
 	gitInit(t, ws)
 	os.WriteFile(filepath.Join(ws, "a.txt"), []byte("old\n"), 0o644)
-	e.guest.Patch = bad
+	os.WriteFile(filepath.Join(ws, "b.txt"), []byte("old\n"), 0o644)
+	e.guest.Patch = modify("a.txt")
 	e.create(api.CreateBoxRequest{Name: "o", Workspace: ws})
 	e.d.Stop(context.Background(), "o", api.StopRequest{})
+	applyParsedHook = func(files []*patchFile) {
+		files[0].Old, files[0].New, files[0].Names = "b.txt", "b.txt", []string{"b.txt"}
+	}
 	_, err = e.d.Apply(context.Background(), "o", api.ApplyRequest{})
-	if errCode(err) != api.CodeBadRequest || !strings.Contains(err.Error(), "git reads the patch differently") {
+	applyParsedHook = nil
+	if errCode(err) != api.CodeBadRequest || !strings.Contains(err.Error(), "git reads the patch differently") ||
+		!strings.Contains(err.Error(), "git reads it as touching binary=false a.txt, tkbox as binary=false b.txt") {
 		t.Fatalf("a patch git reads differently: %v", err)
 	}
 	for _, r := range e.run(0).Records {
@@ -128,6 +141,18 @@ func TestApplyLeadsGitIsTheOracle(t *testing.T) {
 			t.Fatalf("a Write was decided for a patch git reads differently: %+v", r)
 		}
 	}
+	if readFile(t, filepath.Join(ws, "a.txt")) != "old\n" || readFile(t, filepath.Join(ws, "b.txt")) != "old\n" {
+		t.Fatal("written")
+	}
+}
+
+func mustParse(t *testing.T, p string) []*patchFile {
+	t.Helper()
+	files, err := parsePatch(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return files
 }
 
 // A3: a differential test over the guest's real patches (binary literals of every line length, text, new files,
@@ -332,6 +357,20 @@ func TestApplyLeadsCheckoutGitRunsNoProgram(t *testing.T) {
 
 	e.guest.Patch = modify("a.txt") +
 		"diff --git a/ignored-by-global.txt b/ignored-by-global.txt\nnew file mode 100644\n--- /dev/null\n+++ b/ignored-by-global.txt\n@@ -0,0 +1 @@\n+x\n"
+	// a positive control: the hostile config does run its program for a git without Box's overrides (fsmonitor on an
+	// index read), so the marker staying absent below means the overrides held. git 2.39 runs no program for the
+	// commands apply runs with the earlier, narrower flags either (they already turned fsmonitor off; a pager needs a
+	// tty, which a daemon's git never has), so this test guards the overrides, not a difference from those flags.
+	plain := exec.Command("git", "-C", ws, "check-ignore", "-q", "a.txt")
+	plain.Env = hostGitEnv()
+	plain.Run()
+	if ran, _ := filepath.Glob(evil + ".ran.*"); len(ran) == 0 {
+		t.Fatal("the hostile config ran nothing even for a git without Box's overrides: the marker check below would prove nothing")
+	}
+	ran, _ := filepath.Glob(evil + ".ran.*")
+	for _, m := range ran {
+		os.Remove(m)
+	}
 	calls() // drop the setup's own calls
 	e.create(api.CreateBoxRequest{Name: "hostile", Workspace: ws})
 	e.d.Stop(context.Background(), "hostile", api.StopRequest{})
@@ -375,7 +414,7 @@ func TestApplyLeadsCheckoutGitRunsNoProgram(t *testing.T) {
 			}
 		}
 		if sub == "config" {
-			if n := len(c.args); n < 2 || c.args[n-2] != "--get" || (c.args[n-1] != "core.excludesFile" && c.args[n-1] != "core.hooksPath") {
+			if n := len(c.args); n < 2 || c.args[n-2] != "--get-all" || (c.args[n-1] != "core.excludesFile" && c.args[n-1] != "core.hooksPath") {
 				t.Errorf("unexpected git config read in the checkout: %v", c.args)
 			}
 			continue // reading config is the one call that sees the global config: it runs nothing

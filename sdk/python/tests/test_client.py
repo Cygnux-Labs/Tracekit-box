@@ -265,6 +265,18 @@ def test_diff_with_a_huge_summary(client, box, daemon):
     assert client.diff_summary("demo")["files"] == d.files
 
 
+def test_diff_summary_must_be_of_the_patch(client, box, daemon):
+    # a running box's large summary is a second guest diff: one of another patch is read again, then refused
+    daemon.huge_diff = 3000
+    daemon.summary_of = [b"another patch"]
+    d = client.diff("demo")
+    assert daemon.summary_calls == 2 and len(d.files) == 3000
+    daemon.summary_of = [b"another patch", b"yet another"]
+    with pytest.raises(Conflict) as ei:
+        client.diff("demo")
+    assert "the workspace changed while the diff was read" in str(ei.value)
+
+
 def test_stop_diff_apply_export_rm(client, box, tmp_path):
     assert client.stop("demo", reason="done")["state"] == "stopped"
     d = client.diff("demo")

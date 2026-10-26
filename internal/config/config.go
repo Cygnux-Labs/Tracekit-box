@@ -584,6 +584,11 @@ func ParseSecretFlag(s string) (string, Secret, error) {
 	if !secretNameRE.MatchString(name) {
 		return bad("NAME must be upper case, digits and _")
 	}
+	// the source is checked first: anything else after NAME= may be a pasted value, and no part of it (not even the
+	// text after its last @, read as hosts) may reach an error
+	if !strings.HasPrefix(rest, "env:") && !strings.HasPrefix(rest, "file:") {
+		return bad("the source must start with env: or file: (values are never given on the command line)")
+	}
 	at := strings.LastIndex(rest, "@")
 	if at < 0 {
 		return bad("missing @hosts: name the hosts the secret may be sent to")

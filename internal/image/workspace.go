@@ -298,11 +298,15 @@ func (b *builder) listWorkspace(ctx context.Context, src string) ([]string, erro
 	}
 	var stderr capBuffer
 	// git in the host checkout must run nothing the checkout's (or a global) config names: no pager, fsmonitor, hooks
-	// or external diff. The user's global excludes file still applies, read first and passed back with -c, because it
-	// keeps files like .env out of the box.
-	args := []string{"--no-pager", "-c", "core.fsmonitor=false", "-c", "core.pager=cat", "-c", "diff.external=",
-		"-c", "core.untrackedCache=false", "-c", "core.hooksPath=/dev/null"}
-	if ex := gitConfigPath(ctx, gitBin, src, "core.excludesFile"); ex != "" {
+	// or external diff. The excludes file the system or global config names still applies, read first (as apply reads
+	// it) and passed back with -c, because it keeps files like .env out of the box.
+	// The operator's safe.directory values (system and global config) are passed back the same way, so a daemon user
+	// that does not own the checkout can still list it where the operator allowed that.
+	args := []string{"--no-pager"}
+	for _, c := range append(append(append([]string{}, HostGitConf...), "core.hooksPath=/dev/null"), SafeDirectoryConf(ctx, gitBin)...) {
+		args = append(args, "-c", c)
+	}
+	if ex := HostExcludesFile(ctx, gitBin, src); ex != "" {
 		args = append(args, "-c", "core.excludesFile="+ex)
 	}
 	cmd := exec.CommandContext(ctx, gitBin, append(args, "-C", src, "ls-files", "-z", "-co", "--exclude-standard")...)
@@ -344,7 +348,7 @@ func (b *builder) listWorkspace(ctx context.Context, src string) ([]string, erro
 		msg := strings.TrimSpace(stderr.String())
 		hint := ""
 		if strings.Contains(msg, "dubious ownership") {
-			hint = "; run tkbox as the user who owns the checkout, or add it to git's safe.directory"
+			hint = "; run tkbox as the user who owns the checkout, or add it to safe.directory in the daemon user's global git config (git config --global --add safe.directory " + src + ") or the system one"
 		}
 		return nil, fmt.Errorf("workspace: git ls-files in %s failed: %v: %s%s", src, werr, msg, hint)
 	}
@@ -365,19 +369,6 @@ func checkoutGitEnv() []string {
 	}
 	return append(env, "LC_ALL=C", "GIT_OPTIONAL_LOCKS=0", "GIT_PAGER=cat", "PAGER=cat", "GIT_CONFIG_NOSYSTEM=1",
 		"GIT_ATTR_NOSYSTEM=1")
-}
-
-// gitConfigPath reads one path-valued key (with the user's global config, which only this read sees; it runs
-// nothing). "" when unset.
-func gitConfigPath(ctx context.Context, gitBin, dir, key string) string {
-	cmd := exec.CommandContext(ctx, gitBin, "--no-pager", "-c", "core.fsmonitor=false", "-C", dir, "config",
-		"--type=path", "--get", key)
-	cmd.Env = checkoutGitEnv()
-	out, err := cmd.Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
 }
 
 func splitNUL(data []byte, atEOF bool) (int, []byte, error) {

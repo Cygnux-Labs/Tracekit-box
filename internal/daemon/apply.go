@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
+	"github.com/Cygnux-Labs/tracekit-box/internal/image"
 	"github.com/Cygnux-Labs/tracekit-box/internal/tracekit"
 )
 
@@ -99,8 +100,9 @@ type gatedWrite struct {
 // no change to a git-ignored file), leaves out new files the checkout ignores, refuses files that steer the next run
 // or host automation unless AllowSensitive, and works out every file's new content in a scratch copy. Then it asks
 // the signer about every file (Write, with the file's new sha256, mode, symlink status and the patch's sha256) and
-// only if all are allowed runs `git apply --binary` in the checkout, with git's own config, hooks and filters kept
-// out. Check validates and decides but writes nothing.
+// only if all are allowed writes the decided results into the checkout itself, one file at a time (git apply runs only
+// in the scratch copy; a write that fails part way is not rolled back, and the written paths are recorded). Check
+// validates and decides but writes nothing.
 func (d *Daemon) Apply(ctx context.Context, ref string, req api.ApplyRequest) (api.ApplyResult, error) {
 	b, err := d.lookup(ref)
 	if err != nil {
@@ -182,6 +184,9 @@ func (d *Daemon) Apply(ctx context.Context, ref string, req api.ApplyRequest) (a
 	if err != nil {
 		return refuse("unsafe or unreadable patch: %v", err)
 	}
+	if applyParsedHook != nil {
+		applyParsedHook(files)
+	}
 	for _, f := range files {
 		if f.Copy || f.Rename {
 			return refuse("the patch copies or renames %q; a box never makes such patches, so it is refused", f.New)
@@ -228,7 +233,11 @@ func (d *Daemon) Apply(ctx context.Context, ref string, req api.ApplyRequest) (a
 	if err != nil {
 		return api.ApplyResult{}, asAPIError(err)
 	}
-	gitDir, hooks := gitDirs(ctx, dir)
+	gitDir, hooks, err := gitDirs(ctx, dir)
+	if err != nil {
+		b.event(api.EventApplyDecided, "apply", "apply refused: "+err.Error(), map[string]any{"dir": dir})
+		return api.ApplyResult{}, err
+	}
 	for _, p := range paths {
 		if into := insideDir(realDir, p, hooks); into {
 			return refuse("the patch writes %q, inside the checkout's git hooks dir (%s)", p, hooks)
@@ -464,6 +473,9 @@ func statFile(p string) (fileState, error) {
 // applyScratchHook, when set (tests), runs on the scratch copy after the decisions and before anything is written.
 var applyScratchHook func(scratch string)
 
+// applyParsedHook, when set (tests), may change the parser's reading of the patch: a parser that misreads it.
+var applyParsedHook func(files []*patchFile)
+
 // preview is a patch applied in a scratch copy of the files it touches: what each path will be (want), what it was
 // in the checkout when it was copied (before), and the scratch dir holding the result (the caller removes it).
 type preview struct {
@@ -691,30 +703,38 @@ func copyEntry(src, dst string) error {
 	return fmt.Errorf("%s is neither a file nor a symlink", src)
 }
 
-// checkoutGitConf are the -c settings of every git command apply runs: no fsmonitor (a hook program or a daemon), no
-// pager, no external diff and no untracked cache (an index write). Command-line settings beat every config file, the
-// checkout's own .git/config and whatever it includes among them.
-var checkoutGitConf = []string{"core.fsmonitor=false", "core.pager=cat", "diff.external=", "core.untrackedCache=false"}
+// checkoutGitConf are the -c settings of every git command apply runs (image.HostGitConf, shared with the workspace
+// build): no fsmonitor, no pager, no external diff and no untracked cache.
+var checkoutGitConf = image.HostGitConf
 
-// hostGitEnv is the env of a git command in the operator's checkout: the caller's without GIT_* (no GIT_DIR,
-// GIT_EXTERNAL_DIFF, GIT_CONFIG_*) or PAGER, never prompting, paging or taking optional locks.
-func hostGitEnv() []string {
-	env := []string{}
-	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "GIT_") && !strings.HasPrefix(kv, "PAGER=") {
-			env = append(env, kv)
-		}
+// hostGitEnv is the env of a git command in the operator's checkout (image.HostGitEnv): the caller's without GIT_* or
+// PAGER, never prompting, paging or taking optional locks.
+func hostGitEnv() []string { return image.HostGitEnv() }
+
+// scratchGit is a git command for apply's scratch work (its empty git dir, the scratch copy, the oracle's empty work
+// tree): checkoutGit with HOME and XDG_CONFIG_HOME pointed at an empty dir under scratch and core.attributesFile at
+// /dev/null, so no user git file (~/.config/git/attributes, ignore, config) changes what it reads or writes.
+func scratchGit(ctx context.Context, scratch, dir string, conf []string, args ...string) (*exec.Cmd, error) {
+	home := filepath.Join(scratch, ".apply-home")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		return nil, err
 	}
-	return append(env, "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C", "GIT_PAGER=cat", "PAGER=cat")
+	cmd := checkoutGit(ctx, dir, append([]string{"core.attributesFile=/dev/null"}, conf...), args...)
+	cmd.Env = append(cmd.Env, "HOME="+home, "XDG_CONFIG_HOME="+filepath.Join(home, ".config"))
+	return cmd, nil
 }
 
 // checkoutGit is a git command run in the operator's real checkout dir, made unable to run a program there:
-// hostGitEnv, no global or system config or attributes (the only config read is the checkout's own, and
+// hostGitEnv, no global or system config and no system attributes (the only config read is the checkout's own, and
 // checkoutGitConf overrides everything in it that names a program), --no-pager, and conf as more -c settings (what
-// the command needs from the global config, read with hostGitConfig, and core.hooksPath).
+// the command needs from the global config, read with hostGitConfig, and core.hooksPath). It still reads the user's
+// $XDG_CONFIG_HOME/git/ignore, as the workspace build does; scratch work uses scratchGit instead.
 func checkoutGit(ctx context.Context, dir string, conf []string, args ...string) *exec.Cmd {
 	a := []string{"--no-pager"}
-	for _, c := range append(append([]string{}, checkoutGitConf...), conf...) {
+	// the operator's safe.directory values (system and global config, read with image.SafeDirectoryConf) go back with
+	// -c: a daemon user that does not own the checkout works where the operator allowed it
+	pre := append(append([]string{}, checkoutGitConf...), image.SafeDirectoryConf(ctx, "git")...)
+	for _, c := range append(pre, conf...) {
 		a = append(a, "-c", c)
 	}
 	cmd := exec.CommandContext(ctx, "git", append(a, args...)...)
@@ -724,21 +744,14 @@ func checkoutGit(ctx context.Context, dir string, conf []string, args ...string)
 }
 
 // hostGitConfig reads one path setting as git resolves it in dir from every config file (system, global, the
-// checkout's own): `git config --type=path --get key`, "" when unset. Reading config runs no program; the value is
-// passed on with -c, so the commands that use it still read no global or system config.
+// checkout's own; image.GitConfigValues, the read the workspace build uses too), "" when unset. Reading config runs no
+// program; the value is passed on with -c, so the commands that use it still read no global or system config.
 func hostGitConfig(ctx context.Context, dir, key string) string {
-	a := []string{"--no-pager"}
-	for _, c := range checkoutGitConf {
-		a = append(a, "-c", c)
-	}
-	cmd := exec.CommandContext(ctx, "git", append(a, "config", "--type=path", "--get", key)...)
-	cmd.Dir = dir
-	cmd.Env = hostGitEnv()
-	out, err := cmd.Output()
-	if err != nil {
+	vals := image.GitConfigValues(ctx, "git", dir, "", key, true)
+	if len(vals) == 0 {
 		return ""
 	}
-	return strings.TrimRight(string(out), "\n")
+	return vals[len(vals)-1]
 }
 
 // gitAgrees asks git itself what the patch touches (`git apply --numstat -z` and `--summary -z`, with an empty git
@@ -759,11 +772,14 @@ func gitAgrees(ctx context.Context, scratch, patchPath string, files []*patchFil
 	}
 	defer os.RemoveAll(work)
 	gitSays := func(args ...string) (string, error) {
-		cmd := checkoutGit(actx, work, []string{"core.hooksPath=/dev/null", "core.bare=false"},
+		cmd, err := scratchGit(actx, scratch, work, []string{"core.hooksPath=/dev/null", "core.bare=false"},
 			append([]string{"--git-dir=" + gitDir, "--work-tree=" + work, "apply"}, args...)...)
+		if err != nil {
+			return "", err
+		}
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
-		err := cmd.Run()
+		err = cmd.Run()
 		if msg := strings.TrimSpace(stderr.String()); err != nil || msg != "" {
 			if msg == "" {
 				msg = err.Error()
@@ -887,7 +903,12 @@ func scratchGitDir(ctx context.Context, scratch string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if out, err := checkoutGit(ctx, scratch, []string{"core.hooksPath=/dev/null"}, "init", "-q", "--bare", "--template=", gitDir).CombinedOutput(); err != nil {
+	cmd, err := scratchGit(ctx, scratch, scratch, []string{"core.hooksPath=/dev/null"}, "init", "-q", "--bare", "--template=", gitDir)
+	if err != nil {
+		os.RemoveAll(gitDir)
+		return "", err
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
 		os.RemoveAll(gitDir)
 		return "", fmt.Errorf("git init: %v %s", err, strings.TrimSpace(string(out)))
 	}
@@ -895,8 +916,9 @@ func scratchGitDir(ctx context.Context, scratch string) (string, error) {
 }
 
 // gitApply runs git apply --binary (never --unsafe-paths) on the work tree dir with a fresh, empty git dir made in
-// scratch: neither the checkout's .git/config (filters, hooksPath, fsmonitor) nor the global or system config is
-// read, so no filter driver, hook or other host program runs.
+// scratch: neither the checkout's .git/config (filters, hooksPath, fsmonitor) nor the global or system config nor
+// the user's git attributes (scratchGit) are read, so no filter driver, hook or other host program runs and no
+// conversion changes the bytes.
 func gitApply(ctx context.Context, dir, scratch, patchPath string) (string, error) {
 	actx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
@@ -905,8 +927,11 @@ func gitApply(ctx context.Context, dir, scratch, patchPath string) (string, erro
 		return err.Error(), err
 	}
 	defer os.RemoveAll(gitDir)
-	cmd := checkoutGit(actx, dir, []string{"core.hooksPath=/dev/null", "core.bare=false"},
+	cmd, err := scratchGit(actx, scratch, dir, []string{"core.hooksPath=/dev/null", "core.bare=false"},
 		"--git-dir="+gitDir, "--work-tree="+dir, "apply", "--binary", "--whitespace=nowarn", patchPath)
+	if err != nil {
+		return err.Error(), err
+	}
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
@@ -966,8 +991,10 @@ func checkIgnored(ctx context.Context, dir string, paths []string, wsWasGit bool
 // gitDirs are the checkout's git dir and hooks dir as git itself resolves them: `git rev-parse --absolute-git-dir
 // --git-path hooks` with core.hooksPath as the real config sets it (the repo's, global or system: read with
 // hostGitConfig and passed with -c, since checkoutGit reads no global or system config). Both are absolute,
-// symlinks resolved where they exist; "" when dir is not in a git repository.
-func gitDirs(ctx context.Context, dir string) (gitDir, hooks string) {
+// symlinks resolved where they exist; "" when dir is in no git repository (no .git in it or a parent). When dir is in
+// one but git can't say where those dirs are (it refuses the repository, e.g. for its owner), it fails closed: an
+// error, and the apply is refused, since writes into them could not be refused.
+func gitDirs(ctx context.Context, dir string) (gitDir, hooks string, err error) {
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	var conf []string
@@ -975,13 +1002,20 @@ func gitDirs(ctx context.Context, dir string) (gitDir, hooks string) {
 		conf = []string{"core.hooksPath=" + hp}
 	}
 	cmd := checkoutGit(cctx, dir, conf, "rev-parse", "--path-format=absolute", "--absolute-git-dir", "--git-path", "hooks")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", ""
-	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, rerr := cmd.Output()
 	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
-	if len(lines) < 2 {
-		return "", ""
+	if rerr != nil || len(lines) < 2 {
+		if !image.InGitWorkTree(dir) {
+			return "", "", nil
+		}
+		why := strings.TrimSpace(stderr.String())
+		if why == "" && rerr != nil {
+			why = rerr.Error()
+		}
+		return "", "", errf(api.CodeConflict, "fix git there (`git status` as the daemon's user; for another owner, add the checkout to safe.directory in that user's global git config); nothing was applied",
+			"%s is in a git repository, but git can't say where its git and hooks dirs are (%s), so writes into them can't be refused", dir, strings.SplitN(why, "\n", 2)[0])
 	}
 	lines = lines[len(lines)-2:] // a git without --path-format echoes it first
 	abs := func(p string) string {
@@ -998,7 +1032,7 @@ func gitDirs(ctx context.Context, dir string) (gitDir, hooks string) {
 		}
 		return resolveExisting(filepath.Clean(p))
 	}
-	return abs(lines[0]), abs(lines[1])
+	return abs(lines[0]), abs(lines[1]), nil
 }
 
 // resolveExisting resolves the symlinks of p's longest existing ancestor (p itself may not exist yet).

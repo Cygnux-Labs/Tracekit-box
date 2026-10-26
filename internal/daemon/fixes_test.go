@@ -463,7 +463,7 @@ func TestBashArgsCoverEverythingThatRuns(t *testing.T) {
 		}
 	}
 	env, _ := args["env"].(map[string]any)
-	if args["command"] != "env" || args["cwd"] != "/workspace/sub" || args["stdin"] != false || env["X"] != "1" ||
+	if args["command"] != "env 'T=tkbox_TOK_…' X=1 env" || args["cwd"] != "/workspace/sub" || args["stdin"] != false || env["X"] != "1" ||
 		env["T"] != "tkbox_TOK_…" {
 		t.Fatalf("bash args %v", args)
 	}

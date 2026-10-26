@@ -127,6 +127,9 @@ func CheckExcludeDirs(names []string) error {
 type DiffSummary struct {
 	Files []DiffFile `json:"files"`
 	Bytes int64      `json:"bytes"` // size of the patch that follows
+	// PatchSHA256 is the hex sha256 of the patch this summary describes (set by the host's summary, never the
+	// guest's): a client holding a patch from another request checks it is the one summarized.
+	PatchSHA256 string `json:"patch_sha256,omitempty"`
 }
 
 type DiffFile struct {

@@ -39,7 +39,7 @@ func TestReview1ExecEnvDenyList(t *testing.T) {
 			t.Errorf("per-exec env %s: %v", k, e2)
 		}
 	}
-	for _, k := range []string{"HOME", "LANG", "GIT_AUTHOR_NAME", "MY_PATH", "NODE_ENV"} {
+	for _, k := range []string{"LANG", "GIT_AUTHOR_NAME", "MY_PATH", "NODE_ENV"} { // HOME is refused since verify3
 		if _, e2 := e.d.prepareExec("env", api.ExecRequest{Argv: []string{"ls"}, Env: map[string]string{k: "x"}}); e2 != nil {
 			t.Errorf("per-exec env %s refused: %v", k, e2)
 		}

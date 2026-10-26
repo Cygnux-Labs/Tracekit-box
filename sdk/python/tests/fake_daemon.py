@@ -19,6 +19,7 @@ Exec behaviour is scripted by argv[0]:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import shutil
@@ -74,6 +75,8 @@ class FakeDaemon:
         self.signer_ok = True
         self.max_boxes = 8
         self.huge_diff = 0  # files in the diff summary; set: a summary too large for a header
+        self.summary_of: List[bytes] = []  # each /diff/summary describes the next of these patches instead of PATCH
+        self.summary_calls = 0
         # what the fake's apply reports: paths of the patch that steer host automation, and ignored new files
         self.sensitive: List[str] = []
         self.ignored: List[str] = []
@@ -259,10 +262,17 @@ class FakeDaemon:
                 if self.huge_diff:  # thousands of long paths: too large for a header, like the real daemon's
                     summary = {"files": [{"path": "d/" + "x" * 180 + f"/f{i:05d}.txt", "status": "added"}
                                          for i in range(self.huge_diff)], "bytes": len(PATCH)}
+                patch_sha = hashlib.sha256(PATCH.encode() if isinstance(PATCH, str) else PATCH).hexdigest()
+                summary["patch_sha256"] = patch_sha
                 if sub == ["diff", "summary"]:
+                    with self.lock:
+                        self.summary_calls += 1
+                        if self.summary_of:  # a running box whose workspace changed: a summary of another patch
+                            summary["patch_sha256"] = hashlib.sha256(self.summary_of.pop(0)).hexdigest()
                     return self._respond(conn, 200, summary)
                 js = json.dumps(summary)
                 hdrs = {"X-Tkbox-Diff-Summary": js} if len(js) <= 8192 else {"X-Tkbox-Diff-Summary-Omitted": "1"}
+                hdrs["X-Tkbox-Diff-Sha256"] = patch_sha
                 return self._respond(conn, 200, PATCH, headers=hdrs, chunked=True, content_type="text/x-diff")
             if sub == ["apply"] and method == "POST":
                 p = payload or {}

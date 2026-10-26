@@ -56,13 +56,19 @@ func TestRereviewPatchOldNewDiffer(t *testing.T) {
 	if _, problems := checkPatch(files, dir); len(problems) == 0 || !strings.Contains(strings.Join(problems, "; "), "without a rename or copy header") {
 		t.Fatalf("problems %v", problems)
 	}
-	// a deletion without "deleted file mode" still deletes: its path is a target
-	files, err = parsePatch("diff --git a/x b/x\nindex 1111111..0000000\n--- a/x\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n")
+	// "+++ /dev/null" without "deleted file mode" is not a deletion to git: it reads a file named dev/null (a rename of
+	// x to it). The parser refuses it (fuzz F1) rather than read a deletion of x
+	if _, err = parsePatch("diff --git a/x b/x\nindex 1111111..0000000\n--- a/x\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n"); err == nil ||
+		!strings.Contains(err.Error(), "without \"deleted file mode\"") {
+		t.Fatalf("+++ /dev/null without its header: %v", err)
+	}
+	// with its header it is a deletion: its path is a target
+	files, err = parsePatch("diff --git a/x b/x\ndeleted file mode 100644\nindex 1111111..0000000\n--- a/x\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if paths, problems := checkPatch(files, dir); len(problems) != 0 || !slices.Equal(paths, []string{"x"}) {
-		t.Fatalf("deletion without its header: paths %v problems %v", paths, problems)
+		t.Fatalf("deletion: paths %v problems %v", paths, problems)
 	}
 
 	// end to end: nothing is applied and .gitignore stays

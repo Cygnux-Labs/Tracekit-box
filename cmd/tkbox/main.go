@@ -183,7 +183,7 @@ func sanitize(s string) string {
 			b.WriteRune(r)
 		case r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0):
 			fmt.Fprintf(&b, "\\x%02x", r)
-		case r == '‪' || r == '‫' || r == '‬' || r == '‭' || r == '‮' || (r >= '⁦' && r <= '⁩'):
+		case r == '\u202a' || r == '\u202b' || r == '\u202c' || r == '\u202d' || r == '\u202e' || (r >= '\u2066' && r <= '\u2069'):
 			fmt.Fprintf(&b, "\\u%04x", r) // bidi overrides reorder what the reviewer reads
 		default:
 			b.WriteRune(r)
