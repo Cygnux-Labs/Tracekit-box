@@ -322,9 +322,10 @@ files itself:
   git writes on stderr, refuses the patch: `git reads the patch differently than tkbox does, so it is refused: …`.
 - The result is built in a scratch copy of the files the patch touches, outside the checkout, by `git apply --binary`
   with a fresh, empty bare git dir, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_ATTR_NOSYSTEM=1`,
-  `HOME` and `XDG_CONFIG_HOME` pointed at an empty dir and `core.attributesFile=/dev/null` (no filter drivers, hooks,
-  LFS or attribute conversions such as `eol=crlf`). A patch that does not apply there is refused: `the patch does not
-  apply to <dir>: …`.
+  `HOME` and `XDG_CONFIG_HOME` pointed at an empty dir and `core.attributesFile=/dev/null` (no filter drivers, hooks or
+  LFS). The checkout's own `.gitattributes` is in the scratch copy only when the patch changes it (which needs
+  `--allow-sensitive`); then git's built-in conversions it names, such as `eol=crlf`, apply, and the signer decides the
+  converted bytes. A patch that does not apply there is refused: `the patch does not apply to <dir>: …`.
 - The signer decides every file as a `Write` with the arguments `{file_path, sha256, mode, symlink, deleted,
   patch_sha256}` (plus `sensitive: true` for the files above) before anything is written. If the signer denies any
   file, nothing is applied and the denied paths are listed (`tkbox: denied by the signer: <path>`). If the signer holds
