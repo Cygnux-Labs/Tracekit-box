@@ -2,11 +2,13 @@ package vmm
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -100,6 +102,10 @@ func TestLifecycle(t *testing.T) {
 	}
 	if err := m.Start(ctxT(t, time.Second)); err == nil {
 		t.Fatal("second Start succeeded")
+	}
+	// Firecracker keeps its default seccomp filter (SECURITY.md): no --no-seccomp, no --seccomp-filter of our own
+	if args, _ := os.ReadFile(filepath.Join(spec.StateDir, "args.log")); !regexp.MustCompile(`^--api-sock \S+\.sock --id fake-ok$`).Match(bytes.ReplaceAll(args, []byte("\n"), []byte(" "))) {
+		t.Fatalf("firecracker started with %q, want only --api-sock and --id", args)
 	}
 
 	// guest → host

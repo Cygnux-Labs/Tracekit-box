@@ -24,14 +24,24 @@ import (
 //	fake-crash   exits 3 right after InstanceStart
 //	fake-spam    like fake-ok, and writes 100 KiB to stdout on InstanceStart
 //
-// Every request is appended to requests.log in the working directory (the state dir).
+// Every request is appended to requests.log in the working directory (the state dir), and every argument the
+// launcher passed, one per line, is in args.log there.
 func init() {
 	if len(os.Args) > 1 && os.Args[1] == "--version" {
 		fmt.Println("Firecracker v1.17.0")
 		os.Exit(0)
 	}
-	if len(os.Args) == 5 && os.Args[1] == "--api-sock" && os.Args[3] == "--id" {
-		fakeFirecracker(os.Args[2], os.Args[4])
+	after := func(flag string) string {
+		for i, a := range os.Args[1 : len(os.Args)-1] {
+			if a == flag {
+				return os.Args[i+2]
+			}
+		}
+		return ""
+	}
+	if sock, id := after("--api-sock"), after("--id"); sock != "" && id != "" {
+		os.WriteFile("args.log", []byte(strings.Join(os.Args[1:], "\n")), 0o600)
+		fakeFirecracker(sock, id)
 		os.Exit(0)
 	}
 }

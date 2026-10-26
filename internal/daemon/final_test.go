@@ -33,3 +33,55 @@ func TestFinalSecretInWorkspaceRefusesBox(t *testing.T) {
 		t.Fatal("a VM was started")
 	}
 }
+
+// L8 (final check): the sensitive names SECURITY.md lists, which only `--allow-sensitive` applies, at any depth.
+func TestFinalSensitiveNames(t *testing.T) {
+	for _, p := range []string{".gitattributes", ".gitmodules", "tkbox.yaml", "tkbox.yml", ".envrc", ".pre-commit-config.yaml",
+		".husky/pre-commit", "sub/.gitattributes", "svc/tkbox.yaml", "app/.envrc", "web/.husky/_/husky.sh", "lib/.gitmodules"} {
+		if !isSensitive(p) {
+			t.Errorf("isSensitive(%q) = false", p)
+		}
+	}
+	for _, p := range []string{"gitattributes.md", "tkbox.yaml.example", "husky/pre-commit", "envrc"} {
+		if isSensitive(p) {
+			t.Errorf("isSensitive(%q) = true", p)
+		}
+	}
+}
+
+// L8 (final check): a deletion removes only a file or a symlink. A directory that took the deleted file's place
+// stays (with what is in it), and a symlink goes as a link: its target is left alone.
+func TestFinalDeletionRemovesOnlyAFileOrSymlink(t *testing.T) {
+	dir, scratch := t.TempDir(), t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "d", "sub"), 0o755)
+	os.WriteFile(filepath.Join(dir, "d", "sub", "keep.txt"), []byte("keep"), 0o644)
+	target := t.TempDir()
+	os.WriteFile(filepath.Join(target, "t.txt"), []byte("target"), 0o644)
+	os.Symlink(target, filepath.Join(dir, "link"))
+	os.WriteFile(filepath.Join(dir, "f.txt"), []byte("gone"), 0o644)
+
+	if err := writeResult(dir, scratch, "d", fileState{deleted: true}); err == nil || !strings.Contains(err.Error(), "is not a file or a symlink, so it is not deleted") {
+		t.Fatalf("deleting a directory: %v", err)
+	}
+	if readFile(t, filepath.Join(dir, "d", "sub", "keep.txt")) != "keep" {
+		t.Fatal("the directory's content went")
+	}
+	os.Mkdir(filepath.Join(dir, "empty"), 0o755) // os.Remove alone would take this one
+	if err := writeResult(dir, scratch, "empty", fileState{deleted: true}); err == nil {
+		t.Fatal("an empty directory was deleted")
+	}
+	if fi, err := os.Lstat(filepath.Join(dir, "empty")); err != nil || !fi.IsDir() {
+		t.Fatalf("the empty directory: %v", err)
+	}
+	for _, p := range []string{"link", "f.txt"} {
+		if err := writeResult(dir, scratch, p, fileState{deleted: true}); err != nil {
+			t.Fatalf("deleting %s: %v", p, err)
+		}
+		if _, err := os.Lstat(filepath.Join(dir, p)); err == nil {
+			t.Fatalf("%s is still there", p)
+		}
+	}
+	if readFile(t, filepath.Join(target, "t.txt")) != "target" {
+		t.Fatal("a symlink's target went with it")
+	}
+}
