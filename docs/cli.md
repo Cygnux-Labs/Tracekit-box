@@ -150,7 +150,8 @@ the shell-quoted command line, the working directory, this exec's `--env` (a sec
 `tkbox_NAME_…`; a value that holds a secret's real value is refused, `env TOKEN holds the value of secret GH`, and so is
 a command, cwd or up-front stdin that holds one: `the command, its cwd or its stdin holds the value of secret GH`, or
 a decided command line that does, as one with a value split over words or used as an env name: `the command line the
-signer decides holds the value of secret GH`) and
+signer decides holds the value of secret GH`, or `the command's words, joined with spaces, hold the value of secret GH`
+when the split words need quoting) and
 `stdin`, true when the exec has stdin of either kind below. A first word that contains `=` or is a shell reserved word
 (`if`, `then`, `for`, `do`, …) is recorded quoted (`'X=1' echo hi`), so the signer's shell parser sees the program
 that runs, not an assignment or a keyword. A first word starting with `%` is refused (`a program name may not start

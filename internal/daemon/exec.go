@@ -169,6 +169,12 @@ func (d *Daemon) prepareExec(ref string, req api.ExecRequest) (*box, *api.ErrorD
 		return nil, errf(api.CodeBadRequest, "use the secret's placeholder ($"+name+" in the box) instead; its value never enters the box",
 			"the command line the signer decides holds the value of secret %s", name)
 	}
+	// split over words that need quoting (`mysql -p 'pa$$' 'w0rd!'`), the value is not in the decided line as it is,
+	// but the box would still get its pieces
+	if name := secretIn(strings.Join(req.Argv, " "), secrets); name != "" {
+		return nil, errf(api.CodeBadRequest, "use the secret's placeholder ($"+name+" in the box) instead; its value never enters the box",
+			"the command's words, joined with spaces, hold the value of secret %s", name)
+	}
 	if req.Stdin && req.StdinData != nil {
 		return nil, errf(api.CodeBadRequest, "send the input as stdin_data (known up front) or stream it (stdin: true), not both",
 			"stdin and stdin_data are both set")

@@ -43,6 +43,17 @@ func TestVerify5SecretValueInDecidedCommandRefused(t *testing.T) {
 	}
 }
 
+// R1 remainder (final check L1): a value split over words that need shell quoting is not in the decided line as it is
+// (`mysql -p 'pa$$' 'w0rd!'`), yet the box gets its pieces: the words joined with spaces are checked too.
+func TestFinalSecretValueSplitOverQuotedWordsRefused(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.create(api.CreateBoxRequest{Name: "q", Secrets: map[string]api.SecretSpec{"DB": {Value: "pa$$ w0rd!", Hosts: []string{"db.example.com"}}}})
+	_, e2 := e.d.prepareExec("q", api.ExecRequest{Argv: []string{"mysql", "-p", "pa$$", "w0rd!"}})
+	if e2 == nil || e2.Code != api.CodeBadRequest || !strings.Contains(e2.Message, "the command's words, joined with spaces, hold the value of secret DB") {
+		t.Fatalf("a value split over quoted words: %v", e2)
+	}
+}
+
 // R4 (verify5, docs): the checkout's own .gitattributes reaches the scratch apply only when the patch changes it (it
 // is then copied in with the other files it touches; changing it needs --allow-sensitive), and then its conversions
 // apply: eol=crlf writes "new\r\n". The signer decides the converted bytes, so the record names what lands. A patch
