@@ -394,6 +394,11 @@ func (p *Proxy) redactValues(h http.Header) {
 			}
 		}
 	}
+	for _, vs := range h {
+		for i, v := range vs {
+			vs[i] = p.markRebuilt(v) // a later secret's placeholder can complete an earlier one's value
+		}
+	}
 }
 
 // nameHoldsSecret reports whether a header name holds a placeholder or any form of a secret value, without regard to

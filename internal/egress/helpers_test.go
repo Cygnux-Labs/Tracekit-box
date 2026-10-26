@@ -202,3 +202,28 @@ func TestSecretTagNeverRebuildsValue(t *testing.T) {
 		}
 	}
 }
+
+// #4: in a header an exact echo goes back as its placeholder, and that placeholder can complete another secret's
+// value that ends in a prefix of "tkbox_": "abc " before B's echo becomes "abc tkbox_B_…", holding A's "abc tkbox".
+func TestHeaderPlaceholderNeverCompletesValue(t *testing.T) {
+	a, b := mkSecret(t, "A", "", "a.example.com"), mkSecret(t, "B", "", "a.example.com")
+	a.Value = "abc tkbox"
+	var rules []*secretRule
+	for _, s := range []Secret{a, b} {
+		r, err := newSecretRule(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rules = append(rules, r)
+	}
+	p := &Proxy{secrets: rules}
+	p.valMatch = newMatcher(p.valuePatterns())
+	h := http.Header{"X-Echo": {"abc " + b.Value}, "X-Other": {"plain " + b.Value}}
+	p.redactValues(h)
+	if got := h.Get("X-Echo"); p.valMatch.findString(got) != nil {
+		t.Errorf("header redacts to %q, which holds a value", got)
+	}
+	if got := h.Get("X-Other"); got != "plain "+b.Placeholder {
+		t.Errorf("an exact echo redacts to %q, want its placeholder", got)
+	}
+}
