@@ -261,6 +261,7 @@ Install it from a checkout with `pip install ./sdk/python`.
 | [docs/development.md](docs/development.md) | Building, the Lima dev VM, unit and end-to-end tests |
 | [SECURITY.md](SECURITY.md) | Threat model, guarantees, how to report a vulnerability |
 | [examples/](examples) | `tkbox.yaml`, the demo script, a workflow that opens a fix PR |
+| [llms.txt](llms.txt), [skills/tracekit-box](skills/tracekit-box/SKILL.md) | For AI agents: what Box is and how to use it, and an Agent Skill that runs a job in a box step by step |
 
 ## License
 

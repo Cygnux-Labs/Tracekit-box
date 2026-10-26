@@ -1,0 +1,68 @@
+# Tracekit Box
+
+> Tracekit Box runs an AI agent's job, or any untrusted command, in its own Firecracker micro-VM with no network card.
+> Every way out goes through a door on the host: the network (an allowlist; private and cloud-metadata addresses are
+> refused whatever the allowlist or an approval says), secrets (the VM holds only a placeholder; the real value is
+> added on the way out, only for the hosts it is bound to), commands, and code changes (returned as a patch, each file
+> decided before it is written back). A Tracekit signer the agent can't reach decides and signs each door, and each
+> job exports one `.tkb` file anyone can verify offline. Open source (MIT), by Cygnux Labs. Status: v0, built from
+> source, one Linux host with KVM.
+
+Use it when an agent or a CI job must run code with real credentials, reach the network, or change a repository, and
+someone needs to prove afterwards exactly what it did.
+
+Needs: Linux (x86_64 or arm64) with `/dev/kvm`, or a GitHub-hosted `ubuntu-latest` runner; `e2fsprogs` and `git`;
+`tkbox` and its guest agent built from source (`make linux`, see the README's Install); a Tracekit 1.4.2 signer
+(`pip install tracekit-ai==1.4.2`, then `tracekit init --dev --v2 --no-hooks && tracekit up --wait` for a same-user
+dev signer, which gives dev assurance only).
+
+## Run a job
+
+```sh
+tkbox daemon &                                   # once per host; `tkbox ls` answers once it is up
+tkbox run --name job --image python:3.12-slim --allow pypi,debian --workspace . \
+  --secret GH=env:GH_TOKEN@api.github.com        # the box sees only a placeholder for GH
+tkbox exec job -- pip install -q pytest          # each command is decided by the signer first
+tkbox exec job -- python -m pytest               # runs in /workspace, a copy of your checkout
+tkbox approvals                                  # hosts off the allowlist wait here; `tkbox approve <id>` on the host
+tkbox stop job && tkbox diff job                 # the job's changes, as a patch
+tkbox apply job                                  # writes them to your checkout, each file decided first
+tkbox export job -o job.tkb && tracekit verify job.tkb --trust job.trust.json   # Integrity: VERIFIED.
+```
+
+## From an agent (MCP)
+
+`tkbox mcp` serves boxes as MCP tools over stdio: `tkbox_run`, `tkbox_exec`, `tkbox_diff`, `tkbox_stop`, `tkbox_ls`.
+An MCP client can only narrow what the operator set up (image, allowlist, secrets, workspace roots, limits) and only
+reach the boxes its own session created.
+
+## In GitHub Actions
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    persist-credentials: false
+- uses: Cygnux-Labs/tracekit-box/action@main
+  with:
+    agent: claude-code            # or codex, or command (with a `command:` input)
+    prompt: "Make the failing test pass. Do not change the test."
+  env:
+    ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
+The key reaches only the daemon on the runner; the box sees a placeholder that works only for `api.anthropic.com`.
+The action applies the changes only if the signer allows every file and none is sensitive, and uploads the bundle,
+its trust file and the patch as an artifact. Its signer is a dev signer made in the same job: dev assurance only.
+
+## From Python
+
+`pip install ./sdk/python` (from a checkout), then `from tracekit_box import Client`.
+
+## Docs
+- [README](https://github.com/Cygnux-Labs/tracekit-box#readme): what it stops, the doors, the demo
+- [CLI reference](https://github.com/Cygnux-Labs/tracekit-box/blob/main/docs/cli.md): every command and flag
+- [Config](https://github.com/Cygnux-Labs/tracekit-box/blob/main/docs/config.md): tkbox.yaml, presets, secrets
+- [Security model](https://github.com/Cygnux-Labs/tracekit-box/blob/main/SECURITY.md): what Box guarantees and what it does not
+- [Limits](https://github.com/Cygnux-Labs/tracekit-box/blob/main/docs/limits.md): every limit and what to do about it
+- [Agent Skill](https://github.com/Cygnux-Labs/tracekit-box/blob/main/skills/tracekit-box/SKILL.md): running a job in Box, step by step
+- [Tracekit](https://github.com/Cygnux-Labs/Tracekit): the signer, the `.tkb` format and its verifier
