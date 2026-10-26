@@ -438,8 +438,8 @@ func (p *Proxy) findValues(s string) []*secretRule {
 	return out
 }
 
-// findValueTarget looks for secret values in a request target: raw, percent-decoded, and case-insensitively (DNS
-// lower-cases host names, so a value in a host still travels).
+// findValueTarget looks for secret values in a request target: raw and percent-decoded, each in any case like every
+// value form (DNS lower-cases host names, so a value in a host still travels).
 func (p *Proxy) findValueTarget(target string) []*secretRule {
 	if p.valMatch.empty() {
 		return nil
@@ -452,12 +452,6 @@ func (p *Proxy) findValueTarget(target string) []*secretRule {
 			if f := p.findValues(u); f != nil {
 				return f
 			}
-		}
-	}
-	low := asciiLower(target)
-	for _, r := range p.secrets {
-		if len(r.forms) > 0 && strings.Contains(low, asciiLower(r.Value)) {
-			return []*secretRule{r}
 		}
 	}
 	return nil

@@ -80,10 +80,12 @@ type Sink interface {
 // Secret is one bound secret. The guest only ever sees Placeholder.
 //
 // On inspected connections the proxy also guards the value itself, in its raw, percent-encoded, JSON-escaped, hex
-// and base64 forms, each matched without regard to ASCII case: those forms are redacted from response headers,
-// trailers and bodies, and a request that carries one anywhere but its Header on one of its Hosts is a leak. A host
-// that echoes the credential in another encoding (HTML character references, split across lines, the base64 of a
-// case-changed value, ...) does hand it to the guest; values shorter than 6 bytes are not redacted at all.
+// and base64 forms (see valueForms), each matched without regard to ASCII case: those forms are redacted from
+// response headers, trailers and bodies, and a request that carries one anywhere but its Header on one of its Hosts
+// is a leak. A host that echoes the credential in another encoding (HTML character references, split across lines,
+// every byte percent-escaped, the base64 of a case-changed value, ...) does hand it to the guest, and a guest that
+// holds a value can re-encode it past these checks. Values shorter than 6 bytes are neither redacted nor blocked.
+// Ordinary text of 6 bytes or more as a value is redacted wherever it appears, in any case.
 //
 // So that the value can be redacted, requests to a bound host go without Range (a 206 answer is refused), and a
 // request to a bound host that asks to upgrade the connection (WebSocket, h2c) is refused: Box could not keep the

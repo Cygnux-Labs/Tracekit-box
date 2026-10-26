@@ -214,8 +214,10 @@ func valueForms(v string) []string {
 			// Only the characters whose 6 bits all come from the value.
 			start, end := (8*o+5)/6, 8*(o+len(v))/6
 			add(e[start:end])
-			add(strings.ReplaceAll(e[start:end], "/", `\/`)) // inside JSON from PHP and others that escape "/"
-			add(url.QueryEscape(e[start:end]))               // in a URL query: "+" and "/" percent-encoded
+			add(strings.ReplaceAll(e[start:end], "/", `\/`))  // inside JSON from PHP and others that escape "/"
+			add(url.QueryEscape(e[start:end]))                // in a URL query: "+" and "/" percent-encoded
+			add(strings.ReplaceAll(e[start:end], "+", "%2B")) // Python's quote() keeps "/"
+			add(strings.ReplaceAll(e[start:end], "/", "%2F")) // a path segment (url.PathEscape) keeps "+"
 		}
 	}
 	return forms
