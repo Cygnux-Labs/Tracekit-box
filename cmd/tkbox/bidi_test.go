@@ -10,7 +10,7 @@ import (
 )
 
 // R3 (verify5): no tracked text file holds a bidi control (U+202A–U+202E, U+2066–U+2069), which can make source or
-// docs read differently from what a compiler or shell sees. Write one as an escape (‮) instead.
+// docs read differently from what a compiler or shell sees. Write one as an escape (\u202e) instead.
 func TestNoBidiControlsInTrackedFiles(t *testing.T) {
 	top, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
 	if err != nil {
