@@ -20,24 +20,28 @@ agent can't reach decides each one, and you get one `.tkb` file per job that any
 ## Quick look
 
 ```sh
-tkbox run --image python:3.12-slim --allow pypi --workspace . --name demo \
+tkbox run --image python:3.12-slim --allow pypi,debian --workspace . --name demo \
   --secret GH=env:GH_TOKEN@api.github.com
+tkbox exec demo -- sh -c 'apt-get update -q && apt-get install -y -q curl'   # allowed: debian (the image has no curl)
 tkbox exec demo -- pip install -q requests                 # allowed: on the allowlist
 tkbox exec demo -- curl -sI https://example.com            # held until a person runs tkbox approve
 tkbox exec demo -- curl -sS https://169.254.169.254/       # refused: cloud metadata
 tkbox exec demo -- sh -c 'echo "$GH"'                      # prints a placeholder, not your token
 tkbox exec demo -- sh -c 'echo fix > /workspace/app.py'    # comes back as a patch
-tkbox stop demo && tkbox export demo -o demo.tkb && tracekit verify demo.tkb   # Integrity: VERIFIED.
+tkbox stop demo && tkbox export demo -o demo.tkb
+tracekit verify demo.tkb --trust demo.trust.json           # Integrity: VERIFIED.
 ```
 
 ## What it stops
 
 - **Leaks through DNS.** Box never looks up a name it hasn't allowed, so a job can't send data out in DNS queries,
-  the way OpenAI reported a model getting out of its sandbox on 20 Sep 2026.
+  the way an OpenAI agent reached an outside chatbot through a DNS-filtering gap in its training sandbox
+  ([OpenAI's report](https://alignment.openai.com/misalignment-reports/an-agent-used-dns-to-reach-an-external-chatbot/),
+  found 20 Sep 2026).
 - **Key theft.** The VM only holds a placeholder. The real key is added on the way out, and only for the hosts it's
   bound to.
-- **Cloud metadata and private networks.** Refused before any decision, in every address form we fuzzed (decimal,
-  octal, hex, IPv6, IPv4-mapped).
+- **Cloud metadata and private networks.** Refused whatever the allowlist or an approval says, in every address form
+  we fuzzed (decimal, octal, hex, IPv6, IPv4-mapped).
 - **Code changes nobody approved.** A job's edits come back as a patch, and each file is decided and signed before
   it's written to your checkout.
 
