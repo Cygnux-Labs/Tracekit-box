@@ -35,9 +35,9 @@ func TestSignalExitCodes(t *testing.T) {
 
 // S10: control characters from the box never reach a terminal raw.
 func TestSanitize(t *testing.T) {
-	in := "ok\tline\n\x1b[2J\x1b]0;evil\x07\rgone ‮\u0085"
+	in := "ok\tline\n\x1b[2J\x1b]0;evil\x07\rgone \u202e\u0085"
 	out := sanitize(in)
-	if strings.ContainsAny(out, "\x1b\x07\r‮\u0085") || !strings.Contains(out, "ok\tline\n") || !strings.Contains(out, `\x1b[2J`) {
+	if strings.ContainsAny(out, "\x1b\x07\r\u202e\u0085") || !strings.Contains(out, "ok\tline\n") || !strings.Contains(out, `\x1b[2J`) {
 		t.Fatalf("sanitize: %q", out)
 	}
 }
