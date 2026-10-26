@@ -136,7 +136,8 @@ type Config struct {
 	Decider    Decider
 	Sink       Sink
 	Resolver   Resolver // nil: net.DefaultResolver
-	// BlockPrefixes are refused in addition to the built-in ranges (e.g. the signer's own address).
+	// BlockPrefixes are refused in addition to the built-in ranges (e.g. the signer's own address). An IPv6 prefix
+	// that spans the IPv4-mapped range ::ffff:0:0/96 (such as ::/0) refuses the IPv4 addresses it covers there too.
 	BlockPrefixes []netip.Prefix
 	// BlockFunc, when set, is a live address check consulted alongside BlockPrefixes, both when a name is resolved
 	// and again for the exact address each socket connects to (so addresses the host gains after the box started

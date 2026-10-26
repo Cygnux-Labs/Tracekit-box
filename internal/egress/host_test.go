@@ -163,7 +163,7 @@ func TestBlocked(t *testing.T) {
 		"255.255.255.255", "168.63.129.16",
 		"::", "::1", "::127.0.0.1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "::ffff:169.254.169.254", "fc00::1", "fd12::1",
 		"fe80::1", "fec0::1", "ff02::1", "100::1", "2001::1", "2001:0:4136:e378::1", "2001:db8::1", "2002:7f00:1::1",
-		"64:ff9b::7f00:1", "64:ff9b::a9fe:a9fe", "64:ff9b::a00:1", "64:ff9b:1::1", "fd00:ec2::254", "3fff::1",
+		"64:ff9b::7f00:1", "64:ff9b::a9fe:a9fe", "64:ff9b::a00:1", "64:ff9b:1::1", "fd00:ec2::254", "3fff::1", "5f00::1",
 	}
 	for _, s := range blocked {
 		if bad, why := Blocked(netip.MustParseAddr(s)); !bad || why == "" {
@@ -202,6 +202,28 @@ func TestRefusedAllowPrivate(t *testing.T) {
 	for _, s := range []string{"10.0.0.1", "127.0.0.1", "::1", "192.168.1.1"} {
 		if bad, why := p.refused(netip.MustParseAddr(s)); bad {
 			t.Errorf("refused(%s) = %s, want exempt", s, why)
+		}
+	}
+}
+
+// An IPv6 block prefix that spans the IPv4-mapped range blocks the IPv4 addresses it covers there: Box connects to
+// ::ffff:8.8.8.8 (and the NAT64 64:ff9b::808:808) as 8.8.8.8, so no form of it may get past ::/23.
+func TestBlockPrefixSpanningMappedRange(t *testing.T) {
+	p := &Proxy{}
+	var err error
+	p.blockPrefixes, err = normPrefixes("", []netip.Prefix{netip.MustParsePrefix("::/23"), netip.MustParsePrefix("2001:db8::/32")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []string{"::ffff:8.8.8.8", "8.8.8.8", "64:ff9b::808:808"} {
+		if bad, why := p.refused(netip.MustParseAddr(s)); !bad || why != operatorBlocked {
+			t.Errorf("refused(%s) = %v %q with BlockPrefixes ::/23, want %q", s, bad, why, operatorBlocked)
+		}
+	}
+	p.blockPrefixes, _ = normPrefixes("", []netip.Prefix{netip.MustParsePrefix("2001:db8::/32")})
+	for _, s := range []string{"::ffff:8.8.8.8", "8.8.8.8", "2606:4700::1111"} {
+		if bad, why := p.refused(netip.MustParseAddr(s)); bad {
+			t.Errorf("refused(%s) = %s with BlockPrefixes 2001:db8::/32, want allowed", s, why)
 		}
 	}
 }

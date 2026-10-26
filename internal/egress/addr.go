@@ -47,6 +47,7 @@ var builtinBlocked = func() []blockRange {
 		{"2001::/23", "IETF protocol assignments"},
 		{"2002::/16", "6to4"},
 		{"3fff::/20", "documentation (RFC 9637)"},
+		{"5f00::/16", "SRv6 segment identifiers (RFC 9602)"},
 		{"fc00::/7", "unique local (ULA)"},
 		{"fe80::/10", "link-local"},
 		{"fec0::/10", "site-local (deprecated)"},
@@ -142,7 +143,9 @@ func (p *Proxy) refused(a netip.Addr) (bad bool, what string) {
 			return true, "a " + why + " address"
 		}
 		for _, bp := range p.blockPrefixes {
-			if bp.Contains(v) {
+			// An IPv6 prefix that spans the IPv4-mapped range (::/0, ::/23) covers the IPv4 addresses there too:
+			// Box connects to ::ffff:a.b.c.d as a.b.c.d.
+			if bp.Contains(v) || v.Is4() && bp.Contains(netip.AddrFrom16(v.As16())) {
 				return true, operatorBlocked
 			}
 		}
