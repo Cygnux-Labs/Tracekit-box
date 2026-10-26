@@ -240,16 +240,46 @@ func (s *mcpServer) send(v any) {
 }
 
 func (s *mcpServer) serve(parent context.Context, in io.Reader) error {
-	sc := bufio.NewScanner(in)
-	sc.Buffer(make([]byte, 64<<10), mcpMaxLine)
-	// when the client goes away (stdin closes) its in-flight calls are cancelled: execs stop instead of running on
+	// when the client goes away (stdin closes) or the process is told to stop (SIGTERM, SIGINT: parent is cancelled),
+	// its in-flight calls are cancelled, execs stop instead of running on, and the session's boxes are stopped
 	ctx, cancel := context.WithCancel(parent)
 	var wg sync.WaitGroup
 	defer s.stopOwned() // last: nothing else can reach them once this session is gone
 	defer wg.Wait()
 	defer cancel()
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
+	// stdin is read on its own goroutine, so a stop request ends the session even while the client keeps stdin open
+	lines := make(chan []byte)
+	scanErr := make(chan error, 1)
+	go func() {
+		defer close(lines)
+		sc := bufio.NewScanner(in)
+		sc.Buffer(make([]byte, 64<<10), mcpMaxLine)
+		for sc.Scan() {
+			select {
+			case lines <- append([]byte(nil), sc.Bytes()...):
+			case <-ctx.Done():
+				return
+			}
+		}
+		scanErr <- sc.Err()
+	}()
+	for {
+		var raw []byte
+		select {
+		case <-parent.Done():
+			return nil
+		case l, ok := <-lines:
+			if !ok {
+				select {
+				case err := <-scanErr:
+					return err
+				default:
+					return nil
+				}
+			}
+			raw = l
+		}
+		line := bytes.TrimSpace(raw)
 		if len(line) == 0 {
 			continue
 		}
@@ -273,7 +303,6 @@ func (s *mcpServer) serve(parent context.Context, in io.Reader) error {
 			s.send(resp)
 		}(req)
 	}
-	return sc.Err()
 }
 
 // stopOwned stops every box this session created: no later session can reach them, so left running they would only

@@ -426,9 +426,10 @@ created by this tkbox mcp session: it may only use the boxes its tkbox_run creat
 can't use another box's allowlist, secrets or workspace, or kill it. A second key that spells `box` in another case
 (`"BOX"`) is refused (`argument "BOX": use "box"`), so it can't decide which box is used.
 
-When the session ends (the client closes `tkbox mcp`'s stdin), `tkbox mcp` stops every box the session created, since
-no later session can reach them: their patches are saved and their Tracekit runs stay open, so the operator can still
-`tkbox apply` and `tkbox export` them.
+When the session ends (the client closes `tkbox mcp`'s stdin, or `tkbox mcp` gets SIGTERM or SIGINT, even with stdin
+still open), `tkbox mcp` stops every box the session created, since no later session can reach them: their patches are
+saved and their Tracekit runs stay open, so the operator can still `tkbox apply` and `tkbox export` them. A
+`tkbox mcp` killed outright (SIGKILL, a crash) can't: its boxes run until their timeout.
 
 `--config FILE` is the operator's [tkbox.yaml](config.md): every `tkbox_run` starts from its image, allowlist, secrets,
 env and limits. A `tkbox_run` call can only narrow those settings:

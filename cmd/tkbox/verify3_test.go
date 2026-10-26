@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
 	"github.com/Cygnux-Labs/tracekit-box/internal/config"
@@ -94,6 +95,37 @@ func TestVerify3DiffSummaryOfAnotherPatch(t *testing.T) {
 	txt, isErr, err := s.call(context.Background(), "tkbox_diff", json.RawMessage(`{"box":"b1"}`))
 	if !isErr || !strings.Contains(txt+errString(err), api.DiffChangedMessage) {
 		t.Fatalf("tkbox_diff: %v %v %q", err, isErr, txt)
+	}
+}
+
+// 9322e72 residual (verify3): a SIGTERM or SIGINT (the parent context cancelled) ends a `tkbox mcp` session and stops
+// the boxes it created even while the client keeps stdin open; serve returns cleanly.
+func TestVerify3MCPStopsItsBoxesOnSignal(t *testing.T) {
+	sock, fd := startFakeDaemon(t)
+	inR, inW := io.Pipe()
+	defer inW.Close()
+	s := &mcpServer{c: newClient(sock), out: io.Discard, images: []string{"alpine:3"}, base: &config.File{}}
+	if txt, isErr, err := s.call(context.Background(), "tkbox_run", json.RawMessage(`{"image":"alpine:3"}`)); err != nil || isErr {
+		t.Fatalf("run: %v %v %q", err, isErr, txt)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.serve(ctx, inR) }()
+	inW.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}` + "\n"))
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve after a signal: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return after its context was cancelled (stdin still open)")
+	}
+	fd.mu.Lock()
+	n := len(fd.stopped)
+	fd.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("%d boxes stopped after the session was told to stop, want 1", n)
 	}
 }
 
