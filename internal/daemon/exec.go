@@ -69,23 +69,26 @@ var loaderEnv = map[string]bool{"ENV": true, "PROMPT_COMMAND": true, "PATH": tru
 	"SHELLOPTS": true, "BASHOPTS": true, "PS4": true, "IFS": true, "CDPATH": true, "GLOBIGNORE": true, "ZDOTDIR": true,
 	"FPATH": true, "HOME": true, "GLIBC_TUNABLES": true, "CLASSPATH": true, "GEM_PATH": true, "GEM_HOME": true,
 	"BUNDLE_GEMFILE": true, "MAKEFILES": true, "MAKEFLAGS": true, "GOFLAGS": true, "GOENV": true, "GOTOOLCHAIN": true,
-	"RUSTC": true, "RUSTC_WRAPPER": true, "RUSTC_WORKSPACE_WRAPPER": true, "RUSTFLAGS": true, "CARGO_HOME": true,
-	"CARGO_BUILD_RUSTC": true, "CARGO_BUILD_RUSTC_WRAPPER": true, "CC": true, "CXX": true, "CPP": true, "LD": true,
-	"PHPRC": true, "PHP_INI_SCAN_DIR": true, "LESSOPEN": true, "LESSCLOSE": true, "EDITOR": true, "VISUAL": true,
-	"PAGER": true, "MANPAGER": true, "SSH_ASKPASS": true, "PIP_CONFIG_FILE": true}
+	"RUSTC": true, "RUSTC_WRAPPER": true, "RUSTC_WORKSPACE_WRAPPER": true, "RUSTFLAGS": true, "GOROOT": true,
+	"CC": true, "CXX": true, "CPP": true, "LD": true, "PHPRC": true, "PHP_INI_SCAN_DIR": true, "LESSOPEN": true,
+	"LESSCLOSE": true, "EDITOR": true, "VISUAL": true, "PAGER": true, "MANPAGER": true, "SSH_ASKPASS": true,
+	"SUDO_ASKPASS": true, "PIP_CONFIG_FILE": true, "MAVEN_OPTS": true, "GRADLE_OPTS": true, "GRADLE_USER_HOME": true,
+	"R_PROFILE_USER": true, "KUBECONFIG": true, "AWS_CONFIG_FILE": true, "GNUPGHOME": true, "DOCKER_CONFIG": true}
 
 // loaderEnvPrefixes are name prefixes a per-exec env may not set: the dynamic loader (LD_, and DYLD_), GIT_ (config,
-// hooks, ssh, exec path, editor, pager, …), XDG_ base dirs (config is read there), interpreters' options and module
-// paths (PYTHON, PERL, RUBY, NODE_, JAVA_, JDK_, _JAVA_, LUA_) and BASH_ (BASH_ENV, …). npm reads its config from
-// NPM_CONFIG_ names in any case, so that prefix is matched in any case too.
+// hooks, ssh, exec path, editor, pager, …), XDG_ base dirs (config is read there), interpreters' and runtimes'
+// options and module paths (PYTHON, PERL, RUBY, NODE_, JAVA_, JDK_, _JAVA_, LUA_, ERL_, DOTNET_, CORECLR_), BASH_
+// (BASH_ENV, …), OPENSSL_ (engines and providers it loads), and build tools' runners, flags and paths (CARGO_, CGO_,
+// YARN_). npm reads its config from NPM_CONFIG_ names in any case, so that prefix is matched in any case too.
 var loaderEnvPrefixes = []string{"LD_", "DYLD_", "GIT_", "XDG_", "PYTHON", "PERL", "RUBY", "NODE_", "JAVA_", "JDK_",
-	"_JAVA_", "LUA_", "BASH_"}
+	"_JAVA_", "LUA_", "BASH_", "ERL_", "DOTNET_", "CORECLR_", "OPENSSL_", "CARGO_", "CGO_", "YARN_"}
 
 // loaderEnvAllowed are names under a loaderEnvPrefixes prefix that change no program and may be set per exec.
 var loaderEnvAllowed = map[string]bool{"GIT_AUTHOR_NAME": true, "GIT_AUTHOR_EMAIL": true, "GIT_AUTHOR_DATE": true,
 	"GIT_COMMITTER_NAME": true, "GIT_COMMITTER_EMAIL": true, "GIT_COMMITTER_DATE": true, "NODE_ENV": true,
 	"PYTHONUNBUFFERED": true, "PYTHONDONTWRITEBYTECODE": true, "PYTHONIOENCODING": true, "PYTHONUTF8": true,
-	"PYTHONHASHSEED": true, "PYTHONFAULTHANDLER": true}
+	"PYTHONHASHSEED": true, "PYTHONFAULTHANDLER": true, "CGO_ENABLED": true, "CARGO_TERM_COLOR": true,
+	"CARGO_INCREMENTAL": true, "DOTNET_NOLOGO": true, "DOTNET_CLI_TELEMETRY_OPTOUT": true}
 
 // isLoaderEnv reports whether a per-exec env may not set k.
 func isLoaderEnv(k string) bool {

@@ -158,14 +158,21 @@ func TestVerify3ExecEnvDenyList(t *testing.T) {
 		"VISUAL", "PAGER", "LESSOPEN", "MAKEFILES", "MAKEFLAGS", "GOFLAGS", "GOTOOLCHAIN", "RUSTC_WRAPPER", "CC",
 		"LUA_INIT", "LUA_INIT_5_4", "PHPRC", "PHP_INI_SCAN_DIR", "npm_config_script_shell", "NPM_CONFIG_USERCONFIG",
 		"PIP_CONFIG_FILE", "BASH_ENV", "BASH_FUNC_x", "LD_PRELOAD", "PYTHONPATH", "NODE_OPTIONS", "JAVA_TOOL_OPTIONS",
-		"GIT_CONFIG_COUNT", "PATH"} {
+		"GIT_CONFIG_COUNT", "PATH",
+		// R7 (verify5): a library, a configured program or code they load
+		"OPENSSL_CONF", "OPENSSL_ENGINES", "OPENSSL_MODULES", "KUBECONFIG", "AWS_CONFIG_FILE", "GOROOT",
+		"CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_RUSTFLAGS", "CARGO_HOME",
+		"CGO_CFLAGS", "CGO_LDFLAGS", "DOTNET_STARTUP_HOOKS", "CORECLR_PROFILER_PATH", "MAVEN_OPTS", "GRADLE_OPTS",
+		"GRADLE_USER_HOME", "ERL_AFLAGS", "R_PROFILE_USER", "SUDO_ASKPASS", "YARN_YARN_PATH", "YARN_RC_FILENAME",
+		"GNUPGHOME", "DOCKER_CONFIG"} {
 		_, e2 := e.d.prepareExec("env", api.ExecRequest{Argv: []string{"ls"}, Env: map[string]string{k: "/x"}})
 		if e2 == nil || e2.Code != api.CodeBadRequest || !strings.Contains(e2.Message, "env "+k+" can't be set per command") {
 			t.Errorf("per-exec env %s: %v", k, e2)
 		}
 	}
 	for _, k := range []string{"DEBIAN_FRONTEND", "PIP_ROOT_USER_ACTION", "PIP_DISABLE_PIP_VERSION_CHECK", "LANG",
-		"GIT_AUTHOR_NAME", "GIT_COMMITTER_EMAIL", "NODE_ENV", "PYTHONUNBUFFERED", "MY_PATH", "CI", "TERM"} {
+		"GIT_AUTHOR_NAME", "GIT_COMMITTER_EMAIL", "NODE_ENV", "PYTHONUNBUFFERED", "MY_PATH", "CI", "TERM",
+		"CGO_ENABLED", "CARGO_TERM_COLOR", "CARGO_INCREMENTAL", "DOTNET_NOLOGO", "DOTNET_CLI_TELEMETRY_OPTOUT"} {
 		if _, e2 := e.d.prepareExec("env", api.ExecRequest{Argv: []string{"ls"}, Env: map[string]string{k: "x"}}); e2 != nil {
 			t.Errorf("per-exec env %s refused: %v", k, e2)
 		}
