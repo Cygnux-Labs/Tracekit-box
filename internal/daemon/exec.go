@@ -56,10 +56,16 @@ func (b *box) notice(msg string) {
 
 var signalNames = map[string]bool{"SIGINT": true, "SIGTERM": true, "SIGKILL": true, "SIGHUP": true, "SIGQUIT": true}
 
-// loaderEnv are env names that change what a decided command runs without changing its argv; a per-exec env may not
-// set them (an operator's box env may).
+// loaderEnv are env names that change what a decided command runs without changing its argv (the dynamic loader,
+// shell startup files, which program a name resolves to, interpreter preloads and git's config); a per-exec env may
+// not set them (an operator's box env may). Every GIT_CONFIG_* name is refused too (see isLoaderEnv).
 var loaderEnv = map[string]bool{"LD_PRELOAD": true, "LD_LIBRARY_PATH": true, "LD_AUDIT": true, "BASH_ENV": true,
-	"ENV": true, "PROMPT_COMMAND": true}
+	"ENV": true, "PROMPT_COMMAND": true, "PATH": true, "NODE_OPTIONS": true, "PYTHONPATH": true, "PERL5OPT": true,
+	"RUBYOPT": true, "JAVA_TOOL_OPTIONS": true, "GCONV_PATH": true, "GIT_CONFIG": true}
+
+// isLoaderEnv reports whether a per-exec env may not set k: a loaderEnv name, or any GIT_CONFIG_ name
+// (GIT_CONFIG_COUNT, GIT_CONFIG_KEY_n, GIT_CONFIG_VALUE_n, GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, GIT_CONFIG_PARAMETERS, …).
+func isLoaderEnv(k string) bool { return loaderEnv[k] || strings.HasPrefix(k, "GIT_CONFIG_") }
 
 // prepareExec checks an exec request before the connection is upgraded, so a refusal is a plain JSON error.
 func (d *Daemon) prepareExec(ref string, req api.ExecRequest) (*box, *api.ErrorDetail) {
@@ -89,7 +95,7 @@ func (d *Daemon) prepareExec(ref string, req api.ExecRequest) (*box, *api.ErrorD
 		if reservedEnv[k] {
 			return nil, errf(api.CodeBadRequest, "every connection goes through the box's proxy", "env %s is set by the box and can't be overridden", k)
 		}
-		if loaderEnv[k] {
+		if isLoaderEnv(k) {
 			return nil, errf(api.CodeBadRequest, "it changes what the command runs without showing in the command the signer decides; put it in the command itself (e.g. sh -c '"+k+"=… cmd') so it is decided",
 				"env %s can't be set per command", k)
 		}

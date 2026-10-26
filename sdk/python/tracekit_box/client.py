@@ -503,8 +503,9 @@ class Client:
 
         stdin: bytes, str or a binary file object sent to the process (else its stdin is /dev/null); the daemon holds
         up to 4 MiB the process has not read yet, and past that closes its stdin and drops the rest, with a notice.
-        env: per-command env; it may not set LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT, BASH_ENV, ENV or PROMPT_COMMAND
-        (BadRequest). timeout: seconds or a Go duration string, 1s to 24h (default: the box's exec timeout).
+        env: per-command env; it may not set LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT, BASH_ENV, ENV, PROMPT_COMMAND,
+        PATH, NODE_OPTIONS, PYTHONPATH, PERL5OPT, RUBYOPT, JAVA_TOOL_OPTIONS, GCONV_PATH, GIT_CONFIG or any GIT_CONFIG_*
+        name (BadRequest). timeout: seconds or a Go duration string, 1s to 24h (default: the box's exec timeout).
         on_output(stream, data) is called with "stdout" or "stderr" as output arrives; on_event(event) with each
         ExecEvent (deciding, waiting_approval, running, notice).
 
