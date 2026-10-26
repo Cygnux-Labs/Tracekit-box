@@ -420,9 +420,53 @@ func TestTunnelPlain(t *testing.T) {
 	}
 	r := e.dec.Requests[0]
 	p, _ := strconv.Atoi(port)
-	if r.BoxID != "box-test" || r.Scheme != "https" || r.Host != "example.com" || r.Port != p || !r.OnAllowlist ||
-		r.URL != "https://example.com:"+port || len(r.Addrs) != 1 || r.Addrs[0] != netip.MustParseAddr("127.0.0.1") {
+	// Not port 443: recorded as a TCP tunnel to that port (TestDecisionSchemeByPort).
+	if r.BoxID != "box-test" || r.Scheme != "tcp" || r.Host != "example.com" || r.Port != p || !r.OnAllowlist ||
+		r.URL != "tcp://example.com:"+port || len(r.Addrs) != 1 || r.Addrs[0] != netip.MustParseAddr("127.0.0.1") {
 		t.Errorf("decider request %+v", r)
+	}
+}
+
+// The decision is made before the tunnel's first byte, so its url names only what is known then: a CONNECT to 443
+// is https (the tunnel must carry TLS), any other port a TCP tunnel to that port (an allow entry naming the port
+// lets SSH or any other protocol through), and an absolute-form request is http.
+func TestDecisionSchemeByPort(t *testing.T) {
+	checkGoroutines(t)
+	e := newEnv(t, func(c *Config) { c.Allow = []string{"example.com", "example.com:22", "other.example:8443"} })
+	e.dec.Func = func(context.Context, Request) (Verdict, error) {
+		return Verdict{Reason: "test refuses everything"}, nil
+	}
+	for _, target := range []string{"example.com:443", "example.com:22", "other.example:8443", "[2606:4700::1111]:5432"} {
+		_, _, resp := e.rawConnect(target)
+		resp.Body.Close()
+	}
+	c := e.dialProxy()
+	fmt.Fprintf(c, "GET http://example.com/x HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	e.stop()
+	want := map[string]string{
+		"example.com:443":      "https://example.com:443",
+		"example.com:22":       "tcp://example.com:22",
+		"other.example:8443":   "tcp://other.example:8443",
+		"2606:4700::1111:5432": "tcp://[2606:4700::1111]:5432",
+		"example.com:80":       "http://example.com:80",
+	}
+	got := map[string]string{}
+	for _, r := range e.dec.Requests {
+		k := r.Host + ":" + strconv.Itoa(r.Port)
+		got[k] = r.URL
+		if scheme, _, _ := strings.Cut(r.URL, "://"); scheme != r.Scheme {
+			t.Errorf("%s: Scheme %q but URL %q", k, r.Scheme, r.URL)
+		}
+	}
+	for k, u := range want {
+		if got[k] != u {
+			t.Errorf("%s: url %q, want %q", k, got[k], u)
+		}
 	}
 }
 
@@ -589,6 +633,36 @@ func TestIPv4MappedAnswerExempted(t *testing.T) {
 	e.stop()
 	if a := e.dec.Requests[0].Addrs; len(a) != 1 || a[0] != netip.MustParseAddr("127.0.0.1") {
 		t.Errorf("Addrs %v, want the unmapped address", a)
+	}
+}
+
+// An IPv4-mapped literal is matched on the allowlist as its IPv4 address, so the Decider (and the signer's WebFetch
+// url) must name the IPv4 address too: a rule keyed on 127.0.0.1 would otherwise not see [::ffff:127.0.0.1].
+func TestIPv4MappedLiteralReachesDeciderUnmapped(t *testing.T) {
+	checkGoroutines(t)
+	e := newEnv(t, func(c *Config) { c.Allow = []string{"127.0.0.1:8443"} })
+	e.dec.Func = func(context.Context, Request) (Verdict, error) {
+		return Verdict{Reason: "test refuses everything"}, nil
+	}
+	for _, target := range []string{"[::ffff:127.0.0.1]:8443", "[::FFFF:7f00:1]:8443"} {
+		_, _, resp := e.rawConnect(target)
+		if b := body(t, resp); resp.StatusCode != 403 || strings.Contains(b, "ffff") {
+			t.Errorf("%s: %s %q", target, resp.Status, b)
+		}
+	}
+	e.stop()
+	if len(e.dec.Requests) != 2 {
+		t.Fatalf("decider asked %d times", len(e.dec.Requests))
+	}
+	for _, r := range e.dec.Requests {
+		if r.Host != "127.0.0.1" || !strings.HasSuffix(r.URL, "://127.0.0.1:8443") || !r.OnAllowlist {
+			t.Errorf("decider request %+v, want host 127.0.0.1 on the allowlist", r)
+		}
+	}
+	for _, ev := range e.sink.events() {
+		if strings.Contains(ev.Host, "ffff") {
+			t.Errorf("event names the mapped form: %+v", ev)
+		}
 	}
 }
 
@@ -1176,6 +1250,77 @@ func TestInspectAll(t *testing.T) {
 	}
 	if rec.count() != 1 {
 		t.Errorf("upstream saw %d requests", rec.count())
+	}
+}
+
+// With inspect all, a host or port off the allowlist is refused at once: the Decider (and so a person) is never
+// asked and the name is never resolved. That holds for a port the allowlist does not name on an allowed host (the
+// CA covers the host, ports dropped, as the daemon builds it), for absolute-form HTTP, and for a box with no allow
+// entries at all.
+func TestInspectAllRefusesOffAllowlistAtOnce(t *testing.T) {
+	checkGoroutines(t)
+	const caMsg = "Box must inspect this host but the box CA may not impersonate it"
+	const portMsg = "is not on the allow list, so it is refused without asking"
+	const plainMsg = "with inspect: all, a host off the allow list is refused without asking"
+	for _, tc := range []struct {
+		name    string
+		allow   []string
+		caHosts []string
+		cases   map[string]string // CONNECT target or "GET <url>" -> part of X-Tkbox-Reason
+	}{
+		{"allow entries", []string{"example.com", "other.example:8443"}, []string{"example.com", "other.example"}, map[string]string{
+			"evil.example:443":             caMsg,
+			"example.com:8443":             portMsg,
+			"other.example:9999":           portMsg,
+			"other.example:443":            portMsg,
+			"GET http://evil.example/":     plainMsg,
+			"GET http://example.com:8080/": portMsg,
+		}},
+		{"no allow entries", nil, []string{}, map[string]string{
+			"evil.example:443":         caMsg,
+			"8.8.8.8:443":              caMsg,
+			"GET http://evil.example/": plainMsg,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ca, err := NewCAWith("box-test", CAOptions{Hosts: tc.caHosts})
+			if err != nil {
+				t.Fatal(err)
+			}
+			e := newEnv(t, func(c *Config) {
+				c.Inspect = InspectAll
+				c.Allow = tc.allow
+				c.CA = ca
+			})
+			e.res.set("evil.example", "127.0.0.1")
+			for target, want := range tc.cases {
+				var resp *http.Response
+				if u, ok := strings.CutPrefix(target, "GET "); ok {
+					c := e.dialProxy()
+					pu, _ := url.Parse(u)
+					fmt.Fprintf(c, "GET %s HTTP/1.1\r\nHost: %s\r\n\r\n", u, pu.Host)
+					if resp, err = http.ReadResponse(bufio.NewReader(c), nil); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					_, _, resp = e.rawConnect(target)
+				}
+				body(t, resp)
+				if resp.StatusCode != 403 || !strings.Contains(resp.Header.Get("X-Tkbox-Reason"), want) {
+					t.Errorf("%s: %s %q, want 403 with %q", target, resp.Status, resp.Header.Get("X-Tkbox-Reason"), want)
+				}
+			}
+			e.stop()
+			if len(e.dec.Requests) != 0 {
+				t.Errorf("the Decider was asked (a person would be): %+v", e.dec.Requests)
+			}
+			if l := e.res.lookups(); len(l) != 0 {
+				t.Errorf("names off the allowlist were resolved: %v", l)
+			}
+			if n := len(e.sink.events()); n != len(tc.cases) {
+				t.Errorf("%d events for %d refusals: %v", n, len(tc.cases), e.kinds())
+			}
+		})
 	}
 }
 

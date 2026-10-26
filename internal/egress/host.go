@@ -31,6 +31,9 @@ func normalizeHost(s string) (string, netip.Addr, error) {
 		if a.Zone() != "" {
 			return "", netip.Addr{}, errors.New("IPv6 zones are not allowed")
 		}
+		// An IPv4-mapped literal ([::ffff:1.2.3.4]) is the IPv4 address: the allowlist already matches it as one, so
+		// the Decider and the signer must see 1.2.3.4 too, or a rule keyed on 1.2.3.4 would not apply to it.
+		a = a.Unmap()
 		return a.String(), a, nil
 	}
 	// ASCII only, checked before lower-casing: strings.ToLower would fold look-alikes such as the Kelvin sign into "k".

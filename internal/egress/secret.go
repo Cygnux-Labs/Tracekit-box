@@ -200,12 +200,7 @@ func (p *Proxy) redact(s string) string {
 	}
 	for _, r := range p.secrets {
 		for _, f := range r.forms {
-			if strings.Contains(s, f) {
-				s = strings.ReplaceAll(s, f, "[secret "+r.Name+"]")
-			}
-		}
-		if len(r.forms) > 0 && strings.Contains(asciiLower(s), asciiLower(r.Value)) {
-			s = replaceFold(s, r.Value, "[secret "+r.Name+"]") // host names arrive lower-cased
+			s = replaceFold(s, f, "[secret "+r.Name+"]") // any case: host names arrive lower-cased
 		}
 	}
 	low := asciiLower(s)
@@ -337,21 +332,33 @@ func (p *Proxy) checkUse(r *secretRule, canon, host string, swap bool) *leakErro
 // minRedactLen: shorter values cannot be told apart from ordinary text and are not redacted from output.
 const minRedactLen = 6
 
-// replaceFold replaces every ASCII-case-insensitive occurrence of old in s.
+// replaceFold replaces every ASCII-case-insensitive occurrence of old in s (scanning on after each replacement, so
+// a replacement that itself holds old is never matched again).
 func replaceFold(s, old, repl string) string {
+	if old == "" {
+		return s
+	}
 	lo := asciiLower(old)
+	low := asciiLower(s)
+	if !strings.Contains(low, lo) {
+		return s
+	}
+	var b strings.Builder
 	for {
-		i := strings.Index(asciiLower(s), lo)
+		i := strings.Index(low, lo)
 		if i < 0 {
-			return s
+			b.WriteString(s)
+			return b.String()
 		}
-		s = s[:i] + repl + s[i+len(old):]
+		b.WriteString(s[:i])
+		b.WriteString(repl)
+		s, low = s[i+len(old):], low[i+len(old):]
 	}
 }
 
-// redactValues replaces secret values echoed in response headers with their placeholders, and the value's encoded
-// forms (base64 Basic credentials, percent- or JSON-escaped) with a marker. A header whose name holds a value or a
-// placeholder is dropped.
+// redactValues replaces secret values echoed verbatim in response headers with their placeholders, and every other
+// form (another case, base64 Basic credentials, percent- or JSON-escaped, hex; see valueForms) with a marker. A
+// header whose name holds a value or a placeholder is dropped.
 func (p *Proxy) redactValues(h http.Header) {
 	for k := range h {
 		if p.nameHoldsSecret(k) {
@@ -362,13 +369,10 @@ func (p *Proxy) redactValues(h http.Header) {
 		for k, vs := range h {
 			for i, v := range vs {
 				for j, f := range r.forms {
-					if strings.Contains(v, f) {
-						repl := "[tkbox: redacted]"
-						if j == 0 {
-							repl = r.Placeholder
-						}
-						v = strings.ReplaceAll(v, f, repl)
+					if j == 0 && strings.Contains(v, f) {
+						v = strings.ReplaceAll(v, f, r.Placeholder)
 					}
+					v = replaceFold(v, f, "[tkbox: redacted]")
 				}
 				h[k][i] = v
 			}
@@ -398,7 +402,7 @@ func (p *Proxy) valuePatterns() []pattern {
 	var out []pattern
 	for _, r := range p.secrets {
 		for _, f := range r.forms {
-			out = append(out, pattern{s: []byte(f), rule: r, kind: patValue})
+			out = append(out, pattern{s: []byte(f), rule: r, kind: patValue, fold: true})
 		}
 	}
 	return out
