@@ -139,7 +139,8 @@ as is, with no shell: use `sh -c '…'` for pipes and variables. `--` is needed 
 
 The signer decides the command before it starts, as a `Bash` decision with the arguments `{command, cwd, env, stdin}`:
 the shell-quoted command line, the working directory, this exec's `--env` (a secret's placeholder shown as
-`tkbox_NAME_…`; a value that holds a secret's real value is refused, `env TOKEN holds the value of secret GH`) and
+`tkbox_NAME_…`; a value that holds a secret's real value is refused, `env TOKEN holds the value of secret GH`, and so is
+a command, cwd or up-front stdin that holds one: `the command, its cwd or its stdin holds the value of secret GH`) and
 `stdin`, true when the exec has stdin of either kind below. A first word that contains `=` or is a shell reserved word
 (`if`, `then`, `for`, `do`, …) is recorded quoted (`'X=1' echo hi`), so the signer's shell parser sees the program
 that runs, not an assignment or a keyword.

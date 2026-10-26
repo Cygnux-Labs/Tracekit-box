@@ -95,6 +95,13 @@ func (d *Daemon) prepareExec(ref string, req api.ExecRequest) (*box, *api.ErrorD
 	b.mu.Lock()
 	secrets := b.secrets
 	b.mu.Unlock()
+	// a secret's value never enters the box, nor the decision (which holds the command and cwd as they are): the
+	// command, cwd and stdin_data are checked together. A secret value has no NUL, so joining them with NUL can't make a
+	// match across two of them.
+	if name := secretIn(strings.Join(append([]string{req.Cwd, string(req.StdinData)}, req.Argv...), "\x00"), secrets); name != "" {
+		return nil, errf(api.CodeBadRequest, "use the secret's placeholder ($"+name+" in the box) instead; its value never enters the box",
+			"the command, its cwd or its stdin holds the value of secret %s", name)
+	}
 	for k, v := range req.Env {
 		if !envNameRE.MatchString(k) || strings.ContainsRune(v, 0) {
 			return nil, errf(api.CodeBadRequest, "env names are letters, digits and _; values can't hold NUL", "env %q is not a valid KEY=VALUE", k)

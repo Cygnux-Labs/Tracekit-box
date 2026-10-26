@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,5 +96,45 @@ func TestVerify3StreamedStdinDigestOnError(t *testing.T) {
 	_, res := lastBash(e)
 	if res["stdin_sha256"] != sha(script2) || res["stdin_bytes"] != int64(len(script2)) {
 		t.Fatalf("complete after the client hung up: %v", res)
+	}
+}
+
+// L1 (verify3): a secret's real value in the command, its cwd or its stdin_data is refused before anything is decided
+// or reaches the guest; the refusal names the secret, never the value. A value split across two arguments is not one.
+func TestVerify3SecretValueInCommandCwdOrStdinRefused(t *testing.T) {
+	const val = "s3cret-value-1234"
+	e := newTestEnv(t, nil)
+	e.create(api.CreateBoxRequest{Name: "l1", Secrets: map[string]api.SecretSpec{"TOK": {Value: val, Hosts: []string{"api.example.com"}}}})
+	var ph string
+	for _, s := range e.box("l1").secrets {
+		ph = s.Placeholder
+	}
+	sock := e.serve()
+	records, execs := len(e.run(0).Methods()), len(e.guest.Execs)
+	for _, req := range []api.ExecRequest{
+		{Argv: []string{"curl", "-H", "Authorization: Bearer " + val, "https://api.example.com/"}},
+		{Argv: []string{"ls"}, Cwd: "/workspace/" + val},
+		{Argv: []string{"cat"}, StdinData: []byte("token=" + val + "\n")},
+	} {
+		resp, _ := execStream(t, sock, "l1", req, nil)
+		var body api.ErrorBody
+		json.NewDecoder(resp.Body).Decode(&body)
+		resp.Body.Close()
+		js, _ := json.Marshal(body)
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(body.Error.Message, "holds the value of secret TOK") ||
+			strings.Contains(string(js), val) {
+			t.Errorf("exec %+v: %d %s", req, resp.StatusCode, js)
+		}
+	}
+	if n := len(e.run(0).Methods()); n != records || len(e.guest.Execs) != execs {
+		t.Fatalf("a refused exec was decided (%d records, was %d) or run (%d guest execs, was %d)", n, records, len(e.guest.Execs), execs)
+	}
+	for _, req := range []api.ExecRequest{
+		{Argv: []string{"curl", "-H", "Authorization: Bearer " + ph}, Cwd: "/workspace", StdinData: []byte(ph)},
+		{Argv: []string{"echo", val[:6], val[6:]}},
+	} {
+		if _, e2 := e.d.prepareExec("l1", req); e2 != nil {
+			t.Errorf("exec %+v refused: %v", req, e2)
+		}
 	}
 }
