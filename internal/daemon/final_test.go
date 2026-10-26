@@ -3,16 +3,19 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
 	"github.com/Cygnux-Labs/tracekit-box/internal/egress"
 	"github.com/Cygnux-Labs/tracekit-box/internal/image"
+	"github.com/Cygnux-Labs/tracekit-box/internal/tracekit"
 )
 
 // B1 (final check): the workspace build gets the box's secret values, and a workspace file that holds one refuses
@@ -109,5 +112,51 @@ func TestFinalScrubberFillStaysPlainInJSON(t *testing.T) {
 				t.Errorf("%s: %q, as JSON %s", what, out, js)
 			}
 		}
+	}
+}
+
+// Info (final check, after R5): an approval's record still in flight when the box stops is a call in flight, so
+// export (or rm) does not close the run under it: a late failure is then recorded in the run, not only logged.
+func TestFinalExportWaitsForAnApprovalRecord(t *testing.T) {
+	defer func(g time.Duration) { inFlightGrace = g }(inFlightGrace)
+	inFlightGrace = 100 * time.Millisecond
+	e := newTestEnv(t, func(o *Options) { o.ApprovalTimeout = time.Minute })
+	lc := &lateApprovalClient{Client: e.tk, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	e.d.opts.Tracekit = lc
+	e.create(api.CreateBoxRequest{Name: "ex"})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go e.proxy(0).cfg.Decider.Decide(ctx, egress.Request{Host: "x.example", Port: 443, URL: "https://x.example:443"})
+	deadline := time.Now().Add(5 * time.Second)
+	for len(e.d.Approvals()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	pend := e.d.Approvals()
+	if len(pend) != 1 {
+		t.Fatalf("approvals %+v", pend)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		e.d.DecideApproval(pend[0].ID, api.ApprovalDecision{Decision: "approve"}, 1000)
+	}()
+	<-lc.entered
+	cancel()
+	e.d.Stop(context.Background(), "ex", api.StopRequest{})
+	b, _ := e.d.lookup("ex")
+	var inflight errCallsInFlight
+	if err := b.closeRun(context.Background(), "export"); !errors.As(err, &inflight) {
+		t.Fatalf("export closed the run under an approval record in flight: %v", err)
+	}
+	close(lc.release)
+	<-done
+	if err := b.closeRun(context.Background(), "export"); err != nil {
+		t.Fatalf("export once the record is done: %v", err)
+	}
+	if n := gapsOf(e, 0, tracekit.SourceApproval); n != 1 {
+		t.Errorf("tkbox.gap for %s = %d, want 1: %v", tracekit.SourceApproval, n, e.run(0).Methods())
+	}
+	if m := e.run(0).Methods(); m[len(m)-1] != "close" {
+		t.Errorf("the run was not closed last: %v", m)
 	}
 }

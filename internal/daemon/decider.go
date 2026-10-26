@@ -239,6 +239,9 @@ func (d *Daemon) finish(a *approval, state, by, scope string) bool {
 	value := map[string]any{"approval_id": view.ID, "target": view.Target, "decision": state, "approver": by, "scope": scope}
 	var recErr error
 	if state == approvalApproved {
+		// the record (and the loss record if it fails) is a call in flight: export and rm don't close the run under it
+		b.calls.begin()
+		defer b.calls.end()
 		b.mu.Lock()
 		run := b.run
 		b.mu.Unlock()
