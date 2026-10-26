@@ -312,8 +312,8 @@ files itself:
 - Afterwards every written file is checked against what the signer decided; a file that differs is reported
   (`applied, but … differ from what was decided: …`).
 
-The git commands apply runs in the real checkout (`rev-parse`, `check-ignore`), like the work-tree check when a box
-is created, run so that no program the checkout's config names can run:
+Every git command Box runs in the real checkout (apply's `rev-parse` and `check-ignore`, the work-tree check when a
+box is created, and the workspace builder's `ls-files`) runs so that no program the checkout's config names can run:
 
 - every `GIT_*` variable of the daemon's environment removed, and `GIT_PAGER=cat`, `PAGER=cat`,
   `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` and `GIT_ATTR_NOSYSTEM=1` set;
@@ -437,7 +437,7 @@ env and limits. A `tkbox_run` call can only narrow those settings:
 - `task`: refused (`tkbox_run takes no task: …`). The box records the config's `task` (the operator's), the only task
   recorded as trusted; what the orchestrator asks of the agent goes in its commands, which are decided one by one.
 - `name`: refused (`tkbox_run takes no name: a box created over MCP is named by its id`). The box gets its id as its
-  name, unless the config sets `name`.
+  name, even when the config sets `name`.
 
 A refused call says what it would have widened, with the hint ``an MCP client may only narrow what the operator set up
 in `tkbox mcp` (--config, --image, --workspace-root); ask the operator``. Boxes made over MCP record the agent name
