@@ -243,8 +243,15 @@ runs:
         TKB_COMMAND: ${{ inputs.command }}
         TKB_TIMEOUT: ${{ inputs.timeout }}
       run: |
+        # The agent's output streams into the job log, where the runner would obey workflow commands it prints
+        # (::error::, ::add-mask::, ::stop-commands::). Stop them with a token the agent can't know while it runs,
+        # its stderr merged into stdout so the stop comes first, and resume them however the step ends.
+        token=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)
+        resume() { if [ -n "$token" ]; then echo "::$token::"; token=; fi; }
+        trap resume EXIT
+        echo "::stop-commands::$token"
         code=0
-        run() { "$@" || code=$?; }
+        run() { "$@" 2>&1 || code=$?; }
         case "$TKB_AGENT" in
           claude-code)
             run tkbox exec "$TKB_BOX" -- npm i -g @anthropic-ai/claude-code
@@ -266,6 +273,7 @@ runs:
             run tkbox exec "$TKB_BOX" --timeout "$TKB_TIMEOUT" -- sh -c "$TKB_COMMAND"
             ;;
         esac
+        resume
         case "$code" in
           0) ;;
           124) echo "::warning::the agent timed out after $TKB_TIMEOUT (raise the timeout input)" ;;
@@ -282,7 +290,12 @@ runs:
       shell: bash
       env:
         TKB_BOX: ${{ steps.box.outputs.name }}
-      run: tkbox stop "$TKB_BOX"
+      run: |
+        # what stop prints (warnings, the diff summary) names files the agent chose: no workflow commands in it
+        token=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)
+        trap 'echo "::$token::"' EXIT
+        echo "::stop-commands::$token"
+        tkbox stop "$TKB_BOX" 2>&1
 
     - name: Take the changes
       id: changes
@@ -294,10 +307,18 @@ runs:
         TKB_APPLY: ${{ inputs.apply }}
         TKB_AGENT_CODE: ${{ steps.agent.outputs.code }}
       run: |
+        # diff and apply print paths the agent chose: run them with workflow commands stopped (stderr to the log's
+        # stdout, after the stop), and resume however the step ends
+        exec 3>&1
+        token=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)
+        stopped=
+        resume() { if [ -n "$stopped" ]; then echo "::$token::" >&3; stopped=; fi; }
+        trap resume EXIT
+        quiet() { local rc=0; echo "::stop-commands::$token" >&3; stopped=1; "$@" 2>&3 || rc=$?; resume; return "$rc"; }
         mkdir -p "$TKB_OUT"
         patch="$TKB_OUT/tracekit-box.patch"
         echo "patch=$patch" >> "$GITHUB_OUTPUT"
-        tkbox diff "$TKB_BOX" > "$patch"
+        quiet tkbox diff "$TKB_BOX" > "$patch"
         files=$(sed -n 's|^diff --git a/.* b/||p' "$patch")
         delim="tkbox_$(python -c 'import secrets; print(secrets.token_hex(16))')"
         { echo "files<<$delim"; printf '%s\n' "$files"; echo "$delim"; } >> "$GITHUB_OUTPUT"
@@ -310,7 +331,7 @@ runs:
         elif [ "$TKB_AGENT_CODE" != 0 ]; then
           echo "::warning::not applying: the agent exited ${TKB_AGENT_CODE:-without a code}; the patch is in $patch"
         else
-          tkbox apply "$TKB_BOX" || apply_code=$?
+          quiet tkbox apply "$TKB_BOX" || apply_code=$?
           if [ "$apply_code" = 0 ]; then
             applied=true
           else

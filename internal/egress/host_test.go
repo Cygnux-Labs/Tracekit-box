@@ -15,7 +15,9 @@ func TestNormalizeHost(t *testing.T) {
 		"a-b.c":                          "a-b.c",
 		"1.2.3.4":                        "1.2.3.4",
 		"2001:DB8::1":                    "2001:db8::1",
-		"::ffff:10.0.0.1":                "::ffff:10.0.0.1",
+		"::ffff:10.0.0.1":                "10.0.0.1", // IPv4-mapped: the IPv4 address, as the allowlist matches it
+		"::FFFF:1.2.3.4":                 "1.2.3.4",
+		"::ffff:0:1.2.3.4":               "::ffff:0:102:304", // SIIT is not mapped and stays IPv6
 		"api.github.com":                 "api.github.com",
 		"s3.amazonaws.com":               "s3.amazonaws.com",
 		"x1.example.co.uk.":              "x1.example.co.uk",
@@ -53,6 +55,7 @@ func TestParseAuthority(t *testing.T) {
 		{"example.com", 80, "example.com", 80},
 		{"[::1]", 80, "::1", 80},
 		{"1.2.3.4:80", 0, "1.2.3.4", 80},
+		{"[::ffff:1.2.3.4]:443", 0, "1.2.3.4", 443},
 	}
 	for _, c := range cases {
 		h, _, p, err := parseAuthority(c.in, c.def)

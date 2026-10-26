@@ -14,11 +14,16 @@ import (
 
 // Request is what the Decider is asked about one new connection (CONNECT) or one absolute-form HTTP request.
 type Request struct {
-	BoxID       string
-	Scheme      string // "https" for CONNECT, "http" for an absolute-form request
-	Host        string // lower case, no trailing dot; a name or an IP literal as the client sent it
-	Port        int
-	URL         string       // canonical "<scheme>://<host>:<port>", the WebFetch args url
+	BoxID string
+	// Scheme is "https" for a CONNECT to port 443, "tcp" for a CONNECT to any other port (a TCP tunnel: the decision
+	// comes before the first byte, and an allow entry that names the port lets any protocol through), and "http"
+	// for an absolute-form request.
+	Scheme string
+	Host   string // lower case, no trailing dot; a name or an IP literal as the client sent it (IPv4-mapped unmapped)
+	Port   int
+	// URL is the canonical "<scheme>://<host>:<port>" (https://example.com:443, tcp://git.example.com:22,
+	// http://example.com:80), the WebFetch args url.
+	URL         string
 	OnAllowlist bool         // the host:port matches the box's allowlist
 	Addrs       []netip.Addr // what Host resolved to; all of them passed the address checks
 }
@@ -74,9 +79,11 @@ type Sink interface {
 
 // Secret is one bound secret. The guest only ever sees Placeholder.
 //
-// On inspected connections the proxy also guards the value itself: it is redacted from response headers, trailers
-// and bodies (so a host that echoes the credential never hands it to the guest), and a request that carries the
-// value (verbatim, percent-encoded, JSON-escaped or base64) anywhere but its Header on one of its Hosts is a leak.
+// On inspected connections the proxy also guards the value itself, in its raw, percent-encoded, JSON-escaped, hex
+// and base64 forms, each matched without regard to ASCII case: those forms are redacted from response headers,
+// trailers and bodies, and a request that carries one anywhere but its Header on one of its Hosts is a leak. A host
+// that echoes the credential in another encoding (HTML character references, split across lines, the base64 of a
+// case-changed value, ...) does hand it to the guest; values shorter than 6 bytes are not redacted at all.
 //
 // So that the value can be redacted, requests to a bound host go without Range (a 206 answer is refused), and a
 // request to a bound host that asks to upgrade the connection (WebSocket, h2c) is refused: Box could not keep the

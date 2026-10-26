@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -445,6 +446,67 @@ func TestEchoedValueRedactedFromBody(t *testing.T) {
 	noSecret(t, "basic echo", b, gh, other)
 	if resp.StatusCode != 200 || !strings.Contains(b, "redacted") {
 		t.Errorf("basic: %s %q", resp.Status, b)
+	}
+}
+
+// A bound host that reflects the credential upper- or lower-cased, or hex-encoded (either case), in a body or a
+// header: redaction matches without regard to case and knows the hex form, at the same length so Content-Length
+// holds, and also when the form is split across flushes. (Not covered, as docs/limits.md says: HTML character
+// references, a value split across lines, and encodings of a case-changed value.)
+func TestEchoedCaseAndHexFormsRedacted(t *testing.T) {
+	checkGoroutines(t)
+	e, port, gh, other := echoEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		v := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		var echo string
+		switch r.URL.Path {
+		case "/upper":
+			echo = strings.ToUpper(v)
+		case "/lower":
+			echo = strings.ToLower(v)
+		case "/hex":
+			echo = hex.EncodeToString([]byte(v))
+		case "/HEX":
+			echo = strings.ToUpper(hex.EncodeToString([]byte("x" + v + "y")))
+		case "/hexsplit":
+			h := hex.EncodeToString([]byte(v))
+			fl := w.(http.Flusher)
+			for i := 1; i < len(h); i += 7 {
+				io.WriteString(w, "["+h[:i])
+				fl.Flush()
+				io.WriteString(w, strings.ToUpper(h[i:])+"]")
+				fl.Flush()
+			}
+			return
+		}
+		w.Header().Set("X-Echo", "got "+echo)
+		w.Header().Set("Content-Length", strconv.Itoa(len(echo)+6))
+		io.WriteString(w, "body "+echo+"\n")
+	})
+	hexv := hex.EncodeToString([]byte(gh.Value))
+	check := func(what, s string) {
+		t.Helper()
+		noSecret(t, what, s, gh, other)
+		low := strings.ToLower(s)
+		for _, f := range []string{strings.ToLower(gh.Value), hexv} {
+			if strings.Contains(low, f) {
+				t.Errorf("%s holds a form of the value: %q", what, s)
+			}
+		}
+	}
+	bearer := "Authorization: Bearer " + gh.Placeholder
+	for _, path := range []string{"/upper", "/lower", "/hex", "/HEX"} {
+		resp, b := rawGet(e, port, "example.com", path, bearer)
+		check(path+" body", b)
+		check(path+" header", resp.Header.Get("X-Echo"))
+		if resp.StatusCode != 200 || int64(len(b)) != resp.ContentLength || !strings.Contains(b, "redacted") ||
+			!strings.Contains(resp.Header.Get("X-Echo"), "redacted") {
+			t.Errorf("%s: %s CL=%d %q %q", path, resp.Status, resp.ContentLength, b, resp.Header.Get("X-Echo"))
+		}
+	}
+	resp, b := rawGet(e, port, "example.com", "/hexsplit", bearer)
+	check("hexsplit body", b)
+	if resp.StatusCode != 200 || strings.Count(b, "redacted") != (len(hexv)-1+6)/7 {
+		t.Errorf("hexsplit: %s %q", resp.Status, b)
 	}
 }
 

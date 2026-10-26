@@ -2,10 +2,13 @@ package egress
 
 import (
 	"context"
+	"encoding/hex"
 	"net"
 	"net/netip"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 type nopDecider struct{}
@@ -70,6 +73,40 @@ func TestNewValidates(t *testing.T) {
 	}
 	if err := p.Serve(l); err == nil {
 		t.Error("Serve after Close succeeded")
+	}
+}
+
+// Events and refusals are redacted of every value form in any case, and a value that its own marker contains
+// ("secret" in "[secret SECRET]") is replaced once, not forever.
+func TestRedactFoldsEveryForm(t *testing.T) {
+	gh := mkSecret(t, "GH", "", "a.com")
+	gh.Value = "Secret/Value+0123"
+	sec := mkSecret(t, "SECRET", "", "b.com")
+	sec.Value = "secret"
+	var rules []*secretRule
+	for _, s := range []Secret{gh, sec} {
+		r, err := newSecretRule(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rules = append(rules, r)
+	}
+	p := &Proxy{secrets: rules[:1]}
+	in := "a " + strings.ToUpper(gh.Value) + " b " + strings.ToUpper(hex.EncodeToString([]byte(gh.Value))) +
+		" c " + hex.EncodeToString([]byte(gh.Value)) + " d " + strings.ToLower(url.QueryEscape(gh.Value))
+	if out, want := p.redact(in), "a [secret GH] b [secret GH] c [secret GH] d [secret GH]"; out != want {
+		t.Errorf("redact = %q, want %q", out, want)
+	}
+	p = &Proxy{secrets: rules[1:]}
+	done := make(chan string, 1)
+	go func() { done <- p.redact("SECRET and secret") }()
+	select {
+	case out := <-done:
+		if want := "[secret SECRET] and [secret SECRET]"; out != want {
+			t.Errorf("redact = %q, want %q", out, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("redact did not return: it keeps matching the value inside its own marker")
 	}
 }
 

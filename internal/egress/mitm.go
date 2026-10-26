@@ -520,6 +520,10 @@ func (p *Proxy) servePlain(s *session, req *http.Request, br *bufio.Reader) {
 		return
 	}
 	t := target{scheme: "http", host: host, addr: lit, port: port}
+	if r := p.offAllowlistInspectAll(t, false); r != nil {
+		p.deny(s, s.client, t, req.Method, path, *r)
+		return
+	}
 	addrs, ok := p.admit(s, s.client, br, t, req.Method, path)
 	if !ok {
 		return

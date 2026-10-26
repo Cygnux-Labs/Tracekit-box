@@ -119,6 +119,26 @@ func TestCANameConstraints(t *testing.T) {
 	}
 }
 
+// An empty, non-nil host list (inspect all with no allow entries and no secrets) is a CA for no host at all, in
+// Permits and in the certificate: with no DNS subtree written, X.509 would permit every name.
+func TestCAEmptyHostsPermitsNothing(t *testing.T) {
+	ca, err := NewCAWith("box-3", CAOptions{Hosts: []string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(ca.cert)
+	for _, h := range []string{"evil.example", "github.com", "8.8.8.8", "2606:4700::1111"} {
+		if ca.Permits(h) {
+			t.Errorf("Permits(%s) with no hosts", h)
+		}
+		if _, err := ca.leaf(h); err == nil {
+			t.Errorf("leaf(%s) minted with no hosts", h)
+		}
+		mustVerifyFails(t, ca, roots, h)
+	}
+}
+
 // mustVerifyFails mints a leaf for host directly (bypassing Permits) and checks Go's verifier refuses it.
 func mustVerifyFails(t *testing.T, ca *CA, roots *x509.CertPool, host string) bool {
 	t.Helper()
