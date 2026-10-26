@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"fmt"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
+	"github.com/Cygnux-Labs/tracekit-box/internal/guest"
 	"github.com/Cygnux-Labs/tracekit-box/internal/tracekit"
 )
 
@@ -66,6 +69,122 @@ func (c gitCall) inCheckout(ws string) bool {
 		return true
 	}
 	return slices.Contains(c.args, "--work-tree="+ws)
+}
+
+// oracle runs gitAgrees on patch against files.
+func oracle(t *testing.T, patch string, files []*patchFile) error {
+	t.Helper()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "p.patch")
+	os.WriteFile(p, []byte(patch), 0o600)
+	return gitAgrees(context.Background(), dir, p, files)
+}
+
+// A3 (b): git is the oracle: before anything is decided, the set of paths (and creations, deletions, mode changes)
+// git reads from the patch must be exactly the parser's. A patch the parser reads but git does not is refused before
+// any decision.
+func TestApplyLeadsGitIsTheOracle(t *testing.T) {
+	needGit(t)
+	a := modify("a.txt") + newFileSection("dir/b c.txt", "b") +
+		"diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n" +
+		"diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n--- a/gone.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n" +
+		"diff --git \"a/q\\\"\\tü\" \"b/q\\\"\\tü\"\nnew file mode 120000\n--- /dev/null\n+++ \"b/q\\\"\\tü\"\n@@ -0,0 +1 @@\n+target\n\\ No newline at end of file\n" +
+		"diff --git a/b.bin b/b.bin\nnew file mode 100644\nindex 0000000..1111111\nGIT binary patch\nliteral 3\nLc-mrMWC9ET00#gB\n\n"
+	fa, err := parsePatch(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := oracle(t, a, fa); err != nil {
+		t.Fatalf("git and tkbox read the same patch differently: %v", err)
+	}
+	fb, _ := parsePatch(modify("a.txt") + newFileSection("other.txt", "b"))
+	if err := oracle(t, a, fb); err == nil {
+		t.Fatal("a different set of paths passed")
+	}
+	fc, _ := parsePatch(strings.Replace(a, "new mode 100755", "new mode 100644\nnew mode 100755", 1))
+	fc[2].OldMode = "100755" // tkbox would see no mode change
+	if err := oracle(t, a, fc); err == nil {
+		t.Fatal("a different mode change passed")
+	}
+
+	// the parser reads a short "\" line inside a hunk as "no newline"; git reads the patch as corrupt
+	bad := "diff --git a/a.txt b/a.txt\nindex 1111111..2222222 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n\\x\n+new\n"
+	if _, err := parsePatch(bad); err != nil {
+		t.Fatalf("the parser refuses the probe patch already: %v", err)
+	}
+	e := newTestEnv(t, nil)
+	ws := t.TempDir()
+	gitInit(t, ws)
+	os.WriteFile(filepath.Join(ws, "a.txt"), []byte("old\n"), 0o644)
+	e.guest.Patch = bad
+	e.create(api.CreateBoxRequest{Name: "o", Workspace: ws})
+	e.d.Stop(context.Background(), "o", api.StopRequest{})
+	_, err = e.d.Apply(context.Background(), "o", api.ApplyRequest{})
+	if errCode(err) != api.CodeBadRequest || !strings.Contains(err.Error(), "git reads the patch differently") {
+		t.Fatalf("a patch git reads differently: %v", err)
+	}
+	for _, r := range e.run(0).Records {
+		if r.Call.Tool == tracekit.ToolWrite {
+			t.Fatalf("a Write was decided for a patch git reads differently: %+v", r)
+		}
+	}
+}
+
+// A3: a differential test over the guest's real patches (binary literals of every line length, text, new files,
+// modes and symlinks): the parser and git must read them the same way, and the binary sections parse strictly.
+func TestApplyLeadsParserAgreesWithGitOnGuestPatches(t *testing.T) {
+	needGit(t)
+	base, upper := t.TempDir(), t.TempDir()
+	rng := rand.New(rand.NewPCG(1, 2))
+	var sizes []int
+	for _, n := range []int{0, 1, 2, 3, 4, 5, 25, 26, 27, 51, 52, 53, 104, 1000, 70000} {
+		sizes = append(sizes, n)
+	}
+	for _, n := range sizes {
+		data := make([]byte, n)
+		for i := range data {
+			data[i] = byte(rng.UintN(256))
+		}
+		if n > 0 {
+			data[0] = 0 // binary
+		}
+		os.WriteFile(filepath.Join(upper, fmt.Sprintf("bin-%d.dat", n)), data, 0o644)
+		os.WriteFile(filepath.Join(base, fmt.Sprintf("mod-%d.dat", n)), append([]byte{0}, data...), 0o644)
+		os.WriteFile(filepath.Join(upper, fmt.Sprintf("mod-%d.dat", n)), append([]byte{0, 1}, data...), 0o755)
+	}
+	os.WriteFile(filepath.Join(base, "text.txt"), []byte("one\ntwo\nthree\n"), 0o644)
+	os.WriteFile(filepath.Join(upper, "text.txt"), []byte("one\n2\nthree\nfour"), 0o644)
+	os.WriteFile(filepath.Join(base, "exec.sh"), []byte("echo\n"), 0o644)
+	os.WriteFile(filepath.Join(upper, "exec.sh"), []byte("echo\n"), 0o755)
+	os.MkdirAll(filepath.Join(upper, "dir with space", "ü"), 0o755)
+	os.WriteFile(filepath.Join(upper, "dir with space", "ü", "tab\tname"), []byte("x\n"), 0o644)
+	os.Symlink("../target", filepath.Join(upper, "link"))
+	sum, patch, err := guest.Diff(&guest.DirTree{Root: upper}, &guest.DirTree{Root: base}, 64<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := parsePatch(string(patch))
+	if err != nil {
+		t.Fatalf("the parser refuses the guest's patch: %v", err)
+	}
+	if len(files) != len(sum.Files) {
+		t.Fatalf("%d sections parsed, the guest wrote %d", len(files), len(sum.Files))
+	}
+	bins := 0
+	for i, f := range files {
+		if f.Binary != sum.Files[i].Binary {
+			t.Errorf("%s: binary %v, the guest says %v", sum.Files[i].Path, f.Binary, sum.Files[i].Binary)
+		}
+		if f.Binary {
+			bins++
+		}
+	}
+	if bins < 2*len(sizes)-2 {
+		t.Fatalf("only %d binary sections", bins)
+	}
+	if err := oracle(t, string(patch), files); err != nil {
+		t.Fatalf("git and tkbox read the guest's patch differently: %v", err)
+	}
 }
 
 // A2: git never applies the patch to the checkout itself. The result is built in a scratch copy and written only once

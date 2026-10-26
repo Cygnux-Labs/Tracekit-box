@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -267,6 +268,10 @@ func (d *Daemon) Apply(ctx context.Context, ref string, req api.ApplyRequest) (a
 	}
 	if err != nil {
 		return api.ApplyResult{}, asAPIError(err)
+	}
+	// git itself must read the patch exactly as the parser did: every path it would touch is one that was checked
+	if err := gitAgrees(ctx, b.dir, applyPath, kept); err != nil {
+		return refuse("git reads the patch differently than tkbox does, so it is refused: %v", err)
 	}
 	pv, out, err := previewApply(ctx, dir, b.dir, kept, paths, applyPath)
 	if err != nil {
@@ -734,6 +739,145 @@ func hostGitConfig(ctx context.Context, dir, key string) string {
 		return ""
 	}
 	return strings.TrimRight(string(out), "\n")
+}
+
+// gitAgrees asks git itself what the patch touches (`git apply --numstat -z` and `--summary -z`, with an empty git
+// dir and an empty scratch work tree) and requires exactly what the parser saw: the same file sections in the same
+// order, by path and binary-ness, with the same creations, deletions and mode changes. Any disagreement, and anything
+// git says on stderr (it may stop reading a patch half way, warn, and still exit 0), refuses the patch.
+func gitAgrees(ctx context.Context, scratch, patchPath string, files []*patchFile) error {
+	actx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	gitDir, err := scratchGitDir(actx, scratch)
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(gitDir)
+	work, err := os.MkdirTemp(scratch, ".apply-oracle-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(work)
+	gitSays := func(args ...string) (string, error) {
+		cmd := checkoutGit(actx, work, []string{"core.hooksPath=/dev/null", "core.bare=false"},
+			append([]string{"--git-dir=" + gitDir, "--work-tree=" + work, "apply"}, args...)...)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		if msg := strings.TrimSpace(stderr.String()); err != nil || msg != "" {
+			if msg == "" {
+				msg = err.Error()
+			}
+			return "", fmt.Errorf("git does not read the patch cleanly: %s", strings.SplitN(msg, "\n", 2)[0])
+		}
+		return stdout.String(), nil
+	}
+	num, err := gitSays("--numstat", "-z", patchPath)
+	if err != nil {
+		return err
+	}
+	sum, err := gitSays("--summary", "-z", patchPath)
+	if err != nil {
+		return err
+	}
+	// numstat -z: "added\tdeleted\tpath\0" ("-\t-" for binary), or "added\tdeleted\t\0old\0new\0" for a rename or copy
+	var got []string
+	fields := strings.Split(num, "\x00")
+	for i := 0; i < len(fields); i++ {
+		if fields[i] == "" && i == len(fields)-1 {
+			break
+		}
+		parts := strings.SplitN(fields[i], "\t", 3)
+		switch {
+		case len(parts) != 3:
+			return fmt.Errorf("unexpected git apply --numstat output %q", trunc(fields[i]))
+		case parts[2] == "" && i+2 < len(fields):
+			got = append(got, "rename/copy "+fields[i+1]+" -> "+fields[i+2])
+			i += 2
+		default:
+			got = append(got, fmt.Sprintf("binary=%v %s", parts[0] == "-" && parts[1] == "-", parts[2]))
+		}
+	}
+	var want []string
+	var wantSum, wantSumQuoted strings.Builder
+	for _, f := range files {
+		if f.Rename || f.Copy {
+			want = append(want, "rename/copy "+f.Old+" -> "+f.New)
+			continue
+		}
+		p := f.New
+		if p == "" {
+			p = f.Old
+		}
+		want = append(want, fmt.Sprintf("binary=%v %s", f.Binary, p))
+		line := ""
+		switch {
+		case f.Old == "":
+			line = " create mode " + f.NewMode + " "
+		case f.Deleted:
+			line = " delete mode " + f.OldMode + " "
+		case f.NewMode != "" && f.NewMode != f.OldMode:
+			line = " mode change " + f.OldMode + " => " + f.NewMode + " "
+		default:
+			continue
+		}
+		wantSum.WriteString(line + p + "\n")
+		wantSumQuoted.WriteString(line + gitQuote(p) + "\n")
+	}
+	if !slices.Equal(got, want) {
+		return fmt.Errorf("git reads it as touching %s, tkbox as %s", trunc(strings.Join(got, "; ")), trunc(strings.Join(want, "; ")))
+	}
+	if sum != wantSum.String() && sum != wantSumQuoted.String() {
+		return fmt.Errorf("git's creations, deletions and mode changes (%q) differ from tkbox's (%q)", trunc(sum), trunc(wantSum.String()))
+	}
+	return nil
+}
+
+// gitQuote quotes a path as git's quote_c_style does when it must (a quote, a backslash, a control or non-ASCII
+// byte).
+func gitQuote(p string) string {
+	need := false
+	for i := 0; i < len(p); i++ {
+		if c := p[i]; c == '"' || c == '\\' || c < 0x20 || c >= 0x7f {
+			need = true
+			break
+		}
+	}
+	if !need {
+		return p
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(p); i++ {
+		switch c := p[i]; c {
+		case '\a':
+			b.WriteString(`\a`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\v':
+			b.WriteString(`\v`)
+		case '\f':
+			b.WriteString(`\f`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		default:
+			if c < 0x20 || c >= 0x7f {
+				fmt.Fprintf(&b, `\%03o`, c)
+			} else {
+				b.WriteByte(c)
+			}
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 // scratchGitDir makes a fresh, empty bare git dir under scratch, for git commands that must read no repository's
