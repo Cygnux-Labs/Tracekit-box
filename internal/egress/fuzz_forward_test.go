@@ -5,6 +5,7 @@ package egress
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"encoding/base64"
 	"io"
 	"net"
@@ -100,8 +101,10 @@ func hostHeaderFor(c fwdCase) string {
 //   - a real secret value reaches the upstream only in its bound header, on a request to a bound host over TLS;
 //   - no placeholder reaches the upstream;
 //   - the upstream sees Host: the tunnel's host and a request target naming no other host, and exactly one request;
-//   - on an inspected connection the guest never sees a secret value (in a form valueForms covers) that a bound host
-//     echoed back.
+//   - the upstream's path and query are the ones Box checked and records (the request's URL.Path and RawQuery; an
+//     empty path goes as "/");
+//   - on an inspected connection the guest never sees a secret value (in a form valueForms covers, in any case) that
+//     a bound host echoed back.
 func FuzzForward(f *testing.F) {
 	ca, err := NewCA("fuzz")
 	if err != nil {
@@ -127,6 +130,10 @@ func FuzzForward(f *testing.F) {
 		{0, "GET https:http://evil.example/x HTTP/1.1\r\nHost: {HOST}\r\nAuthorization: Bearer {PHGH}\r\n\r\n", "HTTP/1.1 204 No Content\r\n\r\n", nil},
 		// F2: a status below 100 carries a bound host's echo past the body redaction
 		{0, "GET /user HTTP/1.1\r\nHost: {HOST}\r\nAuthorization: Bearer {PHGH}\r\n\r\n", "HTTP/1.1 099 Echo\r\nContent-Length: 24\r\n\r\n{VGH}", nil},
+		// the path and query that go upstream are the ones checked and recorded
+		{0, "GET /a%2Fb/c?q=1&next=%2Fx HTTP/1.1\r\nHost: {HOST}\r\n\r\n", "HTTP/1.1 204 No Content\r\n\r\n", nil},
+		// a bound host's echo in another case
+		{0, "GET /user HTTP/1.1\r\nHost: {HOST}\r\nAuthorization: Bearer {PHGH}\r\n\r\n", "HTTP/1.1 200 OK\r\nX-Echo: {UVGH}\r\nContent-Length: 24\r\n\r\n{UVGH}", nil},
 	}
 	for _, s := range seeds {
 		f.Add(s.sel, s.req, s.resp, s.chunkSizes)
@@ -169,7 +176,7 @@ func FuzzForward(f *testing.F) {
 				}
 			}
 		}
-		respSub := strings.NewReplacer("{VGH}", fzValGH, "{VOAI}", fzValOAI, "{VPW}", fzValPW,
+		respSub := strings.NewReplacer("{VGH}", fzValGH, "{UVGH}", strings.ToUpper(fzValGH), "{VOAI}", fzValOAI, "{VPW}", fzValPW,
 			"{B64VGH}", base64.StdEncoding.EncodeToString([]byte(fzValGH)), "{PCTVPW}", url.QueryEscape(fzValPW),
 			"{PHGH}", phGH)
 		respBytes := []byte(respSub.Replace(respT))
@@ -273,6 +280,10 @@ func FuzzForward(f *testing.F) {
 			if !strings.HasPrefix(ureq.RequestURI, "/") && ureq.RequestURI != "*" {
 				t.Fatalf("upstream request target %q is not origin form (guest sent %q)", ureq.RequestURI, req.RequestURI)
 			}
+			if want := cmp.Or(req.URL.Path, "/"); ureq.URL.Path != want || ureq.URL.RawQuery != req.URL.RawQuery {
+				t.Fatalf("upstream path %q query %q, but Box checked and records path %q query %q (guest sent %q)",
+					ureq.URL.Path, ureq.URL.RawQuery, want, req.URL.RawQuery, req.RequestURI)
+			}
 			for v, name := range vals {
 				r := p.secrets[0]
 				for _, sr := range p.secrets {
@@ -317,9 +328,10 @@ func FuzzForward(f *testing.F) {
 				if !r.boundTo(c.t.host) {
 					continue
 				}
+				lowGuest := asciiLower(string(toGuest)) // the redactor matches every form in any case
 				for _, fm := range valueForms(v) {
-					if bytes.Contains(toGuest, []byte(fm)) {
-						t.Fatalf("the guest saw secret %s (form %q) echoed by %s:\n%q", name, fm, c.t.host, toGuest)
+					if strings.Contains(lowGuest, asciiLower(fm)) {
+						t.Fatalf("the guest saw secret %s (form %q, in some case) echoed by %s:\n%q", name, fm, c.t.host, toGuest)
 					}
 				}
 			}
