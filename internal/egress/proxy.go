@@ -513,6 +513,11 @@ func (p *Proxy) serveConnect(s *session, req *http.Request, br *bufio.Reader) {
 		s.linger(br)
 		return
 	}
+	if r := p.offAllowlistInspectAll(t, true); r != nil {
+		p.deny(s, s.client, t, "", "", *r)
+		s.linger(br)
+		return
+	}
 	inspect := p.cfg.Inspect == InspectAll || p.boundSecrets(host, lit)
 	if inspect && !p.cfg.CA.Permits(host) {
 		p.deny(s, s.client, t, "", "", refusal{status: 403,
@@ -546,6 +551,26 @@ func (p *Proxy) serveConnect(s *session, req *http.Request, br *bufio.Reader) {
 		return
 	}
 	p.serveTunnel(s, t, br, upm, rawOK)
+}
+
+// offAllowlistInspectAll is the refusal, with Inspect "all", of a host or port off the allowlist: refused at once,
+// before the Decider (so no person is asked and nothing is resolved). Box inspects every connection then, and the
+// box CA may impersonate only the allowlist's hosts; a port the allowlist does not name for the host is refused the
+// same way. nil when Inspect is "bound" or the host:port is on the allowlist.
+func (p *Proxy) offAllowlistInspectAll(t target, tunnel bool) *refusal {
+	if p.cfg.Inspect != InspectAll || p.allow.match(t.host, t.addr, t.port) {
+		return nil
+	}
+	if p.allow.matchHost(t.host, t.addr) {
+		return &refusal{status: 403, reason: fmt.Sprintf("with inspect: all, port %d of this host is not on the allow list, so it is refused without asking", t.port),
+			todo: "Ask the operator to allow " + hostPort(t.host, t.port) + ", or use a port the allow list names."}
+	}
+	if tunnel {
+		return &refusal{status: 403, reason: "Box must inspect this host but the box CA may not impersonate it",
+			todo: "Add the host to the box's allow list so the CA covers it."}
+	}
+	return &refusal{status: 403, reason: "with inspect: all, a host off the allow list is refused without asking",
+		todo: "Add the host to the box's allow list."}
 }
 
 // boundSecrets reports whether any secret is bound to host.

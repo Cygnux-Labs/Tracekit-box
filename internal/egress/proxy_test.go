@@ -1253,6 +1253,77 @@ func TestInspectAll(t *testing.T) {
 	}
 }
 
+// With inspect all, a host or port off the allowlist is refused at once: the Decider (and so a person) is never
+// asked and the name is never resolved. That holds for a port the allowlist does not name on an allowed host (the
+// CA covers the host, ports dropped, as the daemon builds it), for absolute-form HTTP, and for a box with no allow
+// entries at all.
+func TestInspectAllRefusesOffAllowlistAtOnce(t *testing.T) {
+	checkGoroutines(t)
+	const caMsg = "Box must inspect this host but the box CA may not impersonate it"
+	const portMsg = "is not on the allow list, so it is refused without asking"
+	const plainMsg = "with inspect: all, a host off the allow list is refused without asking"
+	for _, tc := range []struct {
+		name    string
+		allow   []string
+		caHosts []string
+		cases   map[string]string // CONNECT target or "GET <url>" -> part of X-Tkbox-Reason
+	}{
+		{"allow entries", []string{"example.com", "other.example:8443"}, []string{"example.com", "other.example"}, map[string]string{
+			"evil.example:443":             caMsg,
+			"example.com:8443":             portMsg,
+			"other.example:9999":           portMsg,
+			"other.example:443":            portMsg,
+			"GET http://evil.example/":     plainMsg,
+			"GET http://example.com:8080/": portMsg,
+		}},
+		{"no allow entries", nil, []string{}, map[string]string{
+			"evil.example:443":         caMsg,
+			"8.8.8.8:443":              caMsg,
+			"GET http://evil.example/": plainMsg,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ca, err := NewCAWith("box-test", CAOptions{Hosts: tc.caHosts})
+			if err != nil {
+				t.Fatal(err)
+			}
+			e := newEnv(t, func(c *Config) {
+				c.Inspect = InspectAll
+				c.Allow = tc.allow
+				c.CA = ca
+			})
+			e.res.set("evil.example", "127.0.0.1")
+			for target, want := range tc.cases {
+				var resp *http.Response
+				if u, ok := strings.CutPrefix(target, "GET "); ok {
+					c := e.dialProxy()
+					pu, _ := url.Parse(u)
+					fmt.Fprintf(c, "GET %s HTTP/1.1\r\nHost: %s\r\n\r\n", u, pu.Host)
+					if resp, err = http.ReadResponse(bufio.NewReader(c), nil); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					_, _, resp = e.rawConnect(target)
+				}
+				body(t, resp)
+				if resp.StatusCode != 403 || !strings.Contains(resp.Header.Get("X-Tkbox-Reason"), want) {
+					t.Errorf("%s: %s %q, want 403 with %q", target, resp.Status, resp.Header.Get("X-Tkbox-Reason"), want)
+				}
+			}
+			e.stop()
+			if len(e.dec.Requests) != 0 {
+				t.Errorf("the Decider was asked (a person would be): %+v", e.dec.Requests)
+			}
+			if l := e.res.lookups(); len(l) != 0 {
+				t.Errorf("names off the allowlist were resolved: %v", l)
+			}
+			if n := len(e.sink.events()); n != len(tc.cases) {
+				t.Errorf("%d events for %d refusals: %v", n, len(tc.cases), e.kinds())
+			}
+		})
+	}
+}
+
 func TestUpstreamUntrusted(t *testing.T) {
 	checkGoroutines(t)
 	e, rec, port, gh, _ := secretEnv(t, func(c *Config, _, _ *Secret) { c.UpstreamRoots = x509.NewCertPool() })

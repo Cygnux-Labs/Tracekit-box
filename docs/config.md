@@ -98,7 +98,7 @@ Presets:
 | `go-proxy` | `proxy.golang.org`, `sum.golang.org` | Go modules through the module proxy (`GOPROXY=direct` needs the VCS hosts as well) |
 
 A host that is not allowed is not refused outright: the connection waits up to 2 minutes (the daemon's
-`--approval-timeout`) for a person on the host to run `tkbox approve <id>`, except with `inspect: all`, which refuses it
+`--approval-timeout`) for a person on the host to run `tkbox approve <id>`, except with `inspect: all`, which refuses it (and a port the allowlist does not name for the host)
 at once. Loopback, private, link-local, metadata and this host's own addresses are refused whatever the allowlist says.
 
 ### Secrets

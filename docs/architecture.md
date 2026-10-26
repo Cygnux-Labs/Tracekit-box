@@ -126,7 +126,7 @@ the box's memory per tmpfs, and vanish with the box), and `/workspace` as an ove
   does not name the tunnel's host. A tunnel
   that is not TLS is allowed only to an allow entry that names the port (`host:port`), and such an entry lets any
   protocol through to that port.
-- MITM only for hosts with a bound secret (or every allowed host with `inspect: all`, which then refuses hosts off the
+- MITM only for hosts with a bound secret (or every allowed host with `inspect: all`, which then refuses hosts and ports off the
   allowlist at once), with a per-box ECDSA P-256 CA, name-constrained to those hosts, whose certificate reaches the
   guest through the boot config. The guest exports `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`,
   `GIT_SSL_CAINFO` and `CURL_CA_BUNDLE`. The MITM leaf offers HTTP/1.1 only; upstream TLS is verified against the

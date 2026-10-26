@@ -48,7 +48,8 @@ type CAOptions struct {
 	Lifetime time.Duration
 	// Hosts are the only hosts the CA may impersonate, written into critical X.509 name constraints: the bound
 	// secrets' hosts (exact, "*.example.com" or IP literals) and, with Inspect "all", the allowlist hosts.
-	// nil means unconstrained.
+	// nil means unconstrained; an empty, non-nil list means no host at all (the certificate permits only the
+	// reserved .invalid names and no IP address).
 	Hosts []string
 }
 
@@ -133,6 +134,12 @@ func constrain(tmpl *x509.Certificate, permit patterns) {
 			continue
 		}
 		tmpl.PermittedDNSDomains = append(tmpl.PermittedDNSDomains, p.host)
+	}
+	if len(permit) == 0 {
+		// No hosts at all: with no DNS subtree every name would be permitted, so permit only the reserved .invalid
+		// (RFC 6761), which no real name is under. (IP-only lists keep DNS open: OpenSSL checks an IP leaf's
+		// common name against DNS subtrees.)
+		tmpl.PermittedDNSDomains = []string{"invalid"}
 	}
 	if len(ips) > 0 {
 		tmpl.PermittedIPRanges = ips
