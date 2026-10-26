@@ -253,13 +253,10 @@ func (d *Daemon) finish(a *approval, state, by, scope string) bool {
 			b.mu.Unlock()
 		}
 		if recErr != nil {
-			// a lost approval is a lost must-record observe like any other: counted in the box's tkbox.gap record, and
-			// the box is stopped (fail closed); the waiting connection is refused below
-			b.mu.Lock()
-			if o := b.obs; o != nil {
-				o.lost(tracekit.SourceApproval, "the signer refused it or did not answer: "+recErr.Error())
-			}
-			b.mu.Unlock()
+			// a lost approval is a lost must-record observe like any other: counted in the box's tkbox.gap record (or
+			// recorded on its own when the stopping box already wrote that), and the box is stopped (fail closed); the
+			// waiting connection is refused below
+			b.recordLoss(tracekit.SourceApproval, "egress", "the signer refused it or did not answer: "+recErr.Error())
 			b.failClosed(tracekit.SourceApproval, recErr)
 		}
 	} else {

@@ -329,23 +329,27 @@ type observer struct {
 	last       time.Time
 	suppressed int
 	gaps       map[string]*gap // must-record observes lost, by source
-	gapsTaken  bool            // recordGaps took gaps: a later loss is recorded on its own (completeFailed)
+	gapsTaken  bool            // recordGaps took gaps: a later loss is recorded on its own (recordLoss)
 }
 
 // gapComplete is the tkbox.gap kind of completes that never reached the signer.
 const gapComplete = "complete"
 
 // completeFailed handles a complete the signer refused or never answered: the decided call then has no recorded
-// outcome, so it is counted into the box's tkbox.gap record (kind "complete") like a lost observe. While the box is
-// up it joins the gaps teardown records; afterwards (an apply of a stopped box, or a complete that finished after
-// teardown recorded the gaps) a tkbox.gap record is sent for it at once.
+// outcome, so it is counted into the box's tkbox.gap record (kind "complete") like a lost observe.
 func (b *box) completeFailed(door string, err error) {
-	reason := "the signer refused it or did not answer: " + err.Error()
 	b.event(api.EventSignerProblem, door, "complete failed: "+err.Error(), nil)
+	b.recordLoss(gapComplete, door, "the signer refused it or did not answer: "+err.Error())
+}
+
+// recordLoss counts one must-record record of kind that never reached the signer. While the box is up it joins the
+// gaps teardown records; afterwards (an apply of a stopped box, or a record that failed after teardown recorded the
+// gaps) a tkbox.gap record is sent for it at once.
+func (b *box) recordLoss(kind, door, reason string) {
 	b.mu.Lock()
 	o, run := b.obs, b.run
 	if o != nil && !o.gapsTaken {
-		o.lost(gapComplete, reason)
+		o.lost(kind, reason)
 		b.mu.Unlock()
 		return
 	}
@@ -355,9 +359,9 @@ func (b *box) completeFailed(door string, err error) {
 	}
 	ctx, cancel := context.WithTimeout(b.d.ctx, 30*time.Second)
 	defer cancel()
-	if gerr := run.Observe(ctx, sourceGap, trustedObs, map[string]any{"kind": gapComplete, "dropped": 1, "reason": reason}); gerr != nil {
-		b.event(api.EventSignerProblem, door, "a complete was lost and the loss could not be recorded: "+gerr.Error(), nil)
-		b.d.log.Printf("WARNING: box %s: a complete was lost and the loss could not be recorded in Tracekit: %v", b.id, gerr)
+	if gerr := run.Observe(ctx, sourceGap, trustedObs, map[string]any{"kind": kind, "dropped": 1, "reason": reason}); gerr != nil {
+		b.event(api.EventSignerProblem, door, "a "+kind+" record was lost and the loss could not be recorded: "+gerr.Error(), nil)
+		b.d.log.Printf("WARNING: box %s: a %s record was lost and the loss could not be recorded in Tracekit: %v", b.id, kind, gerr)
 	}
 }
 

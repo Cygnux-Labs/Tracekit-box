@@ -7,9 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
+	"github.com/Cygnux-Labs/tracekit-box/internal/egress"
 	"github.com/Cygnux-Labs/tracekit-box/internal/tracekit"
 )
 
@@ -79,5 +82,71 @@ func TestVerify5RepoAttributesOnlyWhenThePatchChangesThem(t *testing.T) {
 		if !decided {
 			t.Errorf("%s: the signer did not decide a.txt as the bytes written", c.name)
 		}
+	}
+}
+
+// lateApprovalClient holds every approval record until released, then fails it.
+type lateApprovalClient struct {
+	tracekit.Client
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *lateApprovalClient) NewRun(ctx context.Context, a tracekit.Agent) (tracekit.Run, error) {
+	r, err := c.Client.NewRun(ctx, a)
+	if err != nil {
+		return nil, err
+	}
+	return &lateApprovalRun{Run: r, c: c}, nil
+}
+
+type lateApprovalRun struct {
+	tracekit.Run
+	c *lateApprovalClient
+}
+
+func (r *lateApprovalRun) Observe(ctx context.Context, source, trust string, value any) error {
+	if source == tracekit.SourceApproval {
+		r.c.entered <- struct{}{}
+		<-r.c.release
+		return &tracekit.RPCError{Code: "internal", Message: "observe refused"}
+	}
+	return r.Run.Observe(ctx, source, trust, value)
+}
+
+// R5 (verify5): an approval whose record fails only after the stopping box wrote its tkbox.gap record is still
+// recorded as a loss (sent on its own, as a late complete is), not counted into gaps nobody reads again.
+func TestVerify5ApprovalLostAfterGapsTakenIsRecorded(t *testing.T) {
+	e := newTestEnv(t, func(o *Options) { o.ApprovalTimeout = time.Minute })
+	lc := &lateApprovalClient{Client: e.tk, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	e.d.opts.Tracekit = lc
+	e.create(api.CreateBoxRequest{Name: "ap"})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go e.proxy(0).cfg.Decider.Decide(ctx, egress.Request{Host: "x.example", Port: 443, URL: "https://x.example:443"})
+	deadline := time.Now().Add(5 * time.Second)
+	for len(e.d.Approvals()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	pend := e.d.Approvals()
+	if len(pend) != 1 {
+		t.Fatalf("approvals %+v", pend)
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		e.d.DecideApproval(pend[0].ID, api.ApprovalDecision{Decision: "approve"}, 1000)
+	}()
+	<-lc.entered // the approval's record is in flight
+	cancel()     // the proxy closing at stop cancels the waiting connection
+	e.d.Stop(context.Background(), "ap", api.StopRequest{})
+	close(lc.release) // the record fails only now, after the box wrote its gap record
+	wg.Wait()
+	for deadline = time.Now().Add(5 * time.Second); gapsOf(e, 0, tracekit.SourceApproval) == 0 && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := gapsOf(e, 0, tracekit.SourceApproval); n != 1 {
+		t.Errorf("tkbox.gap for %s = %d after the approval record failed late, want 1: %v", tracekit.SourceApproval, n, e.run(0).Methods())
 	}
 }
