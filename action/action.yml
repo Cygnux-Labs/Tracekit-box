@@ -111,8 +111,9 @@ runs:
         echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
         sudo udevadm control --reload-rules
         # wait for udev to apply the new mode before checking it: --settle waits for exactly the events it triggered
-        # (systemd 238+); an older udevadm triggers, then waits for its queue to drain
-        sudo udevadm trigger --settle --name-match=kvm 2>/dev/null \
+        # (systemd 238+), bounded here since it has no timeout of its own; an older udevadm triggers, then waits for its
+        # queue to drain
+        sudo timeout 30 udevadm trigger --settle --name-match=kvm 2>/dev/null \
           || { sudo udevadm trigger --name-match=kvm; sudo udevadm settle --timeout=10 || true; }
         if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
           echo "::error::this runner has no usable /dev/kvm; use a GitHub-hosted ubuntu-latest runner or a self-hosted runner with KVM"

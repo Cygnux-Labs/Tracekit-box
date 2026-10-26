@@ -23,8 +23,12 @@ jobs:
       - name: Run every fuzz target
         env:
           FUZZTIME: ${{ inputs.fuzztime || '60s' }}
+        # make expands the value it is given, so only a Go duration (60s, 1h30m) or a count (1000x) goes through.
         # -k: a failing target does not stop the rest, so every new failing input is collected below
-        run: make -k fuzz FUZZTIME="$FUZZTIME"
+        run: |
+          [[ "$FUZZTIME" =~ ^([0-9]+(ms|s|m|h))+$|^[0-9]+x$ ]] \
+            || { echo "::error::fuzztime must be a Go duration such as 60s or 1h30m, or a count such as 1000x"; exit 1; }
+          make -k fuzz FUZZTIME="$FUZZTIME"
       # A failing input is written under its package's testdata/fuzz; keep only the new ones.
       - name: Collect new failing inputs
         if: failure()
