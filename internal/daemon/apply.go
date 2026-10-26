@@ -183,6 +183,9 @@ func (d *Daemon) Apply(ctx context.Context, ref string, req api.ApplyRequest) (a
 	if err != nil {
 		return refuse("unsafe or unreadable patch: %v", err)
 	}
+	if applyParsedHook != nil {
+		applyParsedHook(files)
+	}
 	for _, f := range files {
 		if f.Copy || f.Rename {
 			return refuse("the patch copies or renames %q; a box never makes such patches, so it is refused", f.New)
@@ -468,6 +471,9 @@ func statFile(p string) (fileState, error) {
 
 // applyScratchHook, when set (tests), runs on the scratch copy after the decisions and before anything is written.
 var applyScratchHook func(scratch string)
+
+// applyParsedHook, when set (tests), may change the parser's reading of the patch: a parser that misreads it.
+var applyParsedHook func(files []*patchFile)
 
 // preview is a patch applied in a scratch copy of the files it touches: what each path will be (want), what it was
 // in the checkout when it was copied (before), and the scratch dir holding the result (the caller removes it).
