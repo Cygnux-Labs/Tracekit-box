@@ -30,6 +30,56 @@ func otherOwnerGit(t *testing.T) {
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
+// verify3b (A3b note): a patch with two sections for one path is refused outright (a symlink created and then
+// retargeted by a second section would have that section judged against the checkout), not by a side effect later.
+func TestVerify3bTwoSectionsForOnePathRefused(t *testing.T) {
+	link := func(target string) string {
+		return "diff --git a/l b/l\nnew file mode 120000\nindex 0000000..1111111\n--- /dev/null\n+++ b/l\n@@ -0,0 +1 @@\n+" + target + "\n\\ No newline at end of file\n"
+	}
+	retarget := "diff --git a/l b/l\n--- a/l\n+++ b/l\n@@ -1 +1 @@\n-inside\n\\ No newline at end of file\n+/etc/passwd\n\\ No newline at end of file\n"
+	del := "diff --git a/a.txt b/a.txt\ndeleted file mode 100644\n--- a/a.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n"
+	for name, p := range map[string]string{
+		"symlink retargeted":  link("inside") + retarget,
+		"modified twice":      modify("a.txt") + modify("a.txt"),
+		"deleted then made":   del + newFileSection("a.txt", "x"),
+		"created twice":       newFileSection("n.txt", "x") + newFileSection("n.txt", "y"),
+		"renamed onto a path": modify("b.txt") + "diff --git a/c.txt b/b.txt\nsimilarity index 100%\nrename from c.txt\nrename to b.txt\n",
+	} {
+		files, err := parsePatch(p)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		dir := t.TempDir()
+		os.WriteFile(filepath.Join(dir, "a.txt"), []byte("old\n"), 0o644)
+		if _, problems := checkPatch(files, dir); !slices.ContainsFunc(problems, func(s string) bool { return strings.Contains(s, "more than one section for") }) {
+			t.Errorf("%s: problems %q", name, problems)
+		}
+	}
+	files, _ := parsePatch(link("inside") + modify("a.txt"))
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "a.txt"), []byte("old\n"), 0o644)
+	if _, problems := checkPatch(files, dir); len(problems) != 0 {
+		t.Fatalf("one section per path: %q", problems)
+	}
+
+	// and through apply: refused before anything is decided
+	e := newTestEnv(t, nil)
+	ws, _ := filepath.EvalSymlinks(t.TempDir())
+	gitInit(t, ws)
+	e.guest.Patch = link("inside") + retarget
+	e.create(api.CreateBoxRequest{Name: "two", Workspace: ws})
+	e.d.Stop(context.Background(), "two", api.StopRequest{})
+	_, err := e.d.Apply(context.Background(), "two", api.ApplyRequest{})
+	if errCode(err) != api.CodeBadRequest || !strings.Contains(err.Error(), "more than one section") {
+		t.Fatalf("apply: %v", err)
+	}
+	for _, r := range e.run(0).Records {
+		if r.Call.Tool == tracekit.ToolWrite {
+			t.Fatalf("a Write was decided: %+v", r)
+		}
+	}
+}
+
 // verify3b V3: the scratch git that builds and checks an apply reads no user git files: a hostile
 // ~/.config/git/attributes (eol=crlf, ident) changes nothing written.
 func TestVerify3bScratchGitReadsNoUserAttributes(t *testing.T) {

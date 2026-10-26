@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -455,6 +456,7 @@ func gitLike(c string) bool {
 func checkPatch(files []*patchFile, dir string) ([]string, []string) {
 	var problems []string
 	seen := map[string]bool{}
+	touched := map[string]bool{} // every path an earlier section wrote or read
 	var out []string
 	for _, f := range files {
 		for _, n := range f.Names {
@@ -478,6 +480,18 @@ func checkPatch(files []*patchFile, dir string) ([]string, []string) {
 		}
 		if f.Old != "" && !f.Copy {
 			targets = append(targets, f.Old)
+		}
+		// each path is in one section only: git applies sections in turn, so a second section for a path (a symlink
+		// created, then retargeted) would be judged here against the checkout, not against the first one's result
+		names := slices.Compact(slices.Sorted(slices.Values(append(append([]string{}, targets...), f.Old))))
+		for _, n := range names {
+			if n == "" {
+				continue
+			}
+			if touched[n] {
+				problems = append(problems, fmt.Sprintf("the patch has more than one section for %q; a box never makes such patches", n))
+			}
+			touched[n] = true
 		}
 		for _, t := range targets {
 			if err := checkParents(dir, t); err != nil {
