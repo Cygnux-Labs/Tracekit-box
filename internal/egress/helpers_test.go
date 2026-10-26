@@ -174,3 +174,31 @@ func TestMarkerNeverRebuildsValue(t *testing.T) {
 		t.Errorf("an ordinary value redacts to %q", out)
 	}
 }
+
+// A "[secret NAME]" tag never rebuilds a value with the text around it, nor holds one: value "]abcdefg" before its
+// own tail, "secret S]" inside the tag, "[secret S]" itself, and "]tail12" after the tag a placeholder becomes. Events
+// and refusals carry what redact returns.
+func TestSecretTagNeverRebuildsValue(t *testing.T) {
+	ph, err := NewPlaceholder("S")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ value, text string }{
+		{"]abcdefg", "]abcdefgabcdefg"},
+		{"secret S]", "secret S]"},
+		{"[secret S]", "x[secret S]y"},
+		{"]tail12", ph + "tail12"},
+		{"ordinary-value", "path /x/ordinary-value/y"},
+	} {
+		r, err := newSecretRule(Secret{Name: "S", Placeholder: ph, Value: c.value, Hosts: []string{"a.example.com"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := &Proxy{secrets: []*secretRule{r}}
+		p.valMatch = newMatcher(p.valuePatterns())
+		out := p.redact(c.text)
+		if p.valMatch.findString(out) != nil || strings.Contains(strings.ToLower(out), "tkbox_") {
+			t.Errorf("value %q: %q redacts to %q", c.value, c.text, out)
+		}
+	}
+}

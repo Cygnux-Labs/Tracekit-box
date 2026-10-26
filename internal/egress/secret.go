@@ -195,6 +195,11 @@ func (p *Proxy) findTarget(target string) []*secretRule {
 // redact replaces every placeholder (and every value long enough to tell apart from ordinary text, in any of its
 // encoded forms) in s with "[secret NAME]", so events and refusals never carry one.
 func (p *Proxy) redact(s string) string {
+	return p.markRebuilt(p.tag(s))
+}
+
+// tag puts "[secret NAME]" in for every value form and placeholder in s.
+func (p *Proxy) tag(s string) string {
 	if len(p.secrets) == 0 || s == "" {
 		return s
 	}
@@ -219,6 +224,17 @@ func (p *Proxy) redact(s string) string {
 		}
 	}
 	return s
+}
+
+// markRebuilt overwrites with markers any value form left in s: a "[secret NAME]" tag, or a placeholder put in for a
+// value, can complete a value with the text around it ("]abc…" before its own tail). Markers never take part in a
+// match (see chooseMarkers), so nothing is left after one pass.
+func (p *Proxy) markRebuilt(s string) string {
+	if p.valMatch.findString(s) == nil {
+		return s
+	}
+	b, _ := io.ReadAll(newRedactReader(p.valMatch, strings.NewReader(s)))
+	return string(b)
 }
 
 // leakError is a placeholder going somewhere it may not.

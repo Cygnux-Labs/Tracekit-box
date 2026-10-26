@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -180,6 +181,7 @@ func (l *eventLog) stream(ctx context.Context, w io.Writer, flush func(), follow
 type scrubber struct {
 	pairs []string // old, new, … for strings.NewReplacer
 	r     *strings.Replacer
+	left  *strings.Replacer // see unrebuild
 }
 
 func newScrubber(secrets []egress.Secret) *scrubber {
@@ -195,15 +197,59 @@ func newScrubber(secrets []egress.Secret) *scrubber {
 	}
 	if len(s.pairs) > 0 {
 		s.r = strings.NewReplacer(s.pairs...)
+		s.left = unrebuild(secrets)
 	}
 	return s
+}
+
+// unrebuild returns a replacer that turns each secret value into a run of a byte no value holds, the same length,
+// for after the tags go in: a tag (or a placeholder's mark) can complete a value with the text around it ("]abc…"
+// before its own tail, or a value inside "secret NAME"). No value can take in a byte of such a run, so after the one
+// leftmost pass none is left. nil when no secret has a value.
+func unrebuild(secrets []egress.Secret) *strings.Replacer {
+	holds := func(c byte) bool {
+		return slices.ContainsFunc(secrets, func(s egress.Secret) bool { return strings.IndexByte(s.Value, c) >= 0 })
+	}
+	// "*#~" first, then printable ASCII that JSON writes as it is, then any byte; no value holds a NUL (the daemon
+	// refuses one), so the search ends there at the latest
+	fill := byte(0)
+	for _, c := range []byte("*#~") {
+		if !holds(c) {
+			fill = c
+			break
+		}
+	}
+	for c := byte('!'); fill == 0 && c <= '~'; c++ {
+		if !strings.ContainsRune(`"\<>&`, rune(c)) && !holds(c) {
+			fill = c
+		}
+	}
+	for c := 1; fill == 0 && c < 256; c++ {
+		if !holds(byte(c)) {
+			fill = byte(c)
+		}
+	}
+	var pairs []string
+	for _, s := range secrets {
+		if s.Value != "" {
+			pairs = append(pairs, s.Value, strings.Repeat(string([]byte{fill}), len(s.Value)))
+		}
+	}
+	if len(pairs) == 0 {
+		return nil
+	}
+	return strings.NewReplacer(pairs...)
 }
 
 func (s *scrubber) str(v string) string {
 	if s == nil || s.r == nil {
 		return v
 	}
-	return s.r.Replace(v)
+	v = s.r.Replace(v)
+	if s.left != nil {
+		v = s.left.Replace(v)
+	}
+	return v
 }
 
 // value scrubs strings inside maps and slices built from JSON-ish values.

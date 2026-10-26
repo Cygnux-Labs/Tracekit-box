@@ -294,11 +294,12 @@ func (q *stdinQueue) Read(p []byte) (int, error) {
 }
 
 // redactor returns what the decision shows of a value: a secret's placeholder as tkbox_NAME_…, its value as
-// [secret NAME].
+// [secret NAME], and a value those complete with the text around it as a run of filler (see unrebuild).
 func (b *box) redactor() func(string) string {
 	b.mu.Lock()
 	secrets := b.secrets
 	b.mu.Unlock()
+	left := unrebuild(secrets)
 	return func(v string) string {
 		for _, s := range secrets {
 			if s.Placeholder != "" {
@@ -307,6 +308,9 @@ func (b *box) redactor() func(string) string {
 			if s.Value != "" {
 				v = strings.ReplaceAll(v, s.Value, "[secret "+s.Name+"]")
 			}
+		}
+		if left != nil {
+			v = left.Replace(v)
 		}
 		return v
 	}
