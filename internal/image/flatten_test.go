@@ -3,6 +3,7 @@ package image
 import (
 	"archive/tar"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -308,10 +309,11 @@ func TestDebugfsQuote(t *testing.T) {
 
 func TestFixupsCommands(t *testing.T) {
 	st := newTestStager(t)
+	uid, gid := os.Getuid()+1, os.Getgid()+1 // never the staged files' owner, so commands must set them
 	if err := applyTar(t, st, mkTar(t,
 		ent{name: "bin/", typ: tar.TypeDir, mode: 0o755},
 		ent{name: "bin/su", body: "x", mode: 0o4755},
-		ent{name: "home/app/", typ: tar.TypeDir, uid: 1000, gid: 1001, mode: 0o750},
+		ent{name: "home/app/", typ: tar.TypeDir, uid: uid, gid: gid, mode: 0o750},
 		ent{name: "l", typ: tar.TypeSymlink, link: "bin"},
 	)); err != nil {
 		t.Fatal(err)
@@ -321,7 +323,8 @@ func TestFixupsCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := string(cmds)
-	for _, want := range []string{`sif "/bin/su" mode 0104755`, `sif "/home/app" uid 1000`, `sif "/home/app" gid 1001`} {
+	for _, want := range []string{`sif "/bin/su" mode 0104755`, fmt.Sprintf(`sif "/home/app" uid %d`, uid),
+		fmt.Sprintf(`sif "/home/app" gid %d`, gid)} {
 		if !strings.Contains(s, want+"\n") {
 			t.Errorf("missing %q in:\n%s", want, s)
 		}
