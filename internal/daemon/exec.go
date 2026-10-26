@@ -160,6 +160,12 @@ func (d *Daemon) prepareExec(ref string, req api.ExecRequest) (*box, *api.ErrorD
 		return nil, errf(api.CodeBadRequest, "run it through a shell instead, e.g. sh -c '…'",
 			"a program name with = can't take a per-command env")
 	}
+	// the decided command line joins argv with spaces and names each env variable, so a value split over bare words
+	// (`echo correct horse battery`) or used as an env name is in it as it is
+	if name := secretIn(b.commandLine(req), secrets); name != "" {
+		return nil, errf(api.CodeBadRequest, "use the secret's placeholder ($"+name+" in the box) instead; its value never enters the box",
+			"the command line the signer decides holds the value of secret %s", name)
+	}
 	if req.Stdin && req.StdinData != nil {
 		return nil, errf(api.CodeBadRequest, "send the input as stdin_data (known up front) or stream it (stdin: true), not both",
 			"stdin and stdin_data are both set")
