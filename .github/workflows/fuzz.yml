@@ -1,0 +1,39 @@
+name: fuzz
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: How long to run each fuzz target (a Go duration)
+        default: 60s
+permissions:
+  contents: read
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Run every fuzz target
+        env:
+          FUZZTIME: ${{ inputs.fuzztime || '60s' }}
+        run: make fuzz FUZZTIME="$FUZZTIME"
+      # A failing input is written under its package's testdata/fuzz; keep only the new ones.
+      - name: Collect new failing inputs
+        if: failure()
+        run: |
+          mkdir -p fuzz-failures
+          git ls-files -z --others --exclude-standard -- '*/testdata/fuzz/*' | xargs -0 -r cp --parents -t fuzz-failures
+      - name: Upload new failing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-failures
+          path: fuzz-failures
+          if-no-files-found: ignore

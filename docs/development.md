@@ -45,8 +45,14 @@ guest agent next to its own binary (or in `tkbox daemon --guest-dir DIR`), so ke
 ```sh
 make test                                 # go test ./...
 make race                                 # with the race detector
+make fuzz                                 # every fuzz target for FUZZTIME each (default 60s)
 cd sdk/python && python3 -m pytest -q     # Python SDK, against a fake daemon
 ```
+
+`go test ./...` runs each fuzz target's seeds and saved inputs (`testdata/fuzz/`). `make fuzz` searches for new ones,
+one target at a time (`make fuzz FUZZTIME=10m` for longer); a failing input is saved under that package's
+`testdata/fuzz/<target>/`, so commit it with the fix. The `fuzz` workflow runs `make fuzz` nightly and on demand, and
+uploads any new failing inputs as an artifact.
 
 The SDK tests need only `pytest` (`python3 -m venv .venv && .venv/bin/pip install pytest`); they run on Python 3.9 and
 newer and need no Linux host.

@@ -1,0 +1,5 @@
+go test fuzz v1
+byte('b')
+string("0 https:\u2006 HTTP/0.0\nHost:{HOST}\n\n")
+string("0")
+[]byte("0")
