@@ -31,6 +31,18 @@ func TestFuzzF6SecretFlagNeverEchoesTheValue(t *testing.T) {
 	if _, _, err := ParseSecretFlag("GH=env:GH_TOKEN@x/y"); err == nil || !strings.Contains(err.Error(), `host "x/y"`) {
 		t.Fatalf("env source with a bad host: %v", err)
 	}
+	// R2 (verify5): a pasted value with an = but no NAME= in front (base64 padding, a key=value token) shows nothing
+	// before its =: only a valid NAME is shown, and an upper-case one can't be told from a NAME
+	for _, c := range []struct{ flag, part string }{
+		{"c2VjcmV0dmFsdWUxMjM0NQ==", "c2VjcmV0dmFsdWUxMjM0NQ"},
+		{"ghp_AbC123secret=x", "ghp_AbC123secret"},
+		{"pass word=x", "pass word"},
+	} {
+		_, _, err := ParseSecretFlag(c.flag)
+		if err == nil || strings.Contains(err.Error(), c.part) || !strings.HasPrefix(err.Error(), `--secret "…": `) {
+			t.Errorf("--secret %s: %v", c.flag, err)
+		}
+	}
 }
 
 // FuzzParse: any tkbox.yaml either fails with an error or yields a config whose every limit is zero (the daemon's
@@ -131,7 +143,10 @@ func FuzzParseSecretFlag(f *testing.F) {
 				return
 			}
 			msg := err.Error()
-			shown := strconv.Quote(flagName + "=…") // the NAME= part is shown on purpose, nothing after it
+			shown := strconv.Quote("…") // a NAME= part is shown on purpose, nothing after it; anything else not at all
+			if secretNameRE.MatchString(flagName) {
+				shown = strconv.Quote(flagName + "=…")
+			}
 			if !strings.HasPrefix(msg, "--secret "+shown+": ") {
 				t.Fatalf("error does not show only NAME=…: %q", msg)
 			}

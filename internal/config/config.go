@@ -626,13 +626,16 @@ func ParseSecretFlag(s string) (string, Secret, error) {
 	return name, sec, nil
 }
 
-// redactFlag keeps only the NAME= part of a flag in an error, in case someone pasted a value.
+// redactFlag keeps only the NAME= part of a flag in an error, in case someone pasted a value. Text before the first =
+// that is no valid NAME may be the value itself (base64 padding, a key=value token), so it is not shown either.
 func redactFlag(s string) string {
 	if n, rest, ok := strings.Cut(s, "="); ok {
 		if strings.HasPrefix(rest, "env:") || strings.HasPrefix(rest, "file:") {
 			return s
 		}
-		return n + "=…"
+		if secretNameRE.MatchString(n) {
+			return n + "=…"
+		}
 	}
 	return "…"
 }
