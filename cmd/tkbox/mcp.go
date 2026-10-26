@@ -524,7 +524,7 @@ func (s *mcpServer) call(ctx context.Context, name string, raw json.RawMessage) 
 			}
 		}}
 		if a.Stdin != "" {
-			eio.Stdin = strings.NewReader(a.Stdin)
+			req.StdinData = []byte(a.Stdin) // known up front: the signer decides it with the command
 		}
 		st, err := s.c.exec(ctx, a.Box, req, eio)
 		var b strings.Builder

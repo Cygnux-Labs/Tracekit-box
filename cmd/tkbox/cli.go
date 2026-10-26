@@ -426,15 +426,19 @@ func cmdDiff(ctx context.Context, args []string, env *cliEnv) error {
 	if err != nil {
 		return err
 	}
-	patch, sum, err := newClient(*sock).diff(ctx, box)
-	if err != nil {
-		return err
-	}
 	if *stat {
+		sum, err := newClient(*sock).diffSummary(ctx, box)
+		if err != nil {
+			return err
+		}
 		for _, f := range sum.Files {
 			fmt.Fprintf(env.stdout, "%-9s %s\n", f.Status, printable(env.stdout, f.Path))
 		}
 		return nil
+	}
+	patch, sum, err := newClient(*sock).diff(ctx, box)
+	if err != nil {
+		return err
 	}
 	io.WriteString(env.stdout, printable(env.stdout, string(patch)))
 	fmt.Fprintf(env.stderr, "tkbox: %s changed\n", plural(len(sum.Files), "file"))

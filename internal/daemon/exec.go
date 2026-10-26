@@ -3,8 +3,11 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net"
 	"sort"
@@ -12,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/agentrpc"
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
@@ -56,10 +60,16 @@ func (b *box) notice(msg string) {
 
 var signalNames = map[string]bool{"SIGINT": true, "SIGTERM": true, "SIGKILL": true, "SIGHUP": true, "SIGQUIT": true}
 
-// loaderEnv are env names that change what a decided command runs without changing its argv; a per-exec env may not
-// set them (an operator's box env may).
+// loaderEnv are env names that change what a decided command runs without changing its argv (the dynamic loader,
+// shell startup files, which program a name resolves to, interpreter preloads and git's config); a per-exec env may
+// not set them (an operator's box env may). Every GIT_CONFIG_* name is refused too (see isLoaderEnv).
 var loaderEnv = map[string]bool{"LD_PRELOAD": true, "LD_LIBRARY_PATH": true, "LD_AUDIT": true, "BASH_ENV": true,
-	"ENV": true, "PROMPT_COMMAND": true}
+	"ENV": true, "PROMPT_COMMAND": true, "PATH": true, "NODE_OPTIONS": true, "PYTHONPATH": true, "PERL5OPT": true,
+	"RUBYOPT": true, "JAVA_TOOL_OPTIONS": true, "GCONV_PATH": true, "GIT_CONFIG": true}
+
+// isLoaderEnv reports whether a per-exec env may not set k: a loaderEnv name, or any GIT_CONFIG_ name
+// (GIT_CONFIG_COUNT, GIT_CONFIG_KEY_n, GIT_CONFIG_VALUE_n, GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, GIT_CONFIG_PARAMETERS, …).
+func isLoaderEnv(k string) bool { return loaderEnv[k] || strings.HasPrefix(k, "GIT_CONFIG_") }
 
 // prepareExec checks an exec request before the connection is upgraded, so a refusal is a plain JSON error.
 func (d *Daemon) prepareExec(ref string, req api.ExecRequest) (*box, *api.ErrorDetail) {
@@ -82,17 +92,32 @@ func (d *Daemon) prepareExec(ref string, req api.ExecRequest) (*box, *api.ErrorD
 			return nil, errf(api.CodeBadRequest, "remove the NUL byte from the command", "an argument has a NUL byte")
 		}
 	}
+	b.mu.Lock()
+	secrets := b.secrets
+	b.mu.Unlock()
 	for k, v := range req.Env {
 		if !envNameRE.MatchString(k) || strings.ContainsRune(v, 0) {
 			return nil, errf(api.CodeBadRequest, "env names are letters, digits and _; values can't hold NUL", "env %q is not a valid KEY=VALUE", k)
 		}
+		if name := secretIn(v, secrets); name != "" {
+			return nil, errf(api.CodeBadRequest, "use the secret's placeholder ($"+name+" in the box) instead; its value never enters the box",
+				"env %s holds the value of secret %s", k, name)
+		}
 		if reservedEnv[k] {
 			return nil, errf(api.CodeBadRequest, "every connection goes through the box's proxy", "env %s is set by the box and can't be overridden", k)
 		}
-		if loaderEnv[k] {
+		if isLoaderEnv(k) {
 			return nil, errf(api.CodeBadRequest, "it changes what the command runs without showing in the command the signer decides; put it in the command itself (e.g. sh -c '"+k+"=… cmd') so it is decided",
 				"env %s can't be set per command", k)
 		}
+	}
+	if req.Stdin && req.StdinData != nil {
+		return nil, errf(api.CodeBadRequest, "send the input as stdin_data (known up front) or stream it (stdin: true), not both",
+			"stdin and stdin_data are both set")
+	}
+	if len(req.StdinData) > api.MaxStdinData {
+		return nil, limitErr("stdin_data is %d bytes, over the %d MiB limit", "stream larger input instead (`tkbox exec -i`, or a file object in the SDK), or write it to a file in /workspace and read it from there",
+			len(req.StdinData), api.MaxStdinData>>20)
 	}
 	if req.Cwd != "" && !strings.HasPrefix(req.Cwd, "/") {
 		return nil, errf(api.CodeBadRequest, "pass --cwd /workspace/... (absolute)", "cwd %q must be an absolute path in the box", req.Cwd)
@@ -136,12 +161,21 @@ type stdinQueue struct {
 	overflow bool  // more than max waited: the rest is dropped, and Read never reports EOF (the process is killed)
 	dropped  int64 // bytes dropped since the overflow
 	ended    bool  // the exec is over
+	sum      hash.Hash
+	given    int64 // bytes handed to the process (hashed in sum)
 }
 
 func newStdinQueue(max int) *stdinQueue {
-	q := &stdinQueue{max: max}
+	q := &stdinQueue{max: max, sum: sha256.New()}
 	q.cond = sync.NewCond(&q.mu)
 	return q
+}
+
+// digest is the sha256 and size of the stdin handed to the process so far.
+func (q *stdinQueue) digest() (string, int64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return hex.EncodeToString(q.sum.Sum(nil)), q.given
 }
 
 // write queues p; it reports false the first time the queue overflows. From then on every byte is dropped (counted)
@@ -204,7 +238,10 @@ func (q *stdinQueue) Read(p []byte) (int, error) {
 		}
 		return 0, io.EOF
 	}
-	return q.buf.Read(p)
+	n, err := q.buf.Read(p)
+	q.sum.Write(p[:n])
+	q.given += int64(n)
+	return n, err
 }
 
 // bashArgs is what the signer decides for an exec: the command line and everything else that changes what runs.
@@ -217,7 +254,7 @@ func (b *box) bashArgs(req api.ExecRequest, line string) map[string]any {
 	b.mu.Lock()
 	secrets := b.secrets
 	b.mu.Unlock()
-	for k, v := range req.Env {
+	redact := func(v string) string {
 		for _, s := range secrets {
 			if s.Placeholder != "" {
 				v = strings.ReplaceAll(v, s.Placeholder, "tkbox_"+s.Name+"_…")
@@ -226,9 +263,22 @@ func (b *box) bashArgs(req api.ExecRequest, line string) map[string]any {
 				v = strings.ReplaceAll(v, s.Value, "[secret "+s.Name+"]")
 			}
 		}
-		env[k] = v
+		return v
 	}
-	return map[string]any{"command": line, "cwd": cwd, "env": env, "stdin": req.Stdin}
+	for k, v := range req.Env {
+		env[k] = redact(v)
+	}
+	args := map[string]any{"command": line, "cwd": cwd, "env": env, "stdin": req.Stdin || req.StdinData != nil}
+	if req.StdinData != nil {
+		// stdin known up front is decided with the command: a script piped into an interpreter is not run unseen
+		sum := sha256.Sum256(req.StdinData)
+		args["stdin_sha256"] = hex.EncodeToString(sum[:])
+		args["stdin_bytes"] = len(req.StdinData)
+		if len(req.StdinData) <= api.MaxStdinText && utf8.Valid(req.StdinData) {
+			args["stdin_text"] = redact(string(req.StdinData))
+		}
+	}
+	return args
 }
 
 // tooLongToRecord reports whether err is the signer's (or the client's) refusal of a frame over 1 MiB.
@@ -385,7 +435,7 @@ func (b *box) runExec(parent context.Context, conn net.Conn, r io.Reader, w io.W
 		cctx, cancel := context.WithTimeout(b.d.ctx, 30*time.Second)
 		defer cancel()
 		if err := run.Complete(cctx, call, dec, status, result); err != nil {
-			b.event(api.EventSignerProblem, "exec", "complete failed: "+err.Error(), nil)
+			b.completeFailed("exec", err)
 		}
 	}
 	if run != nil {
@@ -411,6 +461,7 @@ func (b *box) runExec(parent context.Context, conn net.Conn, r io.Reader, w io.W
 			}
 			return
 		}
+		b.pokeContainment(out.Decision)
 		if !out.Allowed {
 			if dctx.Err() != nil {
 				cancelled() // Gate withdrew the approval
@@ -458,10 +509,13 @@ func (b *box) runExec(parent context.Context, conn net.Conn, r io.Reader, w io.W
 	}
 	sort.Strings(env)
 	preq := proto.ExecRequest{Op: proto.OpExec, Argv: req.Argv, Env: env, Cwd: req.Cwd,
-		TimeoutMS: timeout.Milliseconds(), Stdin: req.Stdin}
+		TimeoutMS: timeout.Milliseconds(), Stdin: req.Stdin || req.StdinData != nil}
 	stdio := agentrpc.ExecIO{Stdout: proto.ChunkWriter{W: fw, Type: proto.TypeStdout},
 		Stderr: proto.ChunkWriter{W: fw, Type: proto.TypeStderr}, Signals: sess.sigs}
-	if req.Stdin {
+	switch {
+	case req.StdinData != nil:
+		stdio.Stdin = bytes.NewReader(req.StdinData) // exactly what was decided
+	case req.Stdin:
 		stdio.Stdin = stdin
 	}
 	ectx, ecancel := context.WithTimeout(ctx, timeout+30*time.Second) // host backstop; the guest enforces timeout
@@ -506,6 +560,12 @@ func (b *box) runExec(parent context.Context, conn net.Conn, r io.Reader, w io.W
 	result := map[string]any{"exit_code": es.Code, "signal": es.Signal, "timed_out": es.TimedOut, "duration_ms": es.DurationMS}
 	data := map[string]any{"command": line, "exit_code": es.Code, "signal": es.Signal, "timed_out": es.TimedOut, "duration_ms": es.DurationMS}
 	summary := fmt.Sprintf("exec exited %d: %s", es.Code, line)
+	if req.Stdin {
+		// streamed stdin was not known when the command was decided: its digest is recorded with the outcome
+		sum, n := stdin.digest()
+		result["stdin_sha256"], result["stdin_bytes"] = sum, n
+		data["stdin_sha256"], data["stdin_bytes"] = sum, n
+	}
 	if es.StdinTruncated {
 		result["stdin_truncated"], result["stdin_dropped_bytes"] = true, es.StdinDroppedBytes
 		data["stdin_truncated"], data["stdin_dropped_bytes"] = true, es.StdinDroppedBytes

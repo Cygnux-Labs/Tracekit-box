@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,6 +44,7 @@ func (d *Daemon) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/boxes/{box}/stop", d.hStop)
 	mux.HandleFunc("DELETE /v1/boxes/{box}", d.hRemove)
 	mux.HandleFunc("GET /v1/boxes/{box}/diff", d.hDiff)
+	mux.HandleFunc("GET /v1/boxes/{box}/diff/summary", d.hDiffSummary)
 	mux.HandleFunc("POST /v1/boxes/{box}/apply", d.hApply)
 	mux.HandleFunc("POST /v1/boxes/{box}/export", d.hExport)
 	mux.HandleFunc("GET /v1/boxes/{box}/events", d.hEvents)
@@ -113,8 +115,16 @@ func writeErr(w http.ResponseWriter, err error) {
 	writeJSON(w, httpStatus(e.Code), api.ErrorBody{Error: *e})
 }
 
-func readJSON(r *http.Request, v any) error {
-	dec := json.NewDecoder(io.LimitReader(r.Body, maxBody))
+// maxExecBody caps an exec request: maxBody for the command, plus room for api.MaxStdinData of stdin_data in base64.
+var maxExecBody = int64(maxBody + base64.StdEncoding.EncodedLen(api.MaxStdinData))
+
+var errExecTooLarge = errf(api.CodeLimit, "put long commands in a script in /workspace and run that; stream input over 1 MiB (`tkbox exec -i`) or write it to a file",
+	"the exec request is too large: the command is too long to record (over 1 MiB) or stdin_data is over 1 MiB")
+
+func readJSON(r *http.Request, v any) error { return readJSONLimit(r, v, maxBody) }
+
+func readJSONLimit(r *http.Request, v any, limit int64) error {
+	dec := json.NewDecoder(io.LimitReader(r.Body, limit))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		return errf(api.CodeBadRequest, "send the JSON body internal/api documents for this route", "request body: %v", err)
@@ -184,12 +194,28 @@ func (d *Daemon) hDiff(w http.ResponseWriter, r *http.Request) {
 	if sum.Files == nil {
 		sum.Files = []proto.DiffFile{}
 	}
-	js, _ := json.Marshal(sum)
-	w.Header().Set(api.DiffSummaryHeader, string(js))
+	// the guest decides how large the summary is: only a small one rides in a header, the rest is at /diff/summary
+	if js, _ := json.Marshal(sum); len(js) <= api.MaxDiffSummaryHeader {
+		w.Header().Set(api.DiffSummaryHeader, string(js))
+	} else {
+		w.Header().Set(api.DiffSummaryOmittedHeader, "1")
+	}
 	w.Header().Set("Content-Type", "text/x-diff")
 	w.Header().Set("Content-Length", strconv.Itoa(len(patch)))
 	w.WriteHeader(http.StatusOK)
 	w.Write(patch)
+}
+
+func (d *Daemon) hDiffSummary(w http.ResponseWriter, r *http.Request) {
+	_, sum, err := d.Diff(r.Context(), r.PathValue("box"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if sum.Files == nil {
+		sum.Files = []proto.DiffFile{}
+	}
+	writeJSON(w, http.StatusOK, sum)
 }
 
 func (d *Daemon) hApply(w http.ResponseWriter, r *http.Request) {
@@ -279,9 +305,9 @@ func (d *Daemon) hExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req api.ExecRequest
-	if err := readJSON(r, &req); err != nil {
-		if strings.Contains(err.Error(), "http: request body too large") || r.ContentLength > maxBody {
-			writeErr(w, errTooLong)
+	if err := readJSONLimit(r, &req, maxExecBody); err != nil {
+		if strings.Contains(err.Error(), "http: request body too large") || r.ContentLength > maxExecBody {
+			writeErr(w, errExecTooLarge)
 			return
 		}
 		writeErr(w, err)

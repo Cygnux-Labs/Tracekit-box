@@ -21,6 +21,7 @@ type patchFile struct {
 	Old, New     string // relative paths; "" for /dev/null
 	Names        []string
 	NewMode      string // "new file mode" / "new mode"
+	OldMode      string // "old mode" / "deleted file mode"
 	IndexMode    string // mode on the index line (unchanged mode)
 	Deleted      bool
 	Rename, Copy bool
@@ -31,9 +32,37 @@ type patchFile struct {
 }
 
 var (
-	hunkRE  = regexp.MustCompile(`^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@`)
-	indexRE = regexp.MustCompile(`^index [0-9a-f]+\.\.[0-9a-f]+(?: ([0-7]{6}))?$`)
+	hunkRE      = regexp.MustCompile(`^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@`)
+	indexRE     = regexp.MustCompile(`^index [0-9a-f]+\.\.[0-9a-f]+(?: ([0-7]{6}))?$`)
+	binHunkRE   = regexp.MustCompile(`^(?:literal|delta) (?:0|[1-9][0-9]{0,18})$`)
+	base85Chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~"
 )
+
+// base85Line reports whether ln is one data line of a GIT binary patch hunk as git reads it: a length character
+// ('A'..'Z' for 1..26 bytes, 'a'..'z' for 27..52) and then exactly the base85 characters that many bytes take.
+func base85Line(ln string) bool {
+	if len(ln) < 6 || (len(ln)-1)%5 != 0 {
+		return false
+	}
+	var n int
+	switch c := ln[0]; {
+	case c >= 'A' && c <= 'Z':
+		n = int(c-'A') + 1
+	case c >= 'a' && c <= 'z':
+		n = int(c-'a') + 27
+	default:
+		return false
+	}
+	if max := (len(ln) - 1) / 5 * 4; n > max || n <= max-4 {
+		return false
+	}
+	for i := 1; i < len(ln); i++ {
+		if strings.IndexByte(base85Chars, ln[i]) < 0 {
+			return false
+		}
+	}
+	return true
+}
 
 // parsePatch reads the file sections of a git-format patch. It is strict: anything git apply could read as a
 // header outside a git section (a traditional ---/+++ patch, a stray hunk) is refused, so every path git will touch
@@ -42,14 +71,16 @@ func parsePatch(patch string) ([]*patchFile, error) {
 	var files []*patchFile
 	var cur *patchFile
 	const (
-		outside = iota // before the first section or between sections
-		header         // after "diff --git", before hunks
-		hunk           // inside a hunk, counting lines
-		binary         // inside a GIT binary patch
-		after          // after a hunk ended, inside a section
+		outside    = iota // before the first section or between sections
+		header            // after "diff --git", before hunks
+		hunk              // inside a hunk, counting lines
+		binStart          // after "GIT binary patch": a "literal N" or "delta N" line must follow
+		binData           // inside a binary hunk: base85 lines up to an empty line
+		binReverse        // after the first binary hunk: an optional second (reverse) hunk
+		after             // after a hunk ended, inside a section
 	)
 	state := outside
-	var oldLeft, newLeft int
+	var oldLeft, newLeft, binHunks int
 	lines := strings.Split(patch, "\n")
 	if n := len(lines); n > 0 && lines[n-1] == "" {
 		lines = lines[:n-1]
@@ -92,6 +123,31 @@ func parsePatch(patch string) ([]*patchFile, error) {
 			}
 			continue
 		}
+		// a binary section is read exactly as git reads it (apply.c parse_binary): "literal N"/"delta N", base85
+		// lines, an empty line, then at most one more such hunk. Anything else inside it is refused, so no line can
+		// hide in it that git would read as a header (or the other way round)
+		if state == binStart || state == binReverse {
+			if binHunkRE.MatchString(ln) {
+				binHunks++
+				state = binData
+				continue
+			}
+			if state == binStart {
+				return nil, bad("a GIT binary patch must start with \"literal N\" or \"delta N\", not %q", trunc(ln))
+			}
+			state = after // no reverse hunk: this line is read as usual
+		}
+		if state == binData {
+			switch {
+			case ln == "" && binHunks == 1:
+				state = binReverse
+			case ln == "":
+				state = after
+			case !base85Line(ln):
+				return nil, bad("not a line of a GIT binary patch (%q); git would read it differently", trunc(ln))
+			}
+			continue
+		}
 		if strings.HasPrefix(ln, "diff --git ") {
 			cur = &patchFile{}
 			files = append(files, cur)
@@ -109,12 +165,6 @@ func parsePatch(patch string) ([]*patchFile, error) {
 				cur.Old, cur.New = cur.Names[0], cur.Names[1]
 			}
 			continue
-		}
-		if state == binary {
-			if ln == "" || strings.HasPrefix(ln, "literal ") || strings.HasPrefix(ln, "delta ") || !strings.ContainsAny(ln, " \t") {
-				continue
-			}
-			state = after
 		}
 		if m := hunkRE.FindStringSubmatch(ln); m != nil {
 			if cur == nil || state == outside {
@@ -184,10 +234,12 @@ func parsePatch(patch string) ([]*patchFile, error) {
 			cur.Old = ""
 		case strings.HasPrefix(ln, "deleted file mode "):
 			cur.Deleted = true
+			cur.OldMode = strings.TrimPrefix(ln, "deleted file mode ")
 		case strings.HasPrefix(ln, "new mode "):
 			cur.NewMode = strings.TrimPrefix(ln, "new mode ")
-		case strings.HasPrefix(ln, "old mode "), strings.HasPrefix(ln, "similarity index "),
-			strings.HasPrefix(ln, "dissimilarity index "):
+		case strings.HasPrefix(ln, "old mode "):
+			cur.OldMode = strings.TrimPrefix(ln, "old mode ")
+		case strings.HasPrefix(ln, "similarity index "), strings.HasPrefix(ln, "dissimilarity index "):
 		case strings.HasPrefix(ln, "index "):
 			m := indexRE.FindStringSubmatch(ln)
 			if m == nil {
@@ -196,7 +248,7 @@ func parsePatch(patch string) ([]*patchFile, error) {
 			cur.IndexMode = m[1]
 		case ln == "GIT binary patch":
 			cur.Binary = true
-			state = binary
+			state, binHunks = binStart, 0
 		case strings.HasPrefix(ln, "Binary files "):
 			return nil, bad("a binary change without its data; make the patch with --binary")
 		default:
@@ -205,6 +257,9 @@ func parsePatch(patch string) ([]*patchFile, error) {
 	}
 	if state == hunk {
 		return nil, errors.New("patch ends inside a hunk")
+	}
+	if state == binStart || state == binData {
+		return nil, errors.New("patch ends inside a GIT binary patch (no terminating empty line)")
 	}
 	for _, f := range files {
 		if f.Deleted {

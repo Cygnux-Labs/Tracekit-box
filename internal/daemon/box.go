@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -43,6 +42,7 @@ type box struct {
 	machine       vmm.Machine
 	guest         agentrpc.Guest
 	proxy         Proxy
+	egressL       net.Listener // the vsock egress listener (also in listeners); closed first when the box stops
 	listeners     []net.Listener
 	run           tracekit.Run
 	runClosed     bool   // close_run accepted
@@ -75,13 +75,14 @@ type box struct {
 	doneOnce sync.Once
 	seq      atomic.Uint64
 	pollNow  chan chan struct{} // tests: run one containment check now
+	poke     chan struct{}      // cap 1: a decision named an incident, check containment now
 	bootCfg  proto.BootConfig
 }
 
 func newBox(d *Daemon, info api.Box, dir string, cid uint32) *box {
 	b := &box{d: d, id: info.ID, dir: dir, cid: cid, info: info, approvedHosts: map[string]bool{},
 		sessions: map[*execSession]struct{}{}, events: openEventLog(dir), stopCh: make(chan struct{}),
-		done: make(chan struct{}), pollNow: make(chan chan struct{}), applySem: make(chan struct{}, 1)}
+		done: make(chan struct{}), pollNow: make(chan chan struct{}), poke: make(chan struct{}, 1), applySem: make(chan struct{}, 1)}
 	b.scrubP.Store(&scrubber{})
 	b.events.onHardCap = func() {
 		b.d.log.Printf("%s: events.ndjson reached its hard cap of %d MiB: stopping the box", b.id, b.events.hardMax>>20)
@@ -172,7 +173,7 @@ func (d *Daemon) Create(ctx context.Context, req api.CreateBoxRequest) (api.Box,
 		return api.Box{}, errf(api.CodeInternal, "check the host's network interfaces; a box can't start without knowing which addresses to keep it away from",
 			"could not list this host's addresses: %v", err)
 	}
-	s.blockPrefixes = prefixes
+	s.blockPrefixes = append(prefixes, d.opts.EgressBlock...)
 	var notices []string
 	if ws := s.req.Workspace; ws != "" && !gitWorkTree(ws) {
 		notices = append(notices, ws+notGitNotice)
@@ -316,17 +317,31 @@ func workspaceWasGit(v api.Box) bool {
 	return true
 }
 
-// gitWorkTree reports whether dir is inside a git work tree (git's own config and hooks stay out of it).
+// gitWorkTree reports whether dir is inside a git work tree (checkoutGit: no program the checkout's config names
+// runs).
 func gitWorkTree(dir string) bool {
-	cmd := exec.Command("git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", dir, "rev-parse", "--is-inside-work-tree")
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0")
-	out, err := cmd.Output()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	out, err := checkoutGit(ctx, dir, []string{"core.hooksPath=/dev/null"}, "rev-parse", "--is-inside-work-tree").Output()
 	return err == nil && strings.TrimSpace(string(out)) == "true"
 }
 
 // boot does the work of Create after the box is registered.
 func (b *box) boot(ctx context.Context, s *spec) error {
 	d := b.d
+	// the scrubber goes in before anything is recorded: no record (not even the first, trusted ones) ever holds a
+	// secret value or placeholder
+	for i := range s.secrets {
+		ph, err := d.eg.placeholder(s.secrets[i].Name)
+		if err != nil {
+			return fmt.Errorf("secret %s placeholder: %w", s.secrets[i].Name, err)
+		}
+		s.secrets[i].Placeholder = ph
+	}
+	b.mu.Lock()
+	b.secrets = s.secrets
+	b.mu.Unlock()
+	b.scrubP.Store(newScrubber(s.secrets))
 	if d.opts.Tracekit != nil {
 		run, err := d.opts.Tracekit.NewRun(ctx, tracekit.Agent{Name: s.agent})
 		if err != nil {
@@ -337,15 +352,15 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 		b.info.RunID = run.ID()
 		b.mu.Unlock()
 		b.startObserver(run)
-		if err := run.Observe(ctx, tracekit.SourceBox, trustedObs, map[string]any{
+		if err := run.Observe(ctx, tracekit.SourceBox, trustedObs, b.scrub().value(map[string]any{
 			"event": "created", "box_id": b.id, "name": b.info.Name, "image": s.req.Image, "allow": s.allow,
 			"limits": s.limits, "secrets": b.info.Secrets, "workspace": s.req.Workspace, "inspect": s.inspect,
 			"env": envValue(s.req.Env),
-		}); err != nil {
+		})); err != nil {
 			return fmt.Errorf("record the box in Tracekit: %w", err)
 		}
 		if s.req.Task != "" {
-			if err := run.Observe(ctx, tracekit.SourceTask, trustedObs, map[string]any{"task": s.req.Task}); err != nil {
+			if err := run.Observe(ctx, tracekit.SourceTask, trustedObs, b.scrub().value(map[string]any{"task": s.req.Task})); err != nil {
 				return fmt.Errorf("record the task in Tracekit: %w", err)
 			}
 		}
@@ -375,18 +390,6 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 	if err := d.opts.Builder.Scratch(ctx, upper, int64(s.limits.DiskMiB)<<20); err != nil {
 		return fmt.Errorf("create the %dMiB workspace disk: %w", s.limits.DiskMiB, err)
 	}
-
-	for i := range s.secrets {
-		ph, err := d.eg.placeholder(s.secrets[i].Name)
-		if err != nil {
-			return fmt.Errorf("secret %s placeholder: %w", s.secrets[i].Name, err)
-		}
-		s.secrets[i].Placeholder = ph
-	}
-	b.mu.Lock()
-	b.secrets = s.secrets
-	b.mu.Unlock()
-	b.scrubP.Store(newScrubber(s.secrets))
 
 	var ca *egress.CA
 	caPEM := ""
@@ -438,6 +441,9 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 		return fmt.Errorf("listen for egress: %w", err)
 	}
 	b.addListener(le)
+	b.mu.Lock()
+	b.egressL = le
+	b.mu.Unlock()
 	go func() {
 		if err := proxy.Serve(le); err != nil && !errors.Is(err, net.ErrClosed) && alive(b.state()) {
 			b.event(api.EventBoxFailed, "egress", "egress proxy stopped: "+err.Error(), nil)
@@ -631,9 +637,32 @@ func (b *box) onTimeout() {
 	b.stop(context.Background(), fmt.Sprintf("timeout: the box reached its %s limit (raise it with --timeout)", time.Duration(t)), false)
 }
 
+// containmentInterval is how long the containment loop waits before its next check, elapsed after the box started:
+// ContainmentPoll for the first ContainmentFastFor, then ContainmentSlowPoll. Each check makes the signer read the
+// whole run, so a long, busy box is polled less often; a decision that opened an incident triggers a check at once
+// (pokeContainment).
+func (d *Daemon) containmentInterval(elapsed time.Duration) time.Duration {
+	if elapsed < d.opts.ContainmentFastFor {
+		return d.opts.ContainmentPoll
+	}
+	return max(d.opts.ContainmentSlowPoll, d.opts.ContainmentPoll)
+}
+
+// pokeContainment asks the containment loop for a check now (a decision named an incident). It never blocks.
+func (b *box) pokeContainment(dec tracekit.Decision) {
+	if dec.IncidentID == "" {
+		return
+	}
+	select {
+	case b.poke <- struct{}{}:
+	default: // a check is already due
+	}
+}
+
 // containmentLoop polls the signer's containment state: held pauses the VM, quarantined kills it.
 func (b *box) containmentLoop() {
-	t := time.NewTicker(b.d.opts.ContainmentPoll)
+	start := time.Now()
+	t := time.NewTimer(b.d.containmentInterval(0))
 	defer t.Stop()
 	for {
 		select {
@@ -641,10 +670,13 @@ func (b *box) containmentLoop() {
 			return
 		case <-t.C:
 			b.checkContainment()
+		case <-b.poke:
+			b.checkContainment()
 		case ack := <-b.pollNow:
 			b.checkContainment()
 			close(ack)
 		}
+		t.Reset(b.d.containmentInterval(time.Since(start)))
 	}
 }
 
@@ -765,6 +797,9 @@ func (b *box) stop(ctx context.Context, reason string, kill bool) {
 		b.ctlMu.Unlock()
 		return
 	}
+	// egress closes first, before the guest gets its say (ending commands, sending the diff, up to a minute): nothing
+	// leaves a box that is going down, whatever the guest does meanwhile. The diff comes over its own vsock port.
+	b.closeEgress()
 	b.persist()
 	sctx := context.WithoutCancel(ctx)
 	switch {
@@ -777,6 +812,32 @@ func (b *box) stop(ctx context.Context, reason string, kill bool) {
 		b.saveDiff(sctx)
 	}
 	b.teardown(sctx, reason, "", kill, false)
+}
+
+// closeEgress shuts the box's egress door: the vsock egress listener (no new connection) and the proxy (every open
+// tunnel and keep-alive session, so no secret is swapped in any more). Idempotent; teardown closes both again. Never
+// called from a proxy goroutine (Proxy.Close waits for them).
+func (b *box) closeEgress() {
+	b.mu.Lock()
+	le, proxy := b.egressL, b.proxy
+	b.mu.Unlock()
+	if le != nil {
+		le.Close()
+	}
+	if proxy != nil {
+		proxy.Close()
+	}
+}
+
+// egressDown reports whether the box is going down (stopping, failed closed, torn down): Decide then refuses.
+func (b *box) egressDown() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch b.info.State {
+	case api.StateCreating, api.StateRunning, api.StatePaused:
+		return b.failedClosed || b.tearingDown
+	}
+	return true
 }
 
 // endExecs asks the box's running commands to end (SIGTERM, then SIGKILL) so the diff is not taken from files they
@@ -1168,10 +1229,11 @@ func (d *Daemon) Remove(ctx context.Context, ref string) error {
 }
 
 // caHosts are the hosts a box's CA may impersonate: the bound secrets' hosts and, with inspect all, the allowlist's
-// (ports dropped: name constraints have none).
+// (ports dropped: name constraints have none). Never nil: egress.CAOptions reads nil as "unconstrained", so a box
+// with nothing to impersonate (inspect all, no allow entries, no secrets) gets a CA that may impersonate nothing.
 func caHosts(secrets []egress.Secret, allow []string, inspect string) []string {
 	seen := map[string]bool{}
-	var out []string
+	out := []string{}
 	add := func(h string) {
 		if !seen[h] {
 			seen[h] = true

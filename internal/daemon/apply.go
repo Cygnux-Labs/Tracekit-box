@@ -11,7 +11,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
@@ -142,6 +145,12 @@ func (d *Daemon) Apply(ctx context.Context, ref string, req api.ApplyRequest) (a
 	if len(bytes.TrimSpace(patch)) == 0 {
 		return res, nil
 	}
+	// an unrecorded box's patch has no run to decide its writes in: a daemon that records (restarted with a signer)
+	// does not write it ungated
+	if v.Unrecorded && d.opts.Tracekit != nil {
+		return api.ApplyResult{}, errf(api.CodeConflict, "review it with `tkbox diff "+ref+"`, then apply it yourself: git apply "+patchPath,
+			"box %s ran unrecorded, so this recording daemon can't decide or record its writes; apply the saved patch by hand after review: %s", ref, patchPath)
+	}
 	// a recorded box's writes are decided in its own run, or not at all
 	if !v.Unrecorded {
 		byHand := "review the saved patch and apply it yourself: git apply " + patchPath
@@ -260,12 +269,18 @@ func (d *Daemon) Apply(ctx context.Context, ref string, req api.ApplyRequest) (a
 	if err != nil {
 		return api.ApplyResult{}, asAPIError(err)
 	}
-	want, out, err := previewApply(ctx, dir, b.dir, kept, paths, applyPath)
+	// git itself must read the patch exactly as the parser did: every path it would touch is one that was checked
+	if err := gitAgrees(ctx, b.dir, applyPath, kept); err != nil {
+		return refuse("git reads the patch differently than tkbox does, so it is refused: %v", err)
+	}
+	pv, out, err := previewApply(ctx, dir, b.dir, kept, paths, applyPath)
 	if err != nil {
 		b.event(api.EventApplyDecided, "apply", "apply refused: the patch does not apply: "+out, map[string]any{"dir": dir})
 		return api.ApplyResult{}, errf(api.CodeConflict, "the checkout changed since the box started; nothing was applied (the patch is at "+patchPath+")",
 			"the patch does not apply to %s: %s", dir, firstLine(out, err))
 	}
+	defer os.RemoveAll(pv.scratch)
+	want := pv.want
 
 	var allowed []gatedWrite
 	for _, p := range paths {
@@ -312,31 +327,47 @@ func (d *Daemon) Apply(ctx context.Context, ref string, req api.ApplyRequest) (a
 			map[string]any{"dir": dir, "paths": paths, "check": true, "sha256": res.SHA256})
 		return res, nil
 	}
-	// once decided, the patch is applied whatever the client does: under the daemon's context (gitApply has its own
-	// timeout), not the request's
-	before := map[string]fileState{}
+	// git never runs on the checkout itself: the patch was applied in the scratch copy, and what is written into the
+	// checkout is that result, file by file, only once it is exactly what the signer decided and the checkout is still
+	// as it was when the decisions were made. From here on the client can't stop it (the request's context is not used)
+	if applyScratchHook != nil {
+		applyScratchHook(pv.scratch)
+	}
+	var mismatch []string
 	for _, p := range paths {
-		if st, err := statFile(filepath.Join(dir, p)); err == nil {
-			before[p] = st
+		if got, err := statFile(filepath.Join(pv.scratch, filepath.FromSlash(p))); err != nil || got != want[p] {
+			mismatch = append(mismatch, p)
 		}
 	}
-	if out, err := gitApply(d.ctx, dir, b.dir, applyPath); err != nil {
-		// git apply checks every hunk before it writes, but a failure while writing (a full disk, a permission) can
-		// leave some files written: say which
-		var written []string
-		for _, p := range paths {
-			if got, serr := statFile(filepath.Join(dir, p)); serr != nil || got != before[p] {
-				written = append(written, p)
-			}
+	if len(mismatch) > 0 {
+		completeWrites(d, b, run, allowed, "error", map[string]any{"written": false, "differs_from_decision": mismatch})
+		b.event(api.EventApplyDecided, "apply", "apply refused: the patched files differ from what was decided: "+strings.Join(mismatch, ", "),
+			map[string]any{"dir": dir, "differ": mismatch})
+		return api.ApplyResult{}, errf(api.CodeConflict, "nothing was written; try the apply again (the patch is at "+patchPath+")",
+			"the patched %s differ from what was decided: %s", plural(len(mismatch), "file"), strings.Join(mismatch, ", "))
+	}
+	var changed []string
+	for _, p := range paths {
+		if got, err := statFile(filepath.Join(dir, filepath.FromSlash(p))); err != nil || got != pv.before[p] {
+			changed = append(changed, p)
 		}
-		completeWrites(d, b, run, allowed, "error", map[string]any{"written": len(written) > 0, "written_paths": written, "error": out})
-		b.event(api.EventApplyDecided, "apply", "git apply failed: "+out, map[string]any{"dir": dir, "written": written})
+	}
+	if len(changed) > 0 {
+		completeWrites(d, b, run, allowed, "error", map[string]any{"written": false, "checkout_changed": changed})
+		b.event(api.EventApplyDecided, "apply", "apply refused: the checkout changed while it was decided: "+strings.Join(changed, ", "),
+			map[string]any{"dir": dir, "changed": changed})
+		return api.ApplyResult{}, errf(api.CodeConflict, "nothing was written; review the checkout with `git status` and apply again (the patch is at "+patchPath+")",
+			"the checkout changed while the patch was decided: %s", strings.Join(changed, ", "))
+	}
+	if written, err := writeResults(dir, pv.scratch, paths, want); err != nil {
+		completeWrites(d, b, run, allowed, "error", map[string]any{"written": len(written) > 0, "written_paths": written, "error": err.Error()})
+		b.event(api.EventApplyDecided, "apply", "writing the patched files failed: "+err.Error(), map[string]any{"dir": dir, "written": written})
 		if len(written) > 0 {
 			return api.ApplyResult{}, errf(api.CodeConflict, "review the checkout with `git status` and `git diff` (the patch is at "+patchPath+")",
-				"git apply failed after writing %s: %s: %s", plural(len(written), "file"), strings.Join(written, ", "), firstLine(out, err))
+				"writing the patched files failed after writing %s: %s: %v", plural(len(written), "file"), strings.Join(written, ", "), err)
 		}
-		return api.ApplyResult{}, errf(api.CodeConflict, "the checkout changed since the box started; nothing was applied (the patch is at "+patchPath+")",
-			"git apply failed: %s", firstLine(out, err))
+		return api.ApplyResult{}, errf(api.CodeConflict, "nothing was written; check the checkout (the patch is at "+patchPath+")",
+			"writing the patched files failed: %v", err)
 	}
 	// what landed must be what was decided
 	var differ []string
@@ -367,7 +398,7 @@ func completeWrites(d *Daemon, b *box, run tracekit.Run, allowed []gatedWrite, s
 	for _, g := range allowed {
 		cctx, cancel := context.WithTimeout(d.ctx, 30*time.Second)
 		if err := run.Complete(cctx, g.call, g.dec, status, result); err != nil {
-			b.event(api.EventSignerProblem, "apply", "complete failed: "+err.Error(), nil)
+			b.completeFailed("apply", err)
 		}
 		cancel()
 	}
@@ -430,37 +461,193 @@ func statFile(p string) (fileState, error) {
 	return fileState{}, fmt.Errorf("%s is neither a file nor a symlink", p)
 }
 
-// previewApply applies the patch to a scratch copy of the files it touches and returns what each written path will
-// be. It fails (with git's output) when the patch does not apply to the checkout as it is now.
-func previewApply(ctx context.Context, dir, scratch string, files []*patchFile, paths []string, patchPath string) (map[string]fileState, string, error) {
+// applyScratchHook, when set (tests), runs on the scratch copy after the decisions and before anything is written.
+var applyScratchHook func(scratch string)
+
+// preview is a patch applied in a scratch copy of the files it touches: what each path will be (want), what it was
+// in the checkout when it was copied (before), and the scratch dir holding the result (the caller removes it).
+type preview struct {
+	scratch string
+	want    map[string]fileState
+	before  map[string]fileState
+}
+
+// previewApply applies the patch to a scratch copy of the files it touches. It fails (with git's output) when the
+// patch does not apply to the checkout as it is now.
+func previewApply(ctx context.Context, dir, scratch string, files []*patchFile, paths []string, patchPath string) (preview, string, error) {
 	tmp, err := os.MkdirTemp(scratch, ".apply-preview-")
 	if err != nil {
-		return nil, "", err
+		return preview{}, "", err
 	}
-	defer os.RemoveAll(tmp)
+	pv := preview{scratch: tmp, want: map[string]fileState{}, before: map[string]fileState{}}
+	fail := func(out string, err error) (preview, string, error) {
+		os.RemoveAll(tmp)
+		return preview{}, out, err
+	}
+	for _, p := range paths {
+		st, err := statFile(filepath.Join(dir, filepath.FromSlash(p)))
+		if err != nil {
+			return fail(err.Error(), err)
+		}
+		pv.before[p] = st
+	}
 	for _, f := range files {
 		if f.Old == "" {
 			if _, err := os.Lstat(filepath.Join(dir, f.New)); err == nil {
-				return nil, f.New + " already exists in the checkout", errors.New("exists")
+				return fail(f.New+" already exists in the checkout", errors.New("exists"))
 			}
 			continue
 		}
 		if err := copyEntry(filepath.Join(dir, f.Old), filepath.Join(tmp, f.Old)); err != nil {
-			return nil, err.Error(), err
+			return fail(err.Error(), err)
 		}
 	}
 	if out, err := gitApply(ctx, tmp, scratch, patchPath); err != nil {
-		return nil, out, err
+		return fail(out, err)
 	}
-	want := map[string]fileState{}
 	for _, p := range paths {
-		st, err := statFile(filepath.Join(tmp, p))
+		st, err := statFile(filepath.Join(tmp, filepath.FromSlash(p)))
 		if err != nil {
-			return nil, err.Error(), err
+			return fail(err.Error(), err)
 		}
-		want[p] = st
+		pv.want[p] = st
 	}
-	return want, "", nil
+	return pv, "", nil
+}
+
+// writeResults writes the decided results from the scratch copy into the checkout dir, deletions first: each file
+// goes to a new temp file in its own dir (O_EXCL|O_NOFOLLOW), gets its mode and is renamed over the target; a symlink
+// is made under a temp name and renamed; a deletion removes only a file or symlink. No parent may be a symlink (each
+// one is checked with lstat just before the write). It returns the paths written before any failure.
+func writeResults(dir, scratch string, paths []string, want map[string]fileState) ([]string, error) {
+	var dels, puts []string
+	for _, p := range paths {
+		if want[p].deleted {
+			dels = append(dels, p)
+		} else {
+			puts = append(puts, p)
+		}
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(dels))) // children before their parents
+	sort.Strings(puts)
+	var written []string
+	for _, p := range append(dels, puts...) {
+		if err := writeResult(dir, scratch, p, want[p]); err != nil {
+			return written, fmt.Errorf("%s: %w", p, err)
+		}
+		written = append(written, p)
+	}
+	return written, nil
+}
+
+func writeResult(dir, scratch, p string, w fileState) error {
+	rel := filepath.FromSlash(p)
+	abs := filepath.Join(dir, rel)
+	parent := filepath.Dir(abs)
+	if err := realParents(dir, filepath.Dir(rel), !w.deleted); err != nil {
+		return err
+	}
+	if w.deleted {
+		fi, err := os.Lstat(abs)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !fi.Mode().IsRegular() && fi.Mode()&os.ModeSymlink == 0 {
+			return errors.New("is not a file or a symlink, so it is not deleted")
+		}
+		if err := os.Remove(abs); err != nil {
+			return err
+		}
+		// like git apply, a dir the deletion left empty goes too
+		for d := parent; d != dir && len(d) > len(dir); d = filepath.Dir(d) {
+			if os.Remove(d) != nil {
+				break
+			}
+		}
+		return nil
+	}
+	src := filepath.Join(scratch, rel)
+	tmp := filepath.Join(parent, ".tkbox-apply-"+randHex(8))
+	if w.symlink {
+		target, err := os.Readlink(src)
+		if err != nil {
+			return err
+		}
+		if err := os.Symlink(target, tmp); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, abs); err != nil {
+			os.Remove(tmp)
+			return err
+		}
+		return nil
+	}
+	perm := os.FileMode(0o644)
+	if fi, err := os.Lstat(abs); err == nil && fi.Mode().IsRegular() {
+		perm = fi.Mode().Perm() // keep the file's own permission bits, with the decided executable bit
+	}
+	if w.mode == "100755" {
+		if perm&0o111 == 0 {
+			perm |= (perm & 0o444) >> 2
+		}
+	} else {
+		perm &^= 0o111
+	}
+	in, err := os.OpenFile(src, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(out, in)
+	if err == nil {
+		err = out.Chmod(perm)
+	}
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, abs)
+	}
+	if err != nil {
+		os.Remove(tmp)
+	}
+	return err
+}
+
+// realParents checks that every component of rel (a dir under root) is a real directory, not a symlink; with create,
+// missing ones are made.
+func realParents(root, rel string, create bool) error {
+	if rel == "." || rel == "" {
+		return nil
+	}
+	cur := root
+	for _, c := range strings.Split(rel, string(filepath.Separator)) {
+		cur = filepath.Join(cur, c)
+		fi, err := os.Lstat(cur)
+		switch {
+		case os.IsNotExist(err) && create:
+			if err := os.Mkdir(cur, 0o777); err != nil {
+				return err
+			}
+			continue
+		case os.IsNotExist(err):
+			return nil // a deletion under a dir that is gone: nothing to delete
+		case err != nil:
+			return err
+		case fi.Mode()&os.ModeSymlink != 0:
+			return fmt.Errorf("its parent %s is a symlink", cur)
+		case !fi.IsDir():
+			return fmt.Errorf("its parent %s is not a directory", cur)
+		}
+	}
+	return nil
 }
 
 // copyEntry copies a regular file (with its permission bits) or a symlink.
@@ -504,20 +691,207 @@ func copyEntry(src, dst string) error {
 	return fmt.Errorf("%s is neither a file nor a symlink", src)
 }
 
-// gitEnv is the environment of the git commands apply runs: the caller's, without GIT_* variables, never prompting.
-// isolated also keeps git's global and system config and system attributes out (no filter drivers, no hooks).
-func gitEnv(isolated bool) []string {
+// checkoutGitConf are the -c settings of every git command apply runs: no fsmonitor (a hook program or a daemon), no
+// pager, no external diff and no untracked cache (an index write). Command-line settings beat every config file, the
+// checkout's own .git/config and whatever it includes among them.
+var checkoutGitConf = []string{"core.fsmonitor=false", "core.pager=cat", "diff.external=", "core.untrackedCache=false"}
+
+// hostGitEnv is the env of a git command in the operator's checkout: the caller's without GIT_* (no GIT_DIR,
+// GIT_EXTERNAL_DIFF, GIT_CONFIG_*) or PAGER, never prompting, paging or taking optional locks.
+func hostGitEnv() []string {
 	env := []string{}
 	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "GIT_") {
+		if !strings.HasPrefix(kv, "GIT_") && !strings.HasPrefix(kv, "PAGER=") {
 			env = append(env, kv)
 		}
 	}
-	env = append(env, "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C")
-	if isolated {
-		env = append(env, "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_ATTR_NOSYSTEM=1")
+	return append(env, "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C", "GIT_PAGER=cat", "PAGER=cat")
+}
+
+// checkoutGit is a git command run in the operator's real checkout dir, made unable to run a program there:
+// hostGitEnv, no global or system config or attributes (the only config read is the checkout's own, and
+// checkoutGitConf overrides everything in it that names a program), --no-pager, and conf as more -c settings (what
+// the command needs from the global config, read with hostGitConfig, and core.hooksPath).
+func checkoutGit(ctx context.Context, dir string, conf []string, args ...string) *exec.Cmd {
+	a := []string{"--no-pager"}
+	for _, c := range append(append([]string{}, checkoutGitConf...), conf...) {
+		a = append(a, "-c", c)
 	}
-	return env
+	cmd := exec.CommandContext(ctx, "git", append(a, args...)...)
+	cmd.Dir = dir
+	cmd.Env = append(hostGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_ATTR_NOSYSTEM=1")
+	return cmd
+}
+
+// hostGitConfig reads one path setting as git resolves it in dir from every config file (system, global, the
+// checkout's own): `git config --type=path --get key`, "" when unset. Reading config runs no program; the value is
+// passed on with -c, so the commands that use it still read no global or system config.
+func hostGitConfig(ctx context.Context, dir, key string) string {
+	a := []string{"--no-pager"}
+	for _, c := range checkoutGitConf {
+		a = append(a, "-c", c)
+	}
+	cmd := exec.CommandContext(ctx, "git", append(a, "config", "--type=path", "--get", key)...)
+	cmd.Dir = dir
+	cmd.Env = hostGitEnv()
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimRight(string(out), "\n")
+}
+
+// gitAgrees asks git itself what the patch touches (`git apply --numstat -z` and `--summary -z`, with an empty git
+// dir and an empty scratch work tree) and requires exactly what the parser saw: the same file sections in the same
+// order, by path and binary-ness, with the same creations, deletions and mode changes. Any disagreement, and anything
+// git says on stderr (it may stop reading a patch half way, warn, and still exit 0), refuses the patch.
+func gitAgrees(ctx context.Context, scratch, patchPath string, files []*patchFile) error {
+	actx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	gitDir, err := scratchGitDir(actx, scratch)
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(gitDir)
+	work, err := os.MkdirTemp(scratch, ".apply-oracle-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(work)
+	gitSays := func(args ...string) (string, error) {
+		cmd := checkoutGit(actx, work, []string{"core.hooksPath=/dev/null", "core.bare=false"},
+			append([]string{"--git-dir=" + gitDir, "--work-tree=" + work, "apply"}, args...)...)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		if msg := strings.TrimSpace(stderr.String()); err != nil || msg != "" {
+			if msg == "" {
+				msg = err.Error()
+			}
+			return "", fmt.Errorf("git does not read the patch cleanly: %s", strings.SplitN(msg, "\n", 2)[0])
+		}
+		return stdout.String(), nil
+	}
+	num, err := gitSays("--numstat", "-z", patchPath)
+	if err != nil {
+		return err
+	}
+	sum, err := gitSays("--summary", "-z", patchPath)
+	if err != nil {
+		return err
+	}
+	// numstat -z: "added\tdeleted\tpath\0" ("-\t-" for binary), or "added\tdeleted\t\0old\0new\0" for a rename or copy
+	var got []string
+	fields := strings.Split(num, "\x00")
+	for i := 0; i < len(fields); i++ {
+		if fields[i] == "" && i == len(fields)-1 {
+			break
+		}
+		parts := strings.SplitN(fields[i], "\t", 3)
+		switch {
+		case len(parts) != 3:
+			return fmt.Errorf("unexpected git apply --numstat output %q", trunc(fields[i]))
+		case parts[2] == "" && i+2 < len(fields):
+			got = append(got, "rename/copy "+fields[i+1]+" -> "+fields[i+2])
+			i += 2
+		default:
+			got = append(got, fmt.Sprintf("binary=%v %s", parts[0] == "-" && parts[1] == "-", parts[2]))
+		}
+	}
+	var want []string
+	var wantSum, wantSumQuoted strings.Builder
+	for _, f := range files {
+		if f.Rename || f.Copy {
+			want = append(want, "rename/copy "+f.Old+" -> "+f.New)
+			continue
+		}
+		p := f.New
+		if p == "" {
+			p = f.Old
+		}
+		want = append(want, fmt.Sprintf("binary=%v %s", f.Binary, p))
+		line := ""
+		switch {
+		case f.Old == "":
+			line = " create mode " + f.NewMode + " "
+		case f.Deleted:
+			line = " delete mode " + f.OldMode + " "
+		case f.NewMode != "" && f.NewMode != f.OldMode:
+			line = " mode change " + f.OldMode + " => " + f.NewMode + " "
+		default:
+			continue
+		}
+		wantSum.WriteString(line + p + "\n")
+		wantSumQuoted.WriteString(line + gitQuote(p) + "\n")
+	}
+	if !slices.Equal(got, want) {
+		return fmt.Errorf("git reads it as touching %s, tkbox as %s", trunc(strings.Join(got, "; ")), trunc(strings.Join(want, "; ")))
+	}
+	if sum != wantSum.String() && sum != wantSumQuoted.String() {
+		return fmt.Errorf("git's creations, deletions and mode changes (%q) differ from tkbox's (%q)", trunc(sum), trunc(wantSum.String()))
+	}
+	return nil
+}
+
+// gitQuote quotes a path as git's quote_c_style does when it must (a quote, a backslash, a control or non-ASCII
+// byte).
+func gitQuote(p string) string {
+	need := false
+	for i := 0; i < len(p); i++ {
+		if c := p[i]; c == '"' || c == '\\' || c < 0x20 || c >= 0x7f {
+			need = true
+			break
+		}
+	}
+	if !need {
+		return p
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(p); i++ {
+		switch c := p[i]; c {
+		case '\a':
+			b.WriteString(`\a`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\v':
+			b.WriteString(`\v`)
+		case '\f':
+			b.WriteString(`\f`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		default:
+			if c < 0x20 || c >= 0x7f {
+				fmt.Fprintf(&b, `\%03o`, c)
+			} else {
+				b.WriteByte(c)
+			}
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// scratchGitDir makes a fresh, empty bare git dir under scratch, for git commands that must read no repository's
+// config. The caller removes it.
+func scratchGitDir(ctx context.Context, scratch string) (string, error) {
+	gitDir, err := os.MkdirTemp(scratch, ".apply-git-")
+	if err != nil {
+		return "", err
+	}
+	if out, err := checkoutGit(ctx, scratch, []string{"core.hooksPath=/dev/null"}, "init", "-q", "--bare", "--template=", gitDir).CombinedOutput(); err != nil {
+		os.RemoveAll(gitDir)
+		return "", fmt.Errorf("git init: %v %s", err, strings.TrimSpace(string(out)))
+	}
+	return gitDir, nil
 }
 
 // gitApply runs git apply --binary (never --unsafe-paths) on the work tree dir with a fresh, empty git dir made in
@@ -526,21 +900,13 @@ func gitEnv(isolated bool) []string {
 func gitApply(ctx context.Context, dir, scratch, patchPath string) (string, error) {
 	actx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	gitDir, err := os.MkdirTemp(scratch, ".apply-git-")
+	gitDir, err := scratchGitDir(actx, scratch)
 	if err != nil {
-		return "", err
+		return err.Error(), err
 	}
 	defer os.RemoveAll(gitDir)
-	initCmd := exec.CommandContext(actx, "git", "init", "-q", "--bare", "--template=", gitDir)
-	initCmd.Env = gitEnv(true)
-	if out, err := initCmd.CombinedOutput(); err != nil {
-		return strings.TrimSpace(string(out)), err
-	}
-	cmd := exec.CommandContext(actx, "git", "--git-dir="+gitDir, "--work-tree="+dir,
-		"-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.bare=false",
-		"apply", "--binary", "--whitespace=nowarn", patchPath)
-	cmd.Dir = dir
-	cmd.Env = gitEnv(true)
+	cmd := checkoutGit(actx, dir, []string{"core.hooksPath=/dev/null", "core.bare=false"},
+		"--git-dir="+gitDir, "--work-tree="+dir, "apply", "--binary", "--whitespace=nowarn", patchPath)
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
@@ -557,10 +923,13 @@ func checkIgnored(ctx context.Context, dir string, paths []string, wsWasGit bool
 	}
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	rp := exec.CommandContext(cctx, "git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-		"rev-parse", "--is-inside-work-tree")
-	rp.Dir = dir
-	rp.Env = gitEnv(false)
+	// the global excludes file is the one setting check-ignore needs from outside the checkout: it is read here and
+	// passed with -c (checkoutGit reads no global config); git's default ($XDG_CONFIG_HOME/git/ignore) needs no config
+	conf := []string{"core.hooksPath=/dev/null"}
+	if ex := hostGitConfig(cctx, dir, "core.excludesFile"); ex != "" {
+		conf = append(conf, "core.excludesFile="+ex)
+	}
+	rp := checkoutGit(cctx, dir, conf, "rev-parse", "--is-inside-work-tree")
 	var rpErr bytes.Buffer
 	rp.Stderr = &rpErr
 	if o, err := rp.Output(); err != nil || strings.TrimSpace(string(o)) != "true" {
@@ -574,10 +943,7 @@ func checkIgnored(ctx context.Context, dir string, paths []string, wsWasGit bool
 		return nil, errf(api.CodeConflict, "apply to a git checkout (--dir), or fix git there (`git status`); nothing was applied",
 			"%s is not a git work tree (%s), but the box's workspace was one: which files git ignores there (and so never reached the box) can't be checked", dir, strings.SplitN(why, "\n", 2)[0])
 	}
-	cmd := exec.CommandContext(cctx, "git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-		"check-ignore", "--stdin", "-z")
-	cmd.Dir = dir
-	cmd.Env = gitEnv(false)
+	cmd := checkoutGit(cctx, dir, conf, "check-ignore", "--stdin", "-z")
 	cmd.Stdin = strings.NewReader(strings.Join(paths, "\x00") + "\x00")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -598,16 +964,17 @@ func checkIgnored(ctx context.Context, dir string, paths []string, wsWasGit bool
 }
 
 // gitDirs are the checkout's git dir and hooks dir as git itself resolves them: `git rev-parse --absolute-git-dir
-// --git-path hooks` with the real config (the repo's, global and system: core.hooksPath may be set in any), GIT_*
-// variables dropped and fsmonitor off (rev-parse runs no other program). Both are absolute, symlinks resolved where
-// they exist; "" when dir is not in a git repository.
+// --git-path hooks` with core.hooksPath as the real config sets it (the repo's, global or system: read with
+// hostGitConfig and passed with -c, since checkoutGit reads no global or system config). Both are absolute,
+// symlinks resolved where they exist; "" when dir is not in a git repository.
 func gitDirs(ctx context.Context, dir string) (gitDir, hooks string) {
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, "git", "-c", "core.fsmonitor=false", "rev-parse", "--path-format=absolute",
-		"--absolute-git-dir", "--git-path", "hooks")
-	cmd.Dir = dir
-	cmd.Env = gitEnv(false)
+	var conf []string
+	if hp := hostGitConfig(cctx, dir, "core.hooksPath"); hp != "" {
+		conf = []string{"core.hooksPath=" + hp}
+	}
+	cmd := checkoutGit(cctx, dir, conf, "rev-parse", "--path-format=absolute", "--absolute-git-dir", "--git-path", "hooks")
 	out, err := cmd.Output()
 	if err != nil {
 		return "", ""

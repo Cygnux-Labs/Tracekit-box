@@ -51,6 +51,9 @@ func (bd *boxDecider) Decide(ctx context.Context, req egress.Request) (egress.Ve
 	b := (*box)(bd)
 	b.calls.begin()
 	defer b.calls.end()
+	if b.egressDown() {
+		return egress.Verdict{Reason: "the box is going down, so nothing more leaves it"}, nil
+	}
 	b.mu.Lock()
 	run := b.run
 	b.mu.Unlock()
@@ -64,6 +67,7 @@ func (bd *boxDecider) Decide(ctx context.Context, req egress.Request) (egress.Ve
 		if err != nil {
 			return egress.Verdict{Reason: "the Tracekit signer did not answer, so nothing leaves the box (fail closed): " + err.Error()}, nil
 		}
+		b.pokeContainment(out.Decision)
 		if !out.Allowed {
 			msg, _ := denial(out)
 			return egress.Verdict{Reason: msg, RuleIDs: out.RuleIDs}, nil
@@ -77,7 +81,7 @@ func (bd *boxDecider) Decide(ctx context.Context, req egress.Request) (egress.Ve
 		cctx, cancel := context.WithTimeout(b.d.ctx, 30*time.Second)
 		defer cancel()
 		if err := run.Complete(cctx, call, dec, status, result); err != nil {
-			b.event(api.EventSignerProblem, "egress", "complete failed: "+err.Error(), nil)
+			b.completeFailed("egress", err)
 		}
 	}
 	hostPort := net.JoinHostPort(req.Host, strconv.Itoa(req.Port))
