@@ -12,6 +12,11 @@ func TestShellQuote(t *testing.T) {
 		{[]string{"echo", "it's"}, `echo 'it'\''s'`},
 		{[]string{"sh", "-c", "echo $HOME > x"}, `sh -c 'echo $HOME > x'`},
 		{[]string{"printf", ""}, "printf ''"},
+		// the first word must stay the program: an assignment or a reserved word there is quoted
+		{[]string{"X=1", "echo", "hi"}, "'X=1' echo hi"},
+		{[]string{"then", "status"}, "'then' status"},
+		{[]string{"for", "x"}, "'for' x"},
+		{[]string{"env", "X=1", "then"}, "env X=1 then"},
 	} {
 		if got := ShellQuote(c.argv); got != c.want {
 			t.Errorf("ShellQuote(%q) = %s, want %s", c.argv, got, c.want)

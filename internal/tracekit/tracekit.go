@@ -40,14 +40,25 @@ func WebFetchArgs(url string) map[string]any { return map[string]any{"url": url}
 func WriteArgs(path string) map[string]any { return map[string]any{"file_path": path} }
 
 // ShellQuote joins argv into one line a POSIX shell parses back into argv: words made only of safe characters stay
-// bare, every other word is single-quoted with each embedded single quote written as '\”.
+// bare, every other word is single-quoted with each embedded single quote written as '\”. The first word is also
+// quoted when a shell would not read it as the program name (an assignment such as X=1, or a reserved word such as
+// then), so the signer's parser sees the program the guest actually runs.
 func ShellQuote(argv []string) string {
 	out := make([]string, len(argv))
 	for i, a := range argv {
+		if i == 0 && a != "" && (strings.Contains(a, "=") || shellReserved[a]) {
+			out[i] = "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"
+			continue
+		}
 		out[i] = quoteWord(a)
 	}
 	return strings.Join(out, " ")
 }
+
+// shellReserved are the words a POSIX shell or bash reads as syntax, not a command, in command position.
+var shellReserved = map[string]bool{"case": true, "coproc": true, "do": true, "done": true, "elif": true,
+	"else": true, "esac": true, "fi": true, "for": true, "function": true, "if": true, "in": true, "select": true,
+	"then": true, "time": true, "until": true, "while": true}
 
 func quoteWord(s string) string {
 	if s == "" {
