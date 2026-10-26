@@ -143,7 +143,9 @@ the shell-quoted command line, the working directory, this exec's `--env` (a sec
 a command, cwd or up-front stdin that holds one: `the command, its cwd or its stdin holds the value of secret GH`) and
 `stdin`, true when the exec has stdin of either kind below. A first word that contains `=` or is a shell reserved word
 (`if`, `then`, `for`, `do`, …) is recorded quoted (`'X=1' echo hi`), so the signer's shell parser sees the program
-that runs, not an assignment or a keyword. With `--env`, the command line starts with `env K=V …` (sorted), as if the
+that runs, not an assignment or a keyword. A first word starting with `%` is refused (`a program name may not start
+with %: a shell reads it as a job spec, so the record could not name the program`): bash runs `%1`, quoted or not, as
+`fg %1`; run such a program by path (`./%1`). With `--env`, the command line starts with `env K=V …` (sorted), as if the
 command had been typed with them, so the signer's own env rules see them too:
 `tkbox exec b --env DEBIAN_FRONTEND=noninteractive -- apt-get install -y curl` is decided as
 `env DEBIAN_FRONTEND=noninteractive apt-get install -y curl`.

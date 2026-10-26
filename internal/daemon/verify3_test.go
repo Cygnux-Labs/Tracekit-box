@@ -251,6 +251,23 @@ func TestVerify3CreatedRecordScrubbed(t *testing.T) {
 	}
 }
 
+// F5 (fuzz): a program name starting with % is refused: bash and zsh run `%1 hi` (quoted or not) as `fg %1`, so no
+// decided command line could name it. A % later in argv is fine.
+func TestVerify3ProgramNameJobSpecRefused(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.create(api.CreateBoxRequest{Name: "f5"})
+	for _, argv := range [][]string{{"%1", "hi"}, {"%", "x"}, {"%vim"}} {
+		_, e2 := e.d.prepareExec("f5", api.ExecRequest{Argv: argv})
+		if e2 == nil || e2.Code != api.CodeBadRequest || !strings.Contains(e2.Message, "may not start with %: a shell reads it as a job spec") ||
+			!strings.Contains(e2.Hint, "./"+argv[0]) {
+			t.Errorf("argv %q: %v", argv, e2)
+		}
+	}
+	if _, e2 := e.d.prepareExec("f5", api.ExecRequest{Argv: []string{"./%1", "%2"}}); e2 != nil {
+		t.Fatalf("a path to %%1: %v", e2)
+	}
+}
+
 // flipGuest answers each diff with the next patch in turn: a running box whose workspace changes between two asks.
 type flipGuest struct {
 	agentrpc.Guest

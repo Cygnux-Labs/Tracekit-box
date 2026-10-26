@@ -119,6 +119,11 @@ func (d *Daemon) prepareExec(ref string, req api.ExecRequest) (*box, *api.ErrorD
 	if len(req.Argv) == 0 || req.Argv[0] == "" {
 		return nil, errf(api.CodeBadRequest, "pass the command after --, e.g. `tkbox exec box -- ls -la`", "no command")
 	}
+	if strings.HasPrefix(req.Argv[0], "%") {
+		// bash and zsh run a first word %… as a job spec (fg), quoted or not: no decided command line could name it
+		return nil, errf(api.CodeBadRequest, "rename it or run it by path (./"+req.Argv[0]+")",
+			"a program name may not start with %%: a shell reads it as a job spec, so the record could not name the program")
+	}
 	for _, a := range req.Argv {
 		if strings.ContainsRune(a, 0) {
 			return nil, errf(api.CodeBadRequest, "remove the NUL byte from the command", "an argument has a NUL byte")
