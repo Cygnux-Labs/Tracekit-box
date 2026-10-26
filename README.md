@@ -77,8 +77,9 @@ Three trust domains:
 - **The VM** (untrusted) runs the agent. It has no network card: the only ways out are vsock ports the daemon serves.
   The host never trusts what the VM says about itself, only what passes through a door.
 - **The Tracekit signer** runs in its own trust domain and holds the signing key. It must be on the same host as the
-  daemon (Unix socket only). The agent can reach neither its socket nor the daemon's. Run it as a separate user to get
-  more than dev assurance.
+  daemon (Unix socket only). The agent can reach neither its socket nor the daemon's. Run it as a separate user so no
+  other process of yours can reach its key (`isolation: separate-user`); assurance above `dev` needs a witness on
+  another host to cosign the signer's log ([Tracekit's deploy guide](https://github.com/Cygnux-Labs/Tracekit/blob/v1.4.2/docs/deploy.md)).
 
 ### The doors
 
@@ -184,9 +185,10 @@ What each step shows:
 - **`tkbox diff`** shows a git-format patch with `x.txt`. After `tkbox stop` (and before `tkbox export`),
   `tkbox apply demo` would ask the signer about `x.txt` and then write it to your checkout; the demo does not apply
   anything. Apply never works on a running box.
-- **`tracekit verify`** checks the bundle offline and prints `Integrity: VERIFIED.` With the same-user dev signer the
-  assurance line says dev: a process running as your user could have reached the key. The agent inside the box cannot,
-  but the bundle only states what the signer's setup proves.
+- **`tracekit verify`** checks the bundle offline and prints `Integrity: VERIFIED.` With the dev signer it also prints
+  `Assurance: dev` (no witness cosigned the signer's log) and `isolation: same-user` (a process running as your user
+  could have reached the key). The agent inside the box cannot, but the bundle only states what the signer's setup
+  proves.
 
 ## Verify a bundle
 
@@ -229,8 +231,8 @@ jobs:
 
 The API key reaches only the daemon on the runner; inside the box Claude Code sees a placeholder that works only for
 `api.anthropic.com`. The action's signer is a dev signer it creates in the same job, and the trust file it verifies
-against comes from that same job, so its bundles have dev assurance: they show the record was not changed after the
-job, not that the runner was honest. Inputs, outputs and the steps are in [action/action.yml](action/action.yml).
+against comes from that same job, with no witness, so its bundles verify as `Assurance: dev`: they show the record was
+not changed after the job, not that the runner was honest. Inputs, outputs and the steps are in [action/action.yml](action/action.yml).
 The agent's output, and the file names `tkbox stop`, `diff` and `apply` print, reach the job log with workflow
 commands stopped (`::stop-commands::` with a random token, resumed however the step ends), so the agent can't add
 annotations, masks or step outputs by printing `::error::` and the like.

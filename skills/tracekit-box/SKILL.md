@@ -26,7 +26,7 @@ description: >
    export), which decides each file before writing it. Sensitive paths such as `.github/workflows/**` need the person's
    `--allow-sensitive`.
 5. **Prove it.** `tkbox export JOB -o JOB.tkb`, then `tracekit verify JOB.tkb --trust JOB.trust.json`. Report its
-   `Integrity:` line and the assurance it prints, as printed: a same-user dev signer gives dev assurance only.
+   `Integrity:`, `Assurance:` and `isolation:` lines as printed: a dev signer (no witness) gives `Assurance: dev`.
 
 Limits: a secret value under 6 bytes is not redacted from responses, blocked in requests or looked for in workspace
 files. The full list is in https://github.com/Cygnux-Labs/tracekit-box/blob/main/docs/limits.md.

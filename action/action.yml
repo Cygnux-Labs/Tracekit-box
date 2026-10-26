@@ -129,7 +129,7 @@ runs:
       with:
         python-version: "3.12"
 
-    # A same-user dev signer made in this job, so the bundle's assurance is dev. Reused by a second use in the job.
+    # A same-user dev signer made in this job, with no witness, so the bundle's assurance is dev. Reused by a second use in the job.
     - name: Start a Tracekit 1.4.2 dev signer
       shell: bash
       run: |

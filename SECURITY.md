@@ -80,12 +80,15 @@ With a signer the agent cannot reach, and within the limits below:
 - **Code the agent wrote runs wherever you run it.** `tkbox apply` writes the agent's changes to your checkout;
   building or testing them on the host runs them outside the box. Test them in a box, or in a CI job with no write
   token and no secrets.
-- **A same-user dev signer gives only dev assurance.** `tracekit init --dev` runs the signer as your user. The agent in
-  the VM still cannot reach it, but any other process running as that user could read the signing key and re-sign
-  history, and the bundle says `dev` for that reason. The signer must be on the same host as the daemon (Box reaches it
-  only over a Unix socket), so in production run it as a separate user (Tracekit's system mode) and pin its trust file
-  somewhere the host cannot change. The GitHub Action makes a dev signer and its trust file in the same job, so the
-  action's bundles have dev assurance only.
+- **A dev signer gives only dev assurance.** A bundle's assurance depends on who vouches for the signer's log, not on
+  how the signer runs: it says `dev` when no witness you pinned cosigned the log, `local` when only witnesses you run
+  did, and `witnessed` when enough independent ones did ([Tracekit's deploy guide](https://github.com/Cygnux-Labs/Tracekit/blob/v1.4.2/docs/deploy.md)).
+  How the signer runs shows as `isolation`. `tracekit init --dev` runs it as your user (`isolation: same-user`): the
+  agent in the VM still cannot reach it, but any other process running as that user could read the signing key and
+  re-sign history. The signer must be on the same host as the daemon (Box reaches it only over a Unix socket), so in
+  production run it as a separate user (Tracekit's system mode, `isolation: separate-user`), add a witness on another
+  host for assurance above `dev`, and pin its trust file somewhere the host cannot change. The GitHub Action makes a
+  dev signer, with no witness, and its trust file in the same job, so the action's bundles have dev assurance only.
 - **Leak checks see only what the proxy reads.** The proxy reads (MITM) the hosts a secret is bound to, every allowed
   HTTPS host with `inspect: all`, and plain HTTP requests. On those it checks the request line, headers and body for
   placeholders. On other HTTPS connections it sees only the host, port and TLS server name, so a placeholder sent there
