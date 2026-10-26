@@ -510,20 +510,68 @@ func copyEntry(src, dst string) error {
 	return fmt.Errorf("%s is neither a file nor a symlink", src)
 }
 
-// gitEnv is the environment of the git commands apply runs: the caller's, without GIT_* variables, never prompting.
-// isolated also keeps git's global and system config and system attributes out (no filter drivers, no hooks).
-func gitEnv(isolated bool) []string {
+// checkoutGitConf are the -c settings of every git command apply runs: no fsmonitor (a hook program or a daemon), no
+// pager, no external diff and no untracked cache (an index write). Command-line settings beat every config file, the
+// checkout's own .git/config and whatever it includes among them.
+var checkoutGitConf = []string{"core.fsmonitor=false", "core.pager=cat", "diff.external=", "core.untrackedCache=false"}
+
+// hostGitEnv is the env of a git command in the operator's checkout: the caller's without GIT_* (no GIT_DIR,
+// GIT_EXTERNAL_DIFF, GIT_CONFIG_*) or PAGER, never prompting, paging or taking optional locks.
+func hostGitEnv() []string {
 	env := []string{}
 	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "GIT_") {
+		if !strings.HasPrefix(kv, "GIT_") && !strings.HasPrefix(kv, "PAGER=") {
 			env = append(env, kv)
 		}
 	}
-	env = append(env, "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C")
-	if isolated {
-		env = append(env, "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_ATTR_NOSYSTEM=1")
+	return append(env, "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C", "GIT_PAGER=cat", "PAGER=cat")
+}
+
+// checkoutGit is a git command run in the operator's real checkout dir, made unable to run a program there:
+// hostGitEnv, no global or system config or attributes (the only config read is the checkout's own, and
+// checkoutGitConf overrides everything in it that names a program), --no-pager, and conf as more -c settings (what
+// the command needs from the global config, read with hostGitConfig, and core.hooksPath).
+func checkoutGit(ctx context.Context, dir string, conf []string, args ...string) *exec.Cmd {
+	a := []string{"--no-pager"}
+	for _, c := range append(append([]string{}, checkoutGitConf...), conf...) {
+		a = append(a, "-c", c)
 	}
-	return env
+	cmd := exec.CommandContext(ctx, "git", append(a, args...)...)
+	cmd.Dir = dir
+	cmd.Env = append(hostGitEnv(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_ATTR_NOSYSTEM=1")
+	return cmd
+}
+
+// hostGitConfig reads one path setting as git resolves it in dir from every config file (system, global, the
+// checkout's own): `git config --type=path --get key`, "" when unset. Reading config runs no program; the value is
+// passed on with -c, so the commands that use it still read no global or system config.
+func hostGitConfig(ctx context.Context, dir, key string) string {
+	a := []string{"--no-pager"}
+	for _, c := range checkoutGitConf {
+		a = append(a, "-c", c)
+	}
+	cmd := exec.CommandContext(ctx, "git", append(a, "config", "--type=path", "--get", key)...)
+	cmd.Dir = dir
+	cmd.Env = hostGitEnv()
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimRight(string(out), "\n")
+}
+
+// scratchGitDir makes a fresh, empty bare git dir under scratch, for git commands that must read no repository's
+// config. The caller removes it.
+func scratchGitDir(ctx context.Context, scratch string) (string, error) {
+	gitDir, err := os.MkdirTemp(scratch, ".apply-git-")
+	if err != nil {
+		return "", err
+	}
+	if out, err := checkoutGit(ctx, scratch, []string{"core.hooksPath=/dev/null"}, "init", "-q", "--bare", "--template=", gitDir).CombinedOutput(); err != nil {
+		os.RemoveAll(gitDir)
+		return "", fmt.Errorf("git init: %v %s", err, strings.TrimSpace(string(out)))
+	}
+	return gitDir, nil
 }
 
 // gitApply runs git apply --binary (never --unsafe-paths) on the work tree dir with a fresh, empty git dir made in
@@ -532,21 +580,13 @@ func gitEnv(isolated bool) []string {
 func gitApply(ctx context.Context, dir, scratch, patchPath string) (string, error) {
 	actx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	gitDir, err := os.MkdirTemp(scratch, ".apply-git-")
+	gitDir, err := scratchGitDir(actx, scratch)
 	if err != nil {
-		return "", err
+		return err.Error(), err
 	}
 	defer os.RemoveAll(gitDir)
-	initCmd := exec.CommandContext(actx, "git", "init", "-q", "--bare", "--template=", gitDir)
-	initCmd.Env = gitEnv(true)
-	if out, err := initCmd.CombinedOutput(); err != nil {
-		return strings.TrimSpace(string(out)), err
-	}
-	cmd := exec.CommandContext(actx, "git", "--git-dir="+gitDir, "--work-tree="+dir,
-		"-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.bare=false",
-		"apply", "--binary", "--whitespace=nowarn", patchPath)
-	cmd.Dir = dir
-	cmd.Env = gitEnv(true)
+	cmd := checkoutGit(actx, dir, []string{"core.hooksPath=/dev/null", "core.bare=false"},
+		"--git-dir="+gitDir, "--work-tree="+dir, "apply", "--binary", "--whitespace=nowarn", patchPath)
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
@@ -563,10 +603,13 @@ func checkIgnored(ctx context.Context, dir string, paths []string, wsWasGit bool
 	}
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	rp := exec.CommandContext(cctx, "git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-		"rev-parse", "--is-inside-work-tree")
-	rp.Dir = dir
-	rp.Env = gitEnv(false)
+	// the global excludes file is the one setting check-ignore needs from outside the checkout: it is read here and
+	// passed with -c (checkoutGit reads no global config); git's default ($XDG_CONFIG_HOME/git/ignore) needs no config
+	conf := []string{"core.hooksPath=/dev/null"}
+	if ex := hostGitConfig(cctx, dir, "core.excludesFile"); ex != "" {
+		conf = append(conf, "core.excludesFile="+ex)
+	}
+	rp := checkoutGit(cctx, dir, conf, "rev-parse", "--is-inside-work-tree")
 	var rpErr bytes.Buffer
 	rp.Stderr = &rpErr
 	if o, err := rp.Output(); err != nil || strings.TrimSpace(string(o)) != "true" {
@@ -580,10 +623,7 @@ func checkIgnored(ctx context.Context, dir string, paths []string, wsWasGit bool
 		return nil, errf(api.CodeConflict, "apply to a git checkout (--dir), or fix git there (`git status`); nothing was applied",
 			"%s is not a git work tree (%s), but the box's workspace was one: which files git ignores there (and so never reached the box) can't be checked", dir, strings.SplitN(why, "\n", 2)[0])
 	}
-	cmd := exec.CommandContext(cctx, "git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-		"check-ignore", "--stdin", "-z")
-	cmd.Dir = dir
-	cmd.Env = gitEnv(false)
+	cmd := checkoutGit(cctx, dir, conf, "check-ignore", "--stdin", "-z")
 	cmd.Stdin = strings.NewReader(strings.Join(paths, "\x00") + "\x00")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -604,16 +644,17 @@ func checkIgnored(ctx context.Context, dir string, paths []string, wsWasGit bool
 }
 
 // gitDirs are the checkout's git dir and hooks dir as git itself resolves them: `git rev-parse --absolute-git-dir
-// --git-path hooks` with the real config (the repo's, global and system: core.hooksPath may be set in any), GIT_*
-// variables dropped and fsmonitor off (rev-parse runs no other program). Both are absolute, symlinks resolved where
-// they exist; "" when dir is not in a git repository.
+// --git-path hooks` with core.hooksPath as the real config sets it (the repo's, global or system: read with
+// hostGitConfig and passed with -c, since checkoutGit reads no global or system config). Both are absolute,
+// symlinks resolved where they exist; "" when dir is not in a git repository.
 func gitDirs(ctx context.Context, dir string) (gitDir, hooks string) {
 	cctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, "git", "-c", "core.fsmonitor=false", "rev-parse", "--path-format=absolute",
-		"--absolute-git-dir", "--git-path", "hooks")
-	cmd.Dir = dir
-	cmd.Env = gitEnv(false)
+	var conf []string
+	if hp := hostGitConfig(cctx, dir, "core.hooksPath"); hp != "" {
+		conf = []string{"core.hooksPath=" + hp}
+	}
+	cmd := checkoutGit(cctx, dir, conf, "rev-parse", "--path-format=absolute", "--absolute-git-dir", "--git-path", "hooks")
 	out, err := cmd.Output()
 	if err != nil {
 		return "", ""

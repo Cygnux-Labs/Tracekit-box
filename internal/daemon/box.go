@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -318,11 +317,12 @@ func workspaceWasGit(v api.Box) bool {
 	return true
 }
 
-// gitWorkTree reports whether dir is inside a git work tree (git's own config and hooks stay out of it).
+// gitWorkTree reports whether dir is inside a git work tree (checkoutGit: no program the checkout's config names
+// runs).
 func gitWorkTree(dir string) bool {
-	cmd := exec.Command("git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", dir, "rev-parse", "--is-inside-work-tree")
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0")
-	out, err := cmd.Output()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	out, err := checkoutGit(ctx, dir, []string{"core.hooksPath=/dev/null"}, "rev-parse", "--is-inside-work-tree").Output()
 	return err == nil && strings.TrimSpace(string(out)) == "true"
 }
 
