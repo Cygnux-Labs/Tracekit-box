@@ -78,7 +78,7 @@ Relative paths in the file (`workspace`, `from_file`) resolve against the file's
 | Entry | Allows |
 |---|---|
 | `example.com` | HTTPS to `example.com:443` (a TLS tunnel whose SNI is `example.com`; ECH is refused), and plain HTTP to port 80 as absolute-form requests the proxy reads, which is what `http_proxy` does (a `CONNECT` tunnel to port 80 is refused) |
-| `example.com:8443` | that port only. A tunnel that is not TLS is allowed only to an entry that names its port like this, and such an entry lets any protocol through to that port (SSH, SMTP, a database protocol), uninspected; a tunnel to any port other than 443 is decided and recorded as `tcp://host:port`. A TLS tunnel must still send the host's name as its SNI |
+| `example.com:8443` | that port only. A tunnel that is not TLS is allowed only to an entry that names its port like this, and such an entry lets any protocol through to that port (SSH, SMTP, a database protocol), uninspected; a tunnel to any port other than 443, or to 443 under an entry that names 443 (`example.com:443`), is decided and recorded as `tcp://host:port`. A TLS tunnel must still send the host's name as its SNI |
 | `*.example.com` | any subdomain of `example.com` (not `example.com` itself), with the same port rules |
 | `203.0.113.7`, `[2001:db8::1]:8443` | an IP literal, with the same port rules; private and special addresses stay refused |
 | a preset name | the preset's hosts |

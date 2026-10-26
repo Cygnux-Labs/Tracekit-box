@@ -15,9 +15,9 @@ import (
 // Request is what the Decider is asked about one new connection (CONNECT) or one absolute-form HTTP request.
 type Request struct {
 	BoxID string
-	// Scheme is "https" for a CONNECT to port 443, "tcp" for a CONNECT to any other port (a TCP tunnel: the decision
-	// comes before the first byte, and an allow entry that names the port lets any protocol through), and "http"
-	// for an absolute-form request.
+	// Scheme is "https" for a CONNECT to port 443, "tcp" for a CONNECT to any other port or to 443 under an allow
+	// entry that names the port (a TCP tunnel: the decision comes before the first byte, and an allow entry that
+	// names the port lets any protocol through), and "http" for an absolute-form request.
 	Scheme string
 	Host   string // lower case, no trailing dot; a name or an IP literal as the client sent it (IPv4-mapped unmapped)
 	Port   int

@@ -429,14 +429,18 @@ func TestTunnelPlain(t *testing.T) {
 
 // The decision is made before the tunnel's first byte, so its url names only what is known then: a CONNECT to 443
 // is https (the tunnel must carry TLS), any other port a TCP tunnel to that port (an allow entry naming the port
-// lets SSH or any other protocol through), and an absolute-form request is http.
+// lets SSH or any other protocol through), as is 443 under an entry that names 443, and an absolute-form request
+// is http.
 func TestDecisionSchemeByPort(t *testing.T) {
 	checkGoroutines(t)
-	e := newEnv(t, func(c *Config) { c.Allow = []string{"example.com", "example.com:22", "other.example:8443"} })
+	e := newEnv(t, func(c *Config) {
+		c.Allow = []string{"example.com", "example.com:22", "other.example:8443", "raw.example:443"}
+	})
+	e.res.set("raw.example", "127.0.0.1") // a name on the allowlist is resolved before the decision
 	e.dec.Func = func(context.Context, Request) (Verdict, error) {
 		return Verdict{Reason: "test refuses everything"}, nil
 	}
-	for _, target := range []string{"example.com:443", "example.com:22", "other.example:8443", "[2606:4700::1111]:5432"} {
+	for _, target := range []string{"example.com:443", "example.com:22", "other.example:8443", "[2606:4700::1111]:5432", "raw.example:443"} {
 		_, _, resp := e.rawConnect(target)
 		resp.Body.Close()
 	}
@@ -454,6 +458,8 @@ func TestDecisionSchemeByPort(t *testing.T) {
 		"other.example:8443":   "tcp://other.example:8443",
 		"2606:4700::1111:5432": "tcp://[2606:4700::1111]:5432",
 		"example.com:80":       "http://example.com:80",
+		// an entry naming port 443 lets a non-TLS tunnel through, so 443 there is a TCP tunnel too
+		"raw.example:443": "tcp://raw.example:443",
 	}
 	got := map[string]string{}
 	for _, r := range e.dec.Requests {
@@ -1255,8 +1261,8 @@ func TestInspectAll(t *testing.T) {
 
 // With inspect all, a host or port off the allowlist is refused at once: the Decider (and so a person) is never
 // asked and the name is never resolved. That holds for a port the allowlist does not name on an allowed host (the
-// CA covers the host, ports dropped, as the daemon builds it), for absolute-form HTTP, and for a box with no allow
-// entries at all.
+// CA covers the host, ports dropped, as the daemon builds it from 889f9ff on), for absolute-form HTTP, and for a box
+// with no allow entries at all.
 func TestInspectAllRefusesOffAllowlistAtOnce(t *testing.T) {
 	checkGoroutines(t)
 	const caMsg = "Box must inspect this host but the box CA may not impersonate it"

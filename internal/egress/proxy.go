@@ -493,9 +493,10 @@ func (p *Proxy) serveConnect(s *session, req *http.Request, br *bufio.Reader) {
 	}
 	// The decision comes before the first byte, so the record names only what is known then: a CONNECT to 443 is
 	// HTTPS (the tunnel must carry TLS), and one to any other port is a TCP tunnel to that port, which an allow entry
-	// naming the port may use for any protocol (SSH, SMTP, or TLS too).
+	// naming the port may use for any protocol (SSH, SMTP, or TLS too). An allow entry that spells out 443
+	// (example.com:443) lets any protocol through as well, so a CONNECT it matches is a TCP tunnel too.
 	scheme := "tcp"
-	if port == 443 {
+	if port == 443 && !p.allow.matchExplicitPort(host, lit, port) {
 		scheme = "https"
 	}
 	t := target{scheme: scheme, host: host, addr: lit, port: port}
