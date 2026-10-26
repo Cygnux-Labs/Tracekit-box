@@ -126,8 +126,8 @@ Inside the box, `$NAME` holds a placeholder such as `tkbox_GH_3f9c…`, never th
 the value (`Authorization: Bearer $GH`); on a request to one of `hosts`, the host proxy replaces the placeholder in the
 bound header with the real value. A request that carries the placeholder anywhere else (another header, the URL, the
 body) or to any other host whose traffic the proxy reads is blocked and recorded as `tkbox.secret.leak`. On those
-connections the proxy also blocks the real value itself (raw, base64, percent- or JSON-escaped) wherever it is not
-being swapped in, and redacts it from response headers, bodies and trailers. Requests to bound hosts are sent with
+connections the proxy also blocks the real value itself (raw, percent-encoded, JSON-escaped, hex or base64, in any case) wherever it is not
+being swapped in, and redacts those forms from response headers, bodies and trailers; other encodings (HTML character references, a value split across lines) are not caught, see [limits.md](limits.md#secrets). Requests to bound hosts are sent with
 `Accept-Encoding: identity`, so their responses can be checked. The value is resolved by the CLI, sent to the daemon over its socket and
 never written to the box, its disks, its events or the record.
 

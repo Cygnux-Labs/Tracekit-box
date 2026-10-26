@@ -7,6 +7,7 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,54 @@ type pattern struct {
 	s    []byte
 	rule *secretRule
 	kind int
+	fold bool // matched without regard to ASCII case (secret values: a host may echo one upper- or lower-cased)
+}
+
+// at reports whether b starts with the pattern.
+func (p *pattern) at(b []byte) bool {
+	if len(b) < len(p.s) {
+		return false
+	}
+	if !p.fold {
+		return bytes.Equal(b[:len(p.s)], p.s)
+	}
+	return asciiEqualFold(b[:len(p.s)], p.s)
+}
+
+// startsWith reports whether the pattern starts with b.
+func (p *pattern) startsWith(b []byte) bool {
+	if !p.fold {
+		return bytes.HasPrefix(p.s, b)
+	}
+	return len(b) <= len(p.s) && asciiEqualFold(p.s[:len(b)], b)
+}
+
+// asciiEqualFold compares equal-length byte strings without regard to ASCII case (never Unicode folding, which would
+// match look-alikes such as the Kelvin sign).
+func asciiEqualFold(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if lowerByte(a[i]) != lowerByte(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func lowerByte(c byte) byte {
+	if 'A' <= c && c <= 'Z' {
+		return c + 'a' - 'A'
+	}
+	return c
+}
+
+func upperByte(c byte) byte {
+	if 'a' <= c && c <= 'z' {
+		return c - ('a' - 'A')
+	}
+	return c
 }
 
 // matcher finds any of a set of patterns in one pass: patterns are indexed by their first byte.
@@ -41,11 +90,22 @@ func newMatcher(pats []pattern) *matcher {
 	m := &matcher{}
 	seen := map[string]bool{}
 	for _, p := range pats {
-		if len(p.s) == 0 || seen[string(p.s)] {
+		key := string(p.s)
+		if p.fold {
+			key = "\x00" + asciiLower(key)
+		}
+		if len(p.s) == 0 || seen[key] {
 			continue
 		}
-		seen[string(p.s)] = true
-		m.first[p.s[0]] = append(m.first[p.s[0]], len(m.pats))
+		seen[key] = true
+		c := p.s[0]
+		if p.fold {
+			c = lowerByte(c)
+			if u := upperByte(c); u != c {
+				m.first[u] = append(m.first[u], len(m.pats))
+			}
+		}
+		m.first[c] = append(m.first[c], len(m.pats))
 		m.pats = append(m.pats, p)
 		m.maxLen = max(m.maxLen, len(p.s))
 	}
@@ -63,7 +123,7 @@ func (m *matcher) index(b []byte, from int) (int, *pattern) {
 		var best *pattern
 		for _, pi := range m.first[b[i]] {
 			p := &m.pats[pi]
-			if bytes.HasPrefix(b[i:], p.s) && (best == nil || len(p.s) > len(best.s)) {
+			if p.at(b[i:]) && (best == nil || len(p.s) > len(best.s)) {
 				best = p
 			}
 		}
@@ -83,7 +143,7 @@ func (m *matcher) hold(b []byte, from int) int {
 	}
 	for i := max(from, len(b)-m.maxLen+1); i < len(b); i++ {
 		for _, pi := range m.first[b[i]] {
-			if p := m.pats[pi].s; len(p) > len(b)-i && bytes.HasPrefix(p, b[i:]) {
+			if p := &m.pats[pi]; len(p.s) > len(b)-i && p.startsWith(b[i:]) {
 				return len(b) - i
 			}
 		}
@@ -110,9 +170,12 @@ func (m *matcher) findString(s string) []*pattern {
 	}
 }
 
-// valueForms returns a secret value as it may travel: verbatim, percent-encoded, JSON-escaped and base64 (standard
-// and URL alphabets, at each of the three byte alignments, so the value is found inside a longer encoded string
-// such as Basic credentials). A value shorter than minRedactLen can't be told apart from ordinary text and has none.
+// valueForms returns a secret value as it may travel: verbatim, percent-encoded, JSON-escaped, hex and base64
+// (standard and URL alphabets, at each of the three byte alignments, so the value is found inside a longer encoded
+// string such as Basic credentials). The proxy matches every form without regard to ASCII case, so an upper- or
+// lower-cased echo and upper-case hex are caught too. Other encodings are not: HTML or XML character references,
+// a value split across lines (MIME or PEM wrapping), the base64 or hex of a case-changed value, and any encoding a
+// host invents. A value shorter than minRedactLen can't be told apart from ordinary text and has none.
 func valueForms(v string) []string {
 	if len(v) < minRedactLen {
 		return nil
@@ -138,6 +201,7 @@ func valueForms(v string) []string {
 			add(strings.ReplaceAll(s, "/", `\/`))
 		}
 	}
+	add(hex.EncodeToString([]byte(v)))
 	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.URLEncoding} {
 		for o := 0; o < 3; o++ {
 			e := enc.EncodeToString(append(make([]byte, o), v...))
