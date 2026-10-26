@@ -44,12 +44,16 @@ are decided by the signer and recorded; the processes they start inside the box 
 A secret is bound to exact host names (no wildcards, no ports) and is swapped into one header, `Authorization` when
 `header` is empty.
 
-`apply` writes every file the signer allows, or nothing. A patch that changes files which steer the next run or host
-automation (`.gitignore`, `.gitattributes`, `.gitmodules`, `tkbox.yaml`, `tkbox.yml`, `.envrc`,
-`.pre-commit-config.yaml`, anything under `.husky/` or `.github/workflows/`) is refused with `BadRequest` unless you
-pass `allow_sensitive=True` after reading those changes. The result is the daemon's `ApplyResult`: `applied`, `denied`,
-`patch`, `checked`, `sensitive` (the applied paths of that kind), `ignored` (new files the checkout's `.gitignore`
-ignores, left out) and `sha256` (of the patch that was decided).
+`apply` writes nothing unless the signer allows every file; then it writes them one at a time, each atomically. A
+write that fails part way is not rolled back: the error (`Conflict`) names the files already written. A patch that
+changes files which steer the next run or host automation (`.gitignore`, `.gitattributes`, `.gitmodules`,
+`tkbox.yaml`, `tkbox.yml`, `.envrc`, `.pre-commit-config.yaml`, `.gitlab-ci.yml`, `.yarnrc*`, the lefthook files,
+anything under `.husky/`, `.github/workflows/`, `.github/actions/`, `.circleci/` or `.devcontainer/`,
+`.vscode/tasks.json`, `.cargo/config*`, and credential files such as `.npmrc` or `*.pem`; the full list is in
+docs/cli.md) is refused with `BadRequest` unless you pass `allow_sensitive=True` after reading those changes. The
+result is the daemon's `ApplyResult`: `applied`, `denied`, `patch`, `checked`, `sensitive` (the patch's paths of that
+kind, also on a check or a denied apply), `ignored` (new files the checkout's `.gitignore` ignores, left out) and
+`sha256` (of the patch that was decided).
 
 ## API
 

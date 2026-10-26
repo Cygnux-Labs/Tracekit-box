@@ -34,8 +34,8 @@ may come before or after a command's arguments; `-flag` and `--flag` are the sam
 
 `tkbox exec` passes the command's own exit code through; see [tkbox exec](#tkbox-exec). Every other command exits 0 on
 success, 1 on an error (the daemon's message, and a hint on a second `tkbox:` line) and 2 on a usage error. With no
-daemon at the socket, every command says `no tkbox daemon answering at <socket> (…): start one with `tkbox daemon` (as
-root on a server), or pass --socket`.
+daemon at the socket, every command says ``no tkbox daemon answering at <socket> (…): start one with `tkbox daemon`, or
+pass --socket``.
 
 ## tkbox daemon
 
@@ -47,7 +47,7 @@ tkbox daemon [--state-dir DIR] [--signer SOCKET] [--unrecorded] [--max-boxes N] 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--state-dir` | `/var/lib/tkbox` as root, else `$XDG_STATE_HOME/tkbox` or `~/.local/state/tkbox` | Images, boxes and the API socket (`run/tkbox.sock`) |
-| `--signer` | discovered like Tracekit's SDK: `$TRACEKIT_SIGNER`, then `/etc/tracekit/client.json`, then the same-user dev signer | The Tracekit signer's Unix socket. The signer must be on this host |
+| `--signer` | discovered like Tracekit's SDK: a signer named in the root-owned `/etc/tracekit/client.json` wins (a different `$TRACEKIT_SIGNER` or `--signer` is then refused); without one, `$TRACEKIT_SIGNER`, then the same-user dev signer | The Tracekit signer's Unix socket. The signer must be on this host |
 | `--unrecorded` | off | Run boxes without a signer. Nothing is recorded or decided by a signer and boxes cannot be exported; the allowlist and Box approvals still apply. Box warns at start and on every box. For debugging Box only |
 | `--max-boxes` | 8 | Boxes alive at once (1 to 1024). Stopped boxes do not count |
 | `--approval-timeout` | `2m` | How long a connection to a host off the allowlist waits for `tkbox approve` (1s to 4m) |
@@ -65,15 +65,20 @@ The daemon listens on `--socket` when it is given, else on `<state dir>/run/tkbo
 
 At start the daemon first checks `/dev/kvm`, before it downloads anything (`this host can't run boxes: /dev/kvm is not
 usable (…): enable KVM (nested virtualization on a VM) and add this user to the kvm group`). Then it claims its socket
-(a second daemon fails with `another tkbox daemon is already listening on …`), downloads Firecracker and the kernel into
-`<state dir>/images/assets` if they are not cached yet, checks the guest agent, and connects to the signer. If no
-signer answers it exits with `tkbox: the daemon needs a Tracekit signer: no signer answering at …` and ``start one with
-`tracekit up`, or pass --unrecorded to run boxes that record nothing``. It logs to stderr with the prefix `tkbox:`,
-ending with `tkbox <version> serving on <socket> (state <dir>, max 8 boxes)`. A bad flag value exits 2.
+(a second daemon fails with `another tkbox daemon is already listening on …`) and connects to the signer, still before
+any download: if no signer answers it exits with `tkbox: the daemon needs a Tracekit signer: no signer answering at …`
+and ``start one with `tracekit up`, or pass --unrecorded to run boxes that record nothing``. Only then does it download
+Firecracker and the kernel into `<state dir>/images/assets` if they are not cached yet, check Firecracker and check the
+guest agent. It logs to stderr with the prefix `tkbox:`, ending with `tkbox <version> serving on <socket> (state <dir>,
+max 8 boxes)`. A bad flag value that the flag parser itself checks (`--max-boxes`, `--approval-timeout`,
+`--egress-block`, an unknown flag) exits 2; a bad file (`--upstream-ca` with no PEM, a missing `--firecracker` or
+`--guest-dir`) is an error and exits 1.
 
-On SIGINT or SIGTERM it logs `stopping every box…` and stops every box cleanly within 60 seconds, saving each box's
-patch, and closes every open Tracekit run (including those of boxes already stopped and waiting for `tkbox apply`) so
-that each can still be exported. Boxes that a previous daemon left running are marked failed (`daemon restarted`).
+On SIGINT or SIGTERM it logs `stopping every box…` and stops every box cleanly, saving each box's patch, and closes
+every open Tracekit run (including those of boxes already stopped and waiting for `tkbox apply`) so that each can still
+be exported. Each box's stop has its own bounds (about 5 s for its commands, up to 60 s for its patch, then the run's
+close), and the boxes stop in parallel; only the final wait is bounded at 60 seconds, so a shutdown can take longer
+than that. Boxes that a previous daemon left running are marked failed (`daemon restarted`).
 
 The run token that lets the daemon record into and close a box's run lives only in the daemon's memory; it is never
 written to disk. So after a restart:
@@ -256,9 +261,11 @@ endpoint, so a patch with very many or very long paths still reviews. Every summ
 was built from (`patch_sha256`), and the diff response names its body's in `X-Tkbox-Diff-Sha256`: on a running box
 the endpoint is a second guest diff, so when the two differ the client reads both once more, and then fails with
 `the workspace changed while the diff was read; run it again` (stop the box to read the patch saved at stop).
-`--stat` reads only the endpoint, whose list is of one diff. Paths that the workspace's `.gitignore` ignores
-and generated directories (`node_modules`, `__pycache__`, `.venv`, `venv`, `.tox`, `.mypy_cache`, `.pytest_cache`,
-`.gradle`, `.next`, `.cache`, at any depth) are left out.
+`--stat` reads only the endpoint, whose list is of one diff. Generated directories (`node_modules`, `__pycache__`,
+`.venv`, `venv`, `.tox`, `.mypy_cache`, `.pytest_cache`, `.gradle`, `.next`, `.cache`, at any depth) are left out of
+the patch; that fixed list is all the guest leaves out. Files the workspace's `.gitignore` ignores that the agent
+created (build output such as `dist/`) are in the patch and count toward its 64 MiB; only `tkbox apply` leaves such new
+files out.
 
 When stdout is a terminal, control characters (escape sequences, carriage returns, C1 controls) and Unicode bidi
 overrides in the patch are printed as escapes (`\x1b`, `\u202e`), so a patch cannot redraw what you review. Redirected
@@ -273,7 +280,8 @@ tkbox apply <box> [--dir DIR] [--check] [--allow-sensitive]
 
 Applies a stopped box's saved patch to the host checkout (default: the box's `--workspace`). It works only on a
 stopped box, from the patch saved at stop, while the box's Tracekit run is open: after `tkbox stop` and before
-`tkbox export` or `tkbox rm`, and not on a box from before a daemon restart. On a running box it is refused (`box demo
+`tkbox export` or `tkbox rm`, and not on a box from before a daemon restart. (A box that ran `--unrecorded` on an
+unrecorded daemon has no run: it applies, with no decisions, even after a restart.) On a running box it is refused (`box demo
 is running`, hint ``stop the box first so the patch can't change under you: `tkbox stop demo` ``). A daemon that has a
 signer refuses the patch of a box that ran `--unrecorded`, since its files would be written with no `Write` decisions:
 `box demo ran unrecorded, so this recording daemon can't decide or record its writes; apply the saved patch by hand
@@ -284,8 +292,8 @@ files itself:
 
 - Every path is validated (relative, no `..`, no `.git` in any case or spelling a file system reads as `.git`, inside
   `DIR`, no writes through symlinks). Copy and rename sections are refused, and so is a section whose old and new names
-  differ without a rename header (`git apply` would delete the old file). Every path the patch touches, old and new,
-  is decided.
+  differ without a rename header (`git apply` would delete the old file), and a patch with more than one section for
+  a path (`the patch has more than one section for "l"`). Every path the patch touches, old and new, is decided.
 - The patch is parsed strictly: anything git could read as a header outside a git file section is refused, and a
   `GIT binary patch` section is read exactly as git reads it: a `literal N` or `delta N` line, base85 lines whose
   length character matches their length, a terminating empty line, and at most one more (reverse) hunk. Anything else
@@ -296,7 +304,9 @@ files itself:
   is refused: what `DIR` ignores can't be checked.
 - Writes inside the checkout's git dir or hooks dir are refused. The hooks dir is the one git itself would use:
   `core.hooksPath` as the repo's, global and system config set it, passed to `git rev-parse --git-path hooks`. It is
-  compared without regard to case and by file identity.
+  compared without regard to case and by file identity. When `DIR` is in a git repository but git can't say where
+  those dirs are (it refuses the repository, for example for its owner), the apply is refused: `… is in a git
+  repository, but git can't say where its git and hooks dirs are (…), so writes into them can't be refused`.
 - Changes to `.gitignore`, `.gitattributes`, `.gitmodules`, `tkbox.yaml`, `tkbox.yml`, `.envrc`,
   `.pre-commit-config.yaml`, `.gitlab-ci.yml`, `.yarnrc.yml` and `lefthook.yml` (in any directory), to
   `.vscode/tasks.json` and `.cargo/config.toml`, to anything under `.husky/`, `.github/workflows/`, `.github/actions/`,
@@ -309,9 +319,10 @@ files itself:
   order, the same binary flags and the same creations, deletions and modes as Box's parser. Any difference, or anything
   git writes on stderr, refuses the patch: `git reads the patch differently than tkbox does, so it is refused: …`.
 - The result is built in a scratch copy of the files the patch touches, outside the checkout, by `git apply --binary`
-  with a fresh, empty bare git dir and with `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` and
-  `GIT_ATTR_NOSYSTEM=1` (no filter drivers, hooks or LFS). A patch that does not apply there is refused: `the patch
-  does not apply to <dir>: …`.
+  with a fresh, empty bare git dir, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_ATTR_NOSYSTEM=1`,
+  `HOME` and `XDG_CONFIG_HOME` pointed at an empty dir and `core.attributesFile=/dev/null` (no filter drivers, hooks,
+  LFS or attribute conversions such as `eol=crlf`). A patch that does not apply there is refused: `the patch does not
+  apply to <dir>: …`.
 - The signer decides every file as a `Write` with the arguments `{file_path, sha256, mode, symlink, deleted,
   patch_sha256}` (plus `sensitive: true` for the files above) before anything is written. If the signer denies any
   file, nothing is applied and the denied paths are listed (`tkbox: denied by the signer: <path>`). If the signer holds
@@ -323,8 +334,10 @@ files itself:
 - Only then does Box write the files, deletions first: each file goes to a temp file in its own directory (opened
   `O_EXCL|O_NOFOLLOW`), gets its mode and is renamed over the target; a symlink is made under a temp name and renamed;
   every parent is checked with lstat just before the write and may not be a symlink; a deletion removes only a file or
-  a symlink. Once every file is decided this runs to the end even if the client goes away. A failure names exactly
-  which paths were written: `writing the patched files failed after writing 1 file: a.txt: …`.
+  a symlink. Once every file is decided this runs to the end even if the client goes away. Each file is written
+  atomically, but the apply as a whole is not: a failure part way is not rolled back. The files written before it
+  stay, and the error names exactly which they are (`writing the patched files failed after writing 1 file: a.txt:
+  …`), as do the run's `Write` completions (`written_paths`).
 - Afterwards every written file is checked against what the signer decided; a file that differs is reported
   (`applied, but … differ from what was decided: …`).
 
@@ -336,8 +349,15 @@ box is created, and the workspace builder's `ls-files`) runs so that no program 
 - `--no-pager` and
   `-c core.fsmonitor=false -c core.pager=cat -c diff.external= -c core.untrackedCache=false`, plus
   `-c core.hooksPath=/dev/null` where hooks don't matter;
-- the two settings they need from outside the checkout, `core.excludesFile` and `core.hooksPath`, read first with
-  `git config --type=path --get` and passed back with `-c`.
+- the settings they need from outside the checkout passed back with `-c`: `core.excludesFile` and `core.hooksPath`
+  (as git resolves them from the system, global and checkout config) and every `safe.directory` value of the system
+  and global config.
+
+Those settings are read first by `git config -z --get-all` (with `--type=path` for the two paths), which runs no
+program. These reads are the only git commands that see the system and global config: they drop the daemon's `GIT_*`
+variables and set the same `-c` and pager settings, but not `GIT_CONFIG_GLOBAL` or `GIT_CONFIG_NOSYSTEM`. The
+workspace build and apply read `core.excludesFile` the same way, so a file ignored through the system's excludes file
+is ignored by both.
 
 `--check` validates and decides only, and writes nothing. `tkbox apply` prints the paths written on stdout and
 `tkbox: applied N files` on stderr (with `--check`, `tkbox: would apply (check only, nothing written) N files`).

@@ -447,14 +447,17 @@ class Client:
     def apply(
         self, box: str, *, dir: Optional[str] = None, check: bool = False, allow_sensitive: bool = False
     ) -> Dict[str, Any]:
-        """POST /v1/boxes/{box}/apply: decide every changed file with the signer, then write them all to dir (default
-        the box's workspace), or nothing if any is denied. Works only on a stopped box, from the patch saved at stop,
-        and before export (Conflict otherwise). check=True decides only and writes nothing.
+        """POST /v1/boxes/{box}/apply: decide every changed file with the signer, then write them to dir (default the
+        box's workspace) one at a time, each atomically, or nothing if any is denied. A write that fails part way is
+        not rolled back; the Conflict names the files already written. Works only on a stopped box, from the patch
+        saved at stop, and before export (Conflict otherwise). check=True decides only and writes nothing.
 
         A patch that changes files steering the next run or host automation (.gitignore, .gitattributes, .gitmodules,
-        tkbox.yaml, tkbox.yml, .envrc, .pre-commit-config.yaml, anything under .husky/ or .github/workflows/) is
+        tkbox.yaml, .envrc, .pre-commit-config.yaml, .gitlab-ci.yml, anything under .husky/, .github/workflows/,
+        .github/actions/, .circleci/ or .devcontainer/, credential files, ...: the full list is in docs/cli.md) is
         refused (BadRequest) unless allow_sensitive=True. Returns the ApplyResult: {applied, denied, patch, checked,
-        sensitive, ignored, sha256}; ignored lists new files the checkout's .gitignore ignores, which are left out."""
+        sensitive, ignored, sha256}; sensitive lists the patch's paths of that kind (also on a check or a denial);
+        ignored lists new files the checkout's .gitignore ignores, which are left out."""
         req: Dict[str, Any] = {}
         if dir:
             req["dir"] = os.path.abspath(os.path.expanduser(dir))

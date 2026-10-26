@@ -129,7 +129,8 @@ func TestApply(t *testing.T) {
 		t.Fatalf("check %+v %v", res, err)
 	}
 
-	// allowed: applied with git apply, every file decided as a Write of its absolute path
+	// allowed: applied (built by git apply in a scratch copy, written by Box), every file decided as a Write of its
+	// absolute path
 	res, err = e.d.Apply(ctx, "ap", api.ApplyRequest{})
 	if err != nil || !slices.Equal(res.Applied, []string{"a.txt", "b.txt"}) || !strings.HasSuffix(res.Patch, "diff.patch") {
 		t.Fatalf("apply %+v %v", res, err)

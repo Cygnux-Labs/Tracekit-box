@@ -100,8 +100,9 @@ type gatedWrite struct {
 // no change to a git-ignored file), leaves out new files the checkout ignores, refuses files that steer the next run
 // or host automation unless AllowSensitive, and works out every file's new content in a scratch copy. Then it asks
 // the signer about every file (Write, with the file's new sha256, mode, symlink status and the patch's sha256) and
-// only if all are allowed runs `git apply --binary` in the checkout, with git's own config, hooks and filters kept
-// out. Check validates and decides but writes nothing.
+// only if all are allowed writes the decided results into the checkout itself, one file at a time (git apply runs only
+// in the scratch copy; a write that fails part way is not rolled back, and the written paths are recorded). Check
+// validates and decides but writes nothing.
 func (d *Daemon) Apply(ctx context.Context, ref string, req api.ApplyRequest) (api.ApplyResult, error) {
 	b, err := d.lookup(ref)
 	if err != nil {
