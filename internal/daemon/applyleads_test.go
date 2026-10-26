@@ -7,9 +7,11 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
+	"github.com/Cygnux-Labs/tracekit-box/internal/tracekit"
 )
 
 // gitCall is one git command the daemon ran, as the logging git shim saw it.
@@ -64,6 +66,113 @@ func (c gitCall) inCheckout(ws string) bool {
 		return true
 	}
 	return slices.Contains(c.args, "--work-tree="+ws)
+}
+
+// A2: git never applies the patch to the checkout itself. The result is built in a scratch copy and written only once
+// it matches the decisions exactly and the checkout is unchanged; otherwise nothing is written. Writes never follow a
+// parent symlink that appeared after the decisions.
+func TestApplyLeadsWritesOnlyWhatWasDecided(t *testing.T) {
+	calls := gitShim(t)
+	var hook atomic.Pointer[func()]
+	e := newTestEnv(t, func(o *Options) {
+		o.Gate = func(ctx context.Context, r tracekit.Run, call tracekit.Call, h tracekit.GateHooks) (tracekit.Outcome, error) {
+			out, err := fakeGate(ctx, r, call, h)
+			if f := hook.Load(); f != nil && call.Tool == tracekit.ToolWrite {
+				(*f)()
+			}
+			return out, err
+		}
+	})
+	setup := func(name string) string {
+		ws, _ := filepath.EvalSymlinks(t.TempDir())
+		gitInit(t, ws)
+		os.WriteFile(filepath.Join(ws, "a.txt"), []byte("old\n"), 0o644)
+		os.Mkdir(filepath.Join(ws, "sub"), 0o755)
+		e.guest.Patch = modify("a.txt") + newFileSection("sub/new.txt", "x") + newFileSection("run.sh", "echo")
+		e.create(api.CreateBoxRequest{Name: name, Workspace: ws})
+		e.d.Stop(context.Background(), name, api.StopRequest{})
+		return ws
+	}
+	untouched := func(ws string) {
+		t.Helper()
+		if readFile(t, filepath.Join(ws, "a.txt")) != "old\n" {
+			t.Fatal("a.txt was written")
+		}
+		for _, p := range []string{"sub/new.txt", "run.sh"} {
+			if _, err := os.Lstat(filepath.Join(ws, p)); !os.IsNotExist(err) {
+				t.Fatalf("%s was written", p)
+			}
+		}
+	}
+
+	// the scratch result differs from the decision (injected): nothing is written, the writes complete as not written
+	ws := setup("mismatch")
+	applyScratchHook = func(scratch string) { os.WriteFile(filepath.Join(scratch, "a.txt"), []byte("evil\n"), 0o644) }
+	_, err := e.d.Apply(context.Background(), "mismatch", api.ApplyRequest{})
+	applyScratchHook = nil
+	if errCode(err) != api.CodeConflict || !strings.Contains(err.Error(), "differ from what was decided: a.txt") {
+		t.Fatalf("mismatch: %v", err)
+	}
+	untouched(ws)
+	for _, r := range e.run(0).Records {
+		if r.Method == "complete" && r.Call.Tool == tracekit.ToolWrite {
+			if m, _ := r.Value.(map[string]any); r.Status != "error" || m["written"] != false {
+				t.Fatalf("complete after a mismatch: %s %v", r.Status, r.Value)
+			}
+		}
+	}
+
+	// the checkout changes after the decisions: nothing is written
+	ws = setup("changed")
+	change := func() { os.WriteFile(filepath.Join(ws, "a.txt"), []byte("old\nmore\n"), 0o644) }
+	hook.Store(&change)
+	_, err = e.d.Apply(context.Background(), "changed", api.ApplyRequest{})
+	hook.Store(nil)
+	if errCode(err) != api.CodeConflict || !strings.Contains(err.Error(), "checkout changed") {
+		t.Fatalf("changed checkout: %v", err)
+	}
+	if readFile(t, filepath.Join(ws, "a.txt")) != "old\nmore\n" {
+		t.Fatal("a.txt overwritten")
+	}
+
+	// a parent turns into a symlink after the decisions: the write under it is refused, nothing lands outside
+	ws = setup("symlinked")
+	outside := t.TempDir()
+	swap := func() {
+		os.Remove(filepath.Join(ws, "sub"))
+		os.Symlink(outside, filepath.Join(ws, "sub"))
+	}
+	hook.Store(&swap)
+	_, err = e.d.Apply(context.Background(), "symlinked", api.ApplyRequest{})
+	hook.Store(nil)
+	if err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("symlinked parent: %v", err)
+	}
+	if ents, _ := os.ReadDir(outside); len(ents) != 0 {
+		t.Fatalf("written through a symlinked parent: %v", ents)
+	}
+
+	// a normal apply writes exactly the decided results, and git apply never ran in the checkout
+	calls()
+	ws = setup("ok")
+	res, err := e.d.Apply(context.Background(), "ok", api.ApplyRequest{})
+	if err != nil || len(res.Applied) != 3 {
+		t.Fatalf("apply: %+v %v", res, err)
+	}
+	if readFile(t, filepath.Join(ws, "a.txt")) != "new\n" || readFile(t, filepath.Join(ws, "sub/new.txt")) != "x\n" || readFile(t, filepath.Join(ws, "run.sh")) != "echo\n" {
+		t.Fatal("not applied")
+	}
+	if fi, _ := os.Stat(filepath.Join(ws, "a.txt")); fi.Mode().Perm() != 0o644 {
+		t.Fatalf("a.txt mode %v", fi.Mode())
+	}
+	for _, c := range calls() {
+		if c.inCheckout(ws) && slices.Contains(c.args, "apply") {
+			t.Fatalf("git apply ran in the checkout: %v (cwd %s)", c.args, c.cwd)
+		}
+	}
+	if left, _ := filepath.Glob(filepath.Join(ws, "*", ".tkbox-apply-*")); len(left) > 0 {
+		t.Fatalf("temp files left: %v", left)
+	}
 }
 
 // A1: no git command apply runs in the operator's checkout can run a program that checkout's config (or the

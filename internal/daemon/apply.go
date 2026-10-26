@@ -11,7 +11,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
@@ -266,12 +268,14 @@ func (d *Daemon) Apply(ctx context.Context, ref string, req api.ApplyRequest) (a
 	if err != nil {
 		return api.ApplyResult{}, asAPIError(err)
 	}
-	want, out, err := previewApply(ctx, dir, b.dir, kept, paths, applyPath)
+	pv, out, err := previewApply(ctx, dir, b.dir, kept, paths, applyPath)
 	if err != nil {
 		b.event(api.EventApplyDecided, "apply", "apply refused: the patch does not apply: "+out, map[string]any{"dir": dir})
 		return api.ApplyResult{}, errf(api.CodeConflict, "the checkout changed since the box started; nothing was applied (the patch is at "+patchPath+")",
 			"the patch does not apply to %s: %s", dir, firstLine(out, err))
 	}
+	defer os.RemoveAll(pv.scratch)
+	want := pv.want
 
 	var allowed []gatedWrite
 	for _, p := range paths {
@@ -318,31 +322,47 @@ func (d *Daemon) Apply(ctx context.Context, ref string, req api.ApplyRequest) (a
 			map[string]any{"dir": dir, "paths": paths, "check": true, "sha256": res.SHA256})
 		return res, nil
 	}
-	// once decided, the patch is applied whatever the client does: under the daemon's context (gitApply has its own
-	// timeout), not the request's
-	before := map[string]fileState{}
+	// git never runs on the checkout itself: the patch was applied in the scratch copy, and what is written into the
+	// checkout is that result, file by file, only once it is exactly what the signer decided and the checkout is still
+	// as it was when the decisions were made. From here on the client can't stop it (the request's context is not used)
+	if applyScratchHook != nil {
+		applyScratchHook(pv.scratch)
+	}
+	var mismatch []string
 	for _, p := range paths {
-		if st, err := statFile(filepath.Join(dir, p)); err == nil {
-			before[p] = st
+		if got, err := statFile(filepath.Join(pv.scratch, filepath.FromSlash(p))); err != nil || got != want[p] {
+			mismatch = append(mismatch, p)
 		}
 	}
-	if out, err := gitApply(d.ctx, dir, b.dir, applyPath); err != nil {
-		// git apply checks every hunk before it writes, but a failure while writing (a full disk, a permission) can
-		// leave some files written: say which
-		var written []string
-		for _, p := range paths {
-			if got, serr := statFile(filepath.Join(dir, p)); serr != nil || got != before[p] {
-				written = append(written, p)
-			}
+	if len(mismatch) > 0 {
+		completeWrites(d, b, run, allowed, "error", map[string]any{"written": false, "differs_from_decision": mismatch})
+		b.event(api.EventApplyDecided, "apply", "apply refused: the patched files differ from what was decided: "+strings.Join(mismatch, ", "),
+			map[string]any{"dir": dir, "differ": mismatch})
+		return api.ApplyResult{}, errf(api.CodeConflict, "nothing was written; try the apply again (the patch is at "+patchPath+")",
+			"the patched %s differ from what was decided: %s", plural(len(mismatch), "file"), strings.Join(mismatch, ", "))
+	}
+	var changed []string
+	for _, p := range paths {
+		if got, err := statFile(filepath.Join(dir, filepath.FromSlash(p))); err != nil || got != pv.before[p] {
+			changed = append(changed, p)
 		}
-		completeWrites(d, b, run, allowed, "error", map[string]any{"written": len(written) > 0, "written_paths": written, "error": out})
-		b.event(api.EventApplyDecided, "apply", "git apply failed: "+out, map[string]any{"dir": dir, "written": written})
+	}
+	if len(changed) > 0 {
+		completeWrites(d, b, run, allowed, "error", map[string]any{"written": false, "checkout_changed": changed})
+		b.event(api.EventApplyDecided, "apply", "apply refused: the checkout changed while it was decided: "+strings.Join(changed, ", "),
+			map[string]any{"dir": dir, "changed": changed})
+		return api.ApplyResult{}, errf(api.CodeConflict, "nothing was written; review the checkout with `git status` and apply again (the patch is at "+patchPath+")",
+			"the checkout changed while the patch was decided: %s", strings.Join(changed, ", "))
+	}
+	if written, err := writeResults(dir, pv.scratch, paths, want); err != nil {
+		completeWrites(d, b, run, allowed, "error", map[string]any{"written": len(written) > 0, "written_paths": written, "error": err.Error()})
+		b.event(api.EventApplyDecided, "apply", "writing the patched files failed: "+err.Error(), map[string]any{"dir": dir, "written": written})
 		if len(written) > 0 {
 			return api.ApplyResult{}, errf(api.CodeConflict, "review the checkout with `git status` and `git diff` (the patch is at "+patchPath+")",
-				"git apply failed after writing %s: %s: %s", plural(len(written), "file"), strings.Join(written, ", "), firstLine(out, err))
+				"writing the patched files failed after writing %s: %s: %v", plural(len(written), "file"), strings.Join(written, ", "), err)
 		}
-		return api.ApplyResult{}, errf(api.CodeConflict, "the checkout changed since the box started; nothing was applied (the patch is at "+patchPath+")",
-			"git apply failed: %s", firstLine(out, err))
+		return api.ApplyResult{}, errf(api.CodeConflict, "nothing was written; check the checkout (the patch is at "+patchPath+")",
+			"writing the patched files failed: %v", err)
 	}
 	// what landed must be what was decided
 	var differ []string
@@ -436,37 +456,193 @@ func statFile(p string) (fileState, error) {
 	return fileState{}, fmt.Errorf("%s is neither a file nor a symlink", p)
 }
 
-// previewApply applies the patch to a scratch copy of the files it touches and returns what each written path will
-// be. It fails (with git's output) when the patch does not apply to the checkout as it is now.
-func previewApply(ctx context.Context, dir, scratch string, files []*patchFile, paths []string, patchPath string) (map[string]fileState, string, error) {
+// applyScratchHook, when set (tests), runs on the scratch copy after the decisions and before anything is written.
+var applyScratchHook func(scratch string)
+
+// preview is a patch applied in a scratch copy of the files it touches: what each path will be (want), what it was
+// in the checkout when it was copied (before), and the scratch dir holding the result (the caller removes it).
+type preview struct {
+	scratch string
+	want    map[string]fileState
+	before  map[string]fileState
+}
+
+// previewApply applies the patch to a scratch copy of the files it touches. It fails (with git's output) when the
+// patch does not apply to the checkout as it is now.
+func previewApply(ctx context.Context, dir, scratch string, files []*patchFile, paths []string, patchPath string) (preview, string, error) {
 	tmp, err := os.MkdirTemp(scratch, ".apply-preview-")
 	if err != nil {
-		return nil, "", err
+		return preview{}, "", err
 	}
-	defer os.RemoveAll(tmp)
+	pv := preview{scratch: tmp, want: map[string]fileState{}, before: map[string]fileState{}}
+	fail := func(out string, err error) (preview, string, error) {
+		os.RemoveAll(tmp)
+		return preview{}, out, err
+	}
+	for _, p := range paths {
+		st, err := statFile(filepath.Join(dir, filepath.FromSlash(p)))
+		if err != nil {
+			return fail(err.Error(), err)
+		}
+		pv.before[p] = st
+	}
 	for _, f := range files {
 		if f.Old == "" {
 			if _, err := os.Lstat(filepath.Join(dir, f.New)); err == nil {
-				return nil, f.New + " already exists in the checkout", errors.New("exists")
+				return fail(f.New+" already exists in the checkout", errors.New("exists"))
 			}
 			continue
 		}
 		if err := copyEntry(filepath.Join(dir, f.Old), filepath.Join(tmp, f.Old)); err != nil {
-			return nil, err.Error(), err
+			return fail(err.Error(), err)
 		}
 	}
 	if out, err := gitApply(ctx, tmp, scratch, patchPath); err != nil {
-		return nil, out, err
+		return fail(out, err)
 	}
-	want := map[string]fileState{}
 	for _, p := range paths {
-		st, err := statFile(filepath.Join(tmp, p))
+		st, err := statFile(filepath.Join(tmp, filepath.FromSlash(p)))
 		if err != nil {
-			return nil, err.Error(), err
+			return fail(err.Error(), err)
 		}
-		want[p] = st
+		pv.want[p] = st
 	}
-	return want, "", nil
+	return pv, "", nil
+}
+
+// writeResults writes the decided results from the scratch copy into the checkout dir, deletions first: each file
+// goes to a new temp file in its own dir (O_EXCL|O_NOFOLLOW), gets its mode and is renamed over the target; a symlink
+// is made under a temp name and renamed; a deletion removes only a file or symlink. No parent may be a symlink (each
+// one is checked with lstat just before the write). It returns the paths written before any failure.
+func writeResults(dir, scratch string, paths []string, want map[string]fileState) ([]string, error) {
+	var dels, puts []string
+	for _, p := range paths {
+		if want[p].deleted {
+			dels = append(dels, p)
+		} else {
+			puts = append(puts, p)
+		}
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(dels))) // children before their parents
+	sort.Strings(puts)
+	var written []string
+	for _, p := range append(dels, puts...) {
+		if err := writeResult(dir, scratch, p, want[p]); err != nil {
+			return written, fmt.Errorf("%s: %w", p, err)
+		}
+		written = append(written, p)
+	}
+	return written, nil
+}
+
+func writeResult(dir, scratch, p string, w fileState) error {
+	rel := filepath.FromSlash(p)
+	abs := filepath.Join(dir, rel)
+	parent := filepath.Dir(abs)
+	if err := realParents(dir, filepath.Dir(rel), !w.deleted); err != nil {
+		return err
+	}
+	if w.deleted {
+		fi, err := os.Lstat(abs)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !fi.Mode().IsRegular() && fi.Mode()&os.ModeSymlink == 0 {
+			return errors.New("is not a file or a symlink, so it is not deleted")
+		}
+		if err := os.Remove(abs); err != nil {
+			return err
+		}
+		// like git apply, a dir the deletion left empty goes too
+		for d := parent; d != dir && len(d) > len(dir); d = filepath.Dir(d) {
+			if os.Remove(d) != nil {
+				break
+			}
+		}
+		return nil
+	}
+	src := filepath.Join(scratch, rel)
+	tmp := filepath.Join(parent, ".tkbox-apply-"+randHex(8))
+	if w.symlink {
+		target, err := os.Readlink(src)
+		if err != nil {
+			return err
+		}
+		if err := os.Symlink(target, tmp); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, abs); err != nil {
+			os.Remove(tmp)
+			return err
+		}
+		return nil
+	}
+	perm := os.FileMode(0o644)
+	if fi, err := os.Lstat(abs); err == nil && fi.Mode().IsRegular() {
+		perm = fi.Mode().Perm() // keep the file's own permission bits, with the decided executable bit
+	}
+	if w.mode == "100755" {
+		if perm&0o111 == 0 {
+			perm |= (perm & 0o444) >> 2
+		}
+	} else {
+		perm &^= 0o111
+	}
+	in, err := os.OpenFile(src, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(out, in)
+	if err == nil {
+		err = out.Chmod(perm)
+	}
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, abs)
+	}
+	if err != nil {
+		os.Remove(tmp)
+	}
+	return err
+}
+
+// realParents checks that every component of rel (a dir under root) is a real directory, not a symlink; with create,
+// missing ones are made.
+func realParents(root, rel string, create bool) error {
+	if rel == "." || rel == "" {
+		return nil
+	}
+	cur := root
+	for _, c := range strings.Split(rel, string(filepath.Separator)) {
+		cur = filepath.Join(cur, c)
+		fi, err := os.Lstat(cur)
+		switch {
+		case os.IsNotExist(err) && create:
+			if err := os.Mkdir(cur, 0o777); err != nil {
+				return err
+			}
+			continue
+		case os.IsNotExist(err):
+			return nil // a deletion under a dir that is gone: nothing to delete
+		case err != nil:
+			return err
+		case fi.Mode()&os.ModeSymlink != 0:
+			return fmt.Errorf("its parent %s is a symlink", cur)
+		case !fi.IsDir():
+			return fmt.Errorf("its parent %s is not a directory", cur)
+		}
+	}
+	return nil
 }
 
 // copyEntry copies a regular file (with its permission bits) or a symlink.
