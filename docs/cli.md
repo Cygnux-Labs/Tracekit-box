@@ -153,7 +153,9 @@ Stdin comes in one of two kinds:
 - **Known before the start.** The API's `stdin_data` (at most 1 MiB, base64 in the JSON request) is decided with the
   command as `stdin_sha256` and `stdin_bytes`, plus `stdin_text` when it is UTF-8 of at most 4 KiB (a secret's
   placeholder shown as `tkbox_NAME_…`, its value as `[secret NAME]`), and exactly that data is the process's stdin.
-  MCP's `tkbox_exec` sends its `stdin` this way, and so does the SDK for bytes or str of at most 1 MiB.
+  MCP's `tkbox_exec` sends its `stdin` this way, and so does the SDK for bytes or str of at most 1 MiB. `stdin_text`
+  is signed verbatim: a credential that is not a Box secret (a password for `docker login --password-stdin`) is in
+  the record for good. Stream credentials instead (`-i`; a file object in the SDK), so only their digest is recorded.
 - **Streamed** (`-i`; in the SDK, larger input and file objects). It can't be known before the start, so the exec's
   completion record has its `stdin_sha256` and `stdin_bytes`: what the process was given, whether it exits, fails, is
   stopped with the box or loses its client.

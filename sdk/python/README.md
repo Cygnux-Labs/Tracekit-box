@@ -79,7 +79,9 @@ such as an egress refusal or an approval to give with `tkbox approve <id>`.
 
 `stdin` as bytes or str of at most 1 MiB is sent in the request (`stdin_data`): the signer decides it with the command
 (its sha256 and size, and the text itself when it is UTF-8 of at most 4 KiB), and exactly that data is the process's
-stdin. Larger input and file objects are streamed, and the sha256 and size of what the process was given are recorded
+stdin. That text is signed verbatim, and only Box secrets are redacted from it: pass a credential that is not a Box
+secret as a file object (`stdin=io.BytesIO(password)`, for `docker login --password-stdin`), so it is streamed and only
+its sha256 is recorded. Larger input and file objects are streamed, and the sha256 and size of what the process was given are recorded
 with the outcome instead; the daemon holds at most 4 MiB the process has not read yet, and past that stops the process
 rather than hand it a false end of input (`stdin_truncated`, and `ok` is false). A per-command `env` is decided as a
 leading `env K=V …` on the command line, and may not set names that change what runs (`LD_*`, `GIT_*`, `XDG_*`,
