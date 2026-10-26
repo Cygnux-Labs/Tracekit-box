@@ -30,6 +30,32 @@ func otherOwnerGit(t *testing.T) {
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
+// verify3b V3: the scratch git that builds and checks an apply reads no user git files: a hostile
+// ~/.config/git/attributes (eol=crlf, ident) changes nothing written.
+func TestVerify3bScratchGitReadsNoUserAttributes(t *testing.T) {
+	needGit(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	for _, d := range []string{filepath.Join(home, ".config", "git")} {
+		os.MkdirAll(d, 0o755)
+		os.WriteFile(filepath.Join(d, "attributes"), []byte("* text eol=crlf ident\n"), 0o644)
+	}
+	e := newTestEnv(t, nil)
+	ws, _ := filepath.EvalSymlinks(t.TempDir())
+	gitInit(t, ws)
+	os.WriteFile(filepath.Join(ws, "a.txt"), []byte("old\n"), 0o644)
+	e.guest.Patch = modify("a.txt") + newFileSection("b.txt", "$Id$ two")
+	e.create(api.CreateBoxRequest{Name: "attr", Workspace: ws})
+	e.d.Stop(context.Background(), "attr", api.StopRequest{})
+	if _, err := e.d.Apply(context.Background(), "attr", api.ApplyRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if a, b := readFile(t, filepath.Join(ws, "a.txt")), readFile(t, filepath.Join(ws, "b.txt")); a != "new\n" || b != "$Id$ two\n" {
+		t.Fatalf("the user's git attributes changed what was written: a.txt %q, b.txt %q", a, b)
+	}
+}
+
 // verify3b V1: a daemon that does not own the checkout works where the operator listed it in safe.directory (global
 // config: read and passed back with -c, since the contained git reads no global config); where git refuses the
 // checkout, apply fails closed rather than skip its git-dir and hooks-dir checks.

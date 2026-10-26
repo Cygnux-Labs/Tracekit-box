@@ -704,10 +704,24 @@ var checkoutGitConf = image.HostGitConf
 // PAGER, never prompting, paging or taking optional locks.
 func hostGitEnv() []string { return image.HostGitEnv() }
 
+// scratchGit is a git command for apply's scratch work (its empty git dir, the scratch copy, the oracle's empty work
+// tree): checkoutGit with HOME and XDG_CONFIG_HOME pointed at an empty dir under scratch and core.attributesFile at
+// /dev/null, so no user git file (~/.config/git/attributes, ignore, config) changes what it reads or writes.
+func scratchGit(ctx context.Context, scratch, dir string, conf []string, args ...string) (*exec.Cmd, error) {
+	home := filepath.Join(scratch, ".apply-home")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		return nil, err
+	}
+	cmd := checkoutGit(ctx, dir, append([]string{"core.attributesFile=/dev/null"}, conf...), args...)
+	cmd.Env = append(cmd.Env, "HOME="+home, "XDG_CONFIG_HOME="+filepath.Join(home, ".config"))
+	return cmd, nil
+}
+
 // checkoutGit is a git command run in the operator's real checkout dir, made unable to run a program there:
-// hostGitEnv, no global or system config or attributes (the only config read is the checkout's own, and
+// hostGitEnv, no global or system config and no system attributes (the only config read is the checkout's own, and
 // checkoutGitConf overrides everything in it that names a program), --no-pager, and conf as more -c settings (what
-// the command needs from the global config, read with hostGitConfig, and core.hooksPath).
+// the command needs from the global config, read with hostGitConfig, and core.hooksPath). It still reads the user's
+// $XDG_CONFIG_HOME/git/ignore, as the workspace build does; scratch work uses scratchGit instead.
 func checkoutGit(ctx context.Context, dir string, conf []string, args ...string) *exec.Cmd {
 	a := []string{"--no-pager"}
 	// the operator's safe.directory values (system and global config, read with image.SafeDirectoryConf) go back with
@@ -751,11 +765,14 @@ func gitAgrees(ctx context.Context, scratch, patchPath string, files []*patchFil
 	}
 	defer os.RemoveAll(work)
 	gitSays := func(args ...string) (string, error) {
-		cmd := checkoutGit(actx, work, []string{"core.hooksPath=/dev/null", "core.bare=false"},
+		cmd, err := scratchGit(actx, scratch, work, []string{"core.hooksPath=/dev/null", "core.bare=false"},
 			append([]string{"--git-dir=" + gitDir, "--work-tree=" + work, "apply"}, args...)...)
+		if err != nil {
+			return "", err
+		}
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
-		err := cmd.Run()
+		err = cmd.Run()
 		if msg := strings.TrimSpace(stderr.String()); err != nil || msg != "" {
 			if msg == "" {
 				msg = err.Error()
@@ -879,7 +896,12 @@ func scratchGitDir(ctx context.Context, scratch string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if out, err := checkoutGit(ctx, scratch, []string{"core.hooksPath=/dev/null"}, "init", "-q", "--bare", "--template=", gitDir).CombinedOutput(); err != nil {
+	cmd, err := scratchGit(ctx, scratch, scratch, []string{"core.hooksPath=/dev/null"}, "init", "-q", "--bare", "--template=", gitDir)
+	if err != nil {
+		os.RemoveAll(gitDir)
+		return "", err
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
 		os.RemoveAll(gitDir)
 		return "", fmt.Errorf("git init: %v %s", err, strings.TrimSpace(string(out)))
 	}
@@ -887,8 +909,9 @@ func scratchGitDir(ctx context.Context, scratch string) (string, error) {
 }
 
 // gitApply runs git apply --binary (never --unsafe-paths) on the work tree dir with a fresh, empty git dir made in
-// scratch: neither the checkout's .git/config (filters, hooksPath, fsmonitor) nor the global or system config is
-// read, so no filter driver, hook or other host program runs.
+// scratch: neither the checkout's .git/config (filters, hooksPath, fsmonitor) nor the global or system config nor
+// the user's git attributes (scratchGit) are read, so no filter driver, hook or other host program runs and no
+// conversion changes the bytes.
 func gitApply(ctx context.Context, dir, scratch, patchPath string) (string, error) {
 	actx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
@@ -897,8 +920,11 @@ func gitApply(ctx context.Context, dir, scratch, patchPath string) (string, erro
 		return err.Error(), err
 	}
 	defer os.RemoveAll(gitDir)
-	cmd := checkoutGit(actx, dir, []string{"core.hooksPath=/dev/null", "core.bare=false"},
+	cmd, err := scratchGit(actx, scratch, dir, []string{"core.hooksPath=/dev/null", "core.bare=false"},
 		"--git-dir="+gitDir, "--work-tree="+dir, "apply", "--binary", "--whitespace=nowarn", patchPath)
+	if err != nil {
+		return err.Error(), err
+	}
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
