@@ -297,6 +297,12 @@ func (x *exchange) forward(req *http.Request, overTLS bool) bool {
 			}
 			break
 		}
+		if resp.StatusCode < 100 {
+			// net/http reads any three digits. Below 100 is no HTTP status, and its body would skip guardBody.
+			resp.Body.Close()
+			err = errors.New("its response is not valid HTTP/1.1")
+			break
+		}
 		if overTLS {
 			p.redactValues(resp.Header)
 			p.redactValues(resp.Trailer) // the names announced in Trailer, which go to the guest in its Trailer header

@@ -1225,3 +1225,25 @@ func TestOpaqueInnerTargetRefused(t *testing.T) {
 		t.Errorf("the bound host received %q with Authorization %q", r.RequestURI, r.Header.Get("Authorization"))
 	}
 }
+
+// A status below 100 is not HTTP. guardBody took it for an interim response with no body, while writeResponse relayed
+// its body, so a bound host's echo reached the guest unredacted. Such a response is refused.
+func TestStatusBelow100Refused(t *testing.T) {
+	checkGoroutines(t)
+	e, port, gh, other := echoEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		v := r.Header.Get("Authorization")
+		c, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		fmt.Fprintf(c, "HTTP/1.1 %s Echo\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", strings.TrimPrefix(r.URL.Path, "/"), len(v), v)
+	})
+	for _, status := range []string{"000", "042", "099"} {
+		resp, b := rawGet(e, port, "example.com", "/"+status, "Authorization: Bearer "+gh.Placeholder)
+		noSecret(t, "status "+status, b, gh, other)
+		if resp.StatusCode != 502 || !strings.Contains(b, "not valid HTTP/1.1") {
+			t.Errorf("status %s: %s %q", status, resp.Status, b)
+		}
+	}
+}
