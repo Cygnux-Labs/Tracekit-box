@@ -163,6 +163,10 @@ type SecretSpec struct {
 	Header string   `json:"header,omitempty"` // header the placeholder is swapped in; "" = Authorization
 }
 
+// AgentMCP is the Agent of a box `tkbox mcp` creates for an MCP client. What that client chose (its workspace) is
+// recorded as untrusted, never in the trusted record of the box, which reads as the operator's request.
+const AgentMCP = "mcp"
+
 type CreateBoxRequest struct {
 	Name      string                `json:"name,omitempty"`      // unique among boxes; default the id
 	Image     string                `json:"image"`               // OCI reference, e.g. "python:3.12-slim"
@@ -172,7 +176,7 @@ type CreateBoxRequest struct {
 	Workspace string                `json:"workspace,omitempty"` // absolute host dir copied into /workspace; "" = none
 	Limits    Limits                `json:"limits,omitempty"`
 	Inspect   string                `json:"inspect,omitempty"` // "bound" (default: MITM only hosts with a bound secret) or "all"
-	Agent     string                `json:"agent,omitempty"`   // agent name recorded in the Tracekit run (default "tkbox")
+	Agent     string                `json:"agent,omitempty"`   // agent name recorded in the Tracekit run (default "tkbox"; AgentMCP)
 	Task      string                `json:"task,omitempty"`    // the task, recorded as trusted observe content
 	// ValidateOnly checks the request (limits, allowlist, secrets, workspace) and answers 200 with the box it would
 	// create, without creating anything.

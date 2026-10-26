@@ -156,7 +156,7 @@ func (s *mcpServer) runRequest(a mcpRunArgs) (api.CreateBoxRequest, error) {
 		}
 	}
 	req, err := config.Request(s.base, config.Flags{Image: image, Workspace: workspace,
-		CPUs: a.CPUs, Memory: a.Memory, Timeout: a.Timeout, Agent: "mcp"}, config.Resolver{})
+		CPUs: a.CPUs, Memory: a.Memory, Timeout: a.Timeout, Agent: api.AgentMCP}, config.Resolver{})
 	if err != nil {
 		return api.CreateBoxRequest{}, err
 	}

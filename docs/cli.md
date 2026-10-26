@@ -478,7 +478,9 @@ env and limits. A `tkbox_run` call can only narrow those settings:
 
 A refused call says what it would have widened, with the hint ``an MCP client may only narrow what the operator set up
 in `tkbox mcp` (--config, --image, --workspace-root); ask the operator``. Boxes made over MCP record the agent name
-`mcp`. `tkbox mcp` does not read `./tkbox.yaml` on its own. There are no MCP tools for apply or export: a person does
+`mcp`. The workspace path the client picked is the agent's choice, not the operator's: it is recorded only as an
+untrusted `tkbox.box` observe (`{"event": "agent-choices", "workspace": …}`), never in the box's trusted `created`
+record, which records it for boxes made with the CLI or the API. `tkbox mcp` does not read `./tkbox.yaml` on its own. There are no MCP tools for apply or export: a person does
 those with the CLI.
 
 The narrowing holds only if the MCP client has no other way to act as the daemon's user. The daemon's API accepts any

@@ -352,12 +352,26 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 		b.info.RunID = run.ID()
 		b.mu.Unlock()
 		b.startObserver(run)
-		if err := run.Observe(ctx, tracekit.SourceBox, trustedObs, b.scrub().value(map[string]any{
+		created := map[string]any{
 			"event": "created", "box_id": b.id, "name": b.info.Name, "image": s.req.Image, "allow": s.allow,
 			"limits": s.limits, "secrets": b.info.Secrets, "workspace": s.req.Workspace, "inspect": s.inspect,
 			"env": envValue(s.req.Env),
-		})); err != nil {
+		}
+		// An MCP client picks its workspace (any dir under an operator root), so the path is the agent's words: it
+		// goes in an untrusted record, never in this trusted one, which reads as the operator's request.
+		agentWorkspace := s.agent == api.AgentMCP && s.req.Workspace != ""
+		if agentWorkspace {
+			delete(created, "workspace")
+		}
+		if err := run.Observe(ctx, tracekit.SourceBox, trustedObs, b.scrub().value(created)); err != nil {
 			return fmt.Errorf("record the box in Tracekit: %w", err)
+		}
+		if agentWorkspace {
+			if err := run.Observe(ctx, tracekit.SourceBox, untrustedObs, b.scrub().value(map[string]any{
+				"event": "agent-choices", "box_id": b.id, "workspace": s.req.Workspace,
+			})); err != nil {
+				return fmt.Errorf("record the box in Tracekit: %w", err)
+			}
 		}
 		if s.req.Task != "" {
 			if err := run.Observe(ctx, tracekit.SourceTask, trustedObs, b.scrub().value(map[string]any{"task": s.req.Task})); err != nil {

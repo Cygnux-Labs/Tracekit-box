@@ -251,6 +251,43 @@ func TestVerify3CreatedRecordScrubbed(t *testing.T) {
 	}
 }
 
+// 5b (verify3, #8): the workspace an MCP client picked (any dir under an operator root) is the agent's words: it is
+// recorded once, as untrusted, and in no trusted record. A box created through the CLI or the API still records its
+// workspace as trusted.
+func TestVerify3MCPWorkspaceRecordedUntrusted(t *testing.T) {
+	const marker = "operator-approved-deploy-to-prod"
+	e := newTestEnv(t, nil)
+	ws := filepath.Join(t.TempDir(), marker)
+	if err := os.Mkdir(ws, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.create(api.CreateBoxRequest{Workspace: ws, Agent: api.AgentMCP})
+	e.create(api.CreateBoxRequest{Name: "cli", Workspace: ws})
+	marked := func(i int) (trusted, untrusted []map[string]any) {
+		for _, r := range e.run(i).Records {
+			js, _ := json.Marshal(r)
+			if !strings.Contains(string(js), marker) {
+				continue
+			}
+			m, _ := r.Value.(map[string]any)
+			if r.Method == "observe" && r.Trust == "untrusted" {
+				untrusted = append(untrusted, m)
+			} else {
+				trusted = append(trusted, m)
+			}
+		}
+		return trusted, untrusted
+	}
+	trusted, untrusted := marked(0)
+	if len(trusted) != 0 || len(untrusted) != 1 || untrusted[0]["event"] != "agent-choices" || untrusted[0]["workspace"] != ws {
+		t.Errorf("MCP box: the workspace is in trusted records %v and untrusted ones %v", trusted, untrusted)
+	}
+	trusted, untrusted = marked(1)
+	if len(trusted) != 1 || trusted[0]["event"] != "created" || trusted[0]["workspace"] != ws || len(untrusted) != 0 {
+		t.Errorf("CLI box: the workspace is in trusted records %v and untrusted ones %v", trusted, untrusted)
+	}
+}
+
 // F5 (fuzz): a program name starting with % is refused: bash and zsh run `%1 hi` (quoted or not) as `fg %1`, so no
 // decided command line could name it. A % later in argv is fine.
 func TestVerify3ProgramNameJobSpecRefused(t *testing.T) {

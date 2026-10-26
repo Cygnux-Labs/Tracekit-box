@@ -307,7 +307,7 @@ func TestMCP(t *testing.T) {
 		t.Fatalf("ls shows a box this session did not create: %q", out)
 	}
 	out, isErr := text(call(6, "tools/call", map[string]any{"name": "tkbox_run", "arguments": map[string]any{"image": "alpine:3", "allow": []string{"pypi"}}}))
-	if isErr || !strings.Contains(out, "is running alpine:3") || fd.created[0].Agent != "mcp" || len(fd.created[0].Secrets) != 0 {
+	if isErr || !strings.Contains(out, "is running alpine:3") || fd.created[0].Agent != api.AgentMCP || len(fd.created[0].Secrets) != 0 {
 		t.Fatalf("run: %q %+v", out, fd.created)
 	}
 	if strings.Join(fd.created[0].Allow, ",") != "pypi" {
