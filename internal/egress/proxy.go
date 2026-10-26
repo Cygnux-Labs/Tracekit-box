@@ -491,7 +491,14 @@ func (p *Proxy) serveConnect(s *session, req *http.Request, br *bufio.Reader) {
 		s.linger(br)
 		return
 	}
-	t := target{scheme: "https", host: host, addr: lit, port: port}
+	// The decision comes before the first byte, so the record names only what is known then: a CONNECT to 443 is
+	// HTTPS (the tunnel must carry TLS), and one to any other port is a TCP tunnel to that port, which an allow entry
+	// naming the port may use for any protocol (SSH, SMTP, or TLS too).
+	scheme := "tcp"
+	if port == 443 {
+		scheme = "https"
+	}
+	t := target{scheme: scheme, host: host, addr: lit, port: port}
 	if req.ContentLength != 0 || len(req.TransferEncoding) > 0 {
 		p.deny(s, s.client, t, "", "", refusal{status: 400, reason: "a CONNECT request has a body", todo: "Send CONNECT without a body."})
 		s.linger(br)

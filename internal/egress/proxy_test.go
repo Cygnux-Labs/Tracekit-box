@@ -420,9 +420,53 @@ func TestTunnelPlain(t *testing.T) {
 	}
 	r := e.dec.Requests[0]
 	p, _ := strconv.Atoi(port)
-	if r.BoxID != "box-test" || r.Scheme != "https" || r.Host != "example.com" || r.Port != p || !r.OnAllowlist ||
-		r.URL != "https://example.com:"+port || len(r.Addrs) != 1 || r.Addrs[0] != netip.MustParseAddr("127.0.0.1") {
+	// Not port 443: recorded as a TCP tunnel to that port (TestDecisionSchemeByPort).
+	if r.BoxID != "box-test" || r.Scheme != "tcp" || r.Host != "example.com" || r.Port != p || !r.OnAllowlist ||
+		r.URL != "tcp://example.com:"+port || len(r.Addrs) != 1 || r.Addrs[0] != netip.MustParseAddr("127.0.0.1") {
 		t.Errorf("decider request %+v", r)
+	}
+}
+
+// The decision is made before the tunnel's first byte, so its url names only what is known then: a CONNECT to 443
+// is https (the tunnel must carry TLS), any other port a TCP tunnel to that port (an allow entry naming the port
+// lets SSH or any other protocol through), and an absolute-form request is http.
+func TestDecisionSchemeByPort(t *testing.T) {
+	checkGoroutines(t)
+	e := newEnv(t, func(c *Config) { c.Allow = []string{"example.com", "example.com:22", "other.example:8443"} })
+	e.dec.Func = func(context.Context, Request) (Verdict, error) {
+		return Verdict{Reason: "test refuses everything"}, nil
+	}
+	for _, target := range []string{"example.com:443", "example.com:22", "other.example:8443", "[2606:4700::1111]:5432"} {
+		_, _, resp := e.rawConnect(target)
+		resp.Body.Close()
+	}
+	c := e.dialProxy()
+	fmt.Fprintf(c, "GET http://example.com/x HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	e.stop()
+	want := map[string]string{
+		"example.com:443":      "https://example.com:443",
+		"example.com:22":       "tcp://example.com:22",
+		"other.example:8443":   "tcp://other.example:8443",
+		"2606:4700::1111:5432": "tcp://[2606:4700::1111]:5432",
+		"example.com:80":       "http://example.com:80",
+	}
+	got := map[string]string{}
+	for _, r := range e.dec.Requests {
+		k := r.Host + ":" + strconv.Itoa(r.Port)
+		got[k] = r.URL
+		if scheme, _, _ := strings.Cut(r.URL, "://"); scheme != r.Scheme {
+			t.Errorf("%s: Scheme %q but URL %q", k, r.Scheme, r.URL)
+		}
+	}
+	for k, u := range want {
+		if got[k] != u {
+			t.Errorf("%s: url %q, want %q", k, got[k], u)
+		}
 	}
 }
 
