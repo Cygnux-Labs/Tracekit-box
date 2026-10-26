@@ -213,7 +213,7 @@ func TestParseRunYAML(t *testing.T) {
 		{"unknown key", goodYAML + "secret: x\n", "secret"},
 		{"two documents", goodYAML + "---\nagent: x\n", "more than one YAML document"},
 		{"agent on two lines", strings.Replace(goodYAML, "agent: Claude Code", `agent: "Claude\nCode"`, 1), "one line"},
-		{"bidi override", strings.Replace(goodYAML, "Fix the", "Fix ‮the", 1), "control or format character"},
+		{"bidi override", strings.Replace(goodYAML, "Fix the", "Fix \u202ethe", 1), "control or format character"},
 		{"image with a space", strings.Replace(goodYAML, "python:3.12-slim", "python 3", 1), "holds a space"},
 		{"allow entry with a space", strings.Replace(goodYAML, "allow: []", "allow: [pypi, 'a b']", 1), "holds a space"},
 		{"empty allow entry", strings.Replace(goodYAML, "allow: []", "allow: ['']", 1), "an allow entry is required"},
