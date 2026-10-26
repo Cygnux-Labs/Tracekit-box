@@ -283,6 +283,36 @@ type observer struct {
 	last       time.Time
 	suppressed int
 	gaps       map[string]*gap // must-record observes lost, by source
+	gapsTaken  bool            // recordGaps took gaps: a later loss is recorded on its own (completeFailed)
+}
+
+// gapComplete is the tkbox.gap kind of completes that never reached the signer.
+const gapComplete = "complete"
+
+// completeFailed handles a complete the signer refused or never answered: the decided call then has no recorded
+// outcome, so it is counted into the box's tkbox.gap record (kind "complete") like a lost observe. While the box is
+// up it joins the gaps teardown records; afterwards (an apply of a stopped box, or a complete that finished after
+// teardown recorded the gaps) a tkbox.gap record is sent for it at once.
+func (b *box) completeFailed(door string, err error) {
+	reason := "the signer refused it or did not answer: " + err.Error()
+	b.event(api.EventSignerProblem, door, "complete failed: "+err.Error(), nil)
+	b.mu.Lock()
+	o, run := b.obs, b.run
+	if o != nil && !o.gapsTaken {
+		o.lost(gapComplete, reason)
+		b.mu.Unlock()
+		return
+	}
+	b.mu.Unlock()
+	if run == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(b.d.ctx, 30*time.Second)
+	defer cancel()
+	if gerr := run.Observe(ctx, sourceGap, trustedObs, map[string]any{"kind": gapComplete, "dropped": 1, "reason": reason}); gerr != nil {
+		b.event(api.EventSignerProblem, door, "a complete was lost and the loss could not be recorded: "+gerr.Error(), nil)
+		b.d.log.Printf("WARNING: box %s: a complete was lost and the loss could not be recorded in Tracekit: %v", b.id, gerr)
+	}
 }
 
 // lost counts a must-record observe that will never reach the signer (caller holds box.mu).
@@ -463,6 +493,7 @@ func (b *box) recordGaps(ctx context.Context, run tracekit.Run) string {
 	var gaps map[string]*gap
 	if b.obs != nil {
 		gaps, b.obs.gaps = b.obs.gaps, nil
+		b.obs.gapsTaken = true
 	}
 	b.mu.Unlock()
 	if len(gaps) == 0 {

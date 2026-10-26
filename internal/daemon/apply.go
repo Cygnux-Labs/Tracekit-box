@@ -367,7 +367,7 @@ func completeWrites(d *Daemon, b *box, run tracekit.Run, allowed []gatedWrite, s
 	for _, g := range allowed {
 		cctx, cancel := context.WithTimeout(d.ctx, 30*time.Second)
 		if err := run.Complete(cctx, g.call, g.dec, status, result); err != nil {
-			b.event(api.EventSignerProblem, "apply", "complete failed: "+err.Error(), nil)
+			b.completeFailed("apply", err)
 		}
 		cancel()
 	}

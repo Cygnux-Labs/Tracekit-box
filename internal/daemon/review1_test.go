@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
 	"github.com/Cygnux-Labs/tracekit-box/internal/egress"
+	"github.com/Cygnux-Labs/tracekit-box/internal/proto"
 	"github.com/Cygnux-Labs/tracekit-box/internal/tracekit"
 )
 
@@ -98,6 +102,96 @@ func TestReview1NoSecretValuesInFirstRecordsOrEnv(t *testing.T) {
 	}
 	if _, e2 := e.d.prepareExec("l1", api.ExecRequest{Argv: []string{"env"}, Env: map[string]string{"AUTH": ph}}); e2 != nil {
 		t.Fatalf("per-exec env with the placeholder: %v", e2)
+	}
+}
+
+// flakyClient's runs refuse every complete (when failComplete is set) and the observes of the sources in failObserve.
+type flakyClient struct {
+	tracekit.Client
+	mu           sync.Mutex
+	failComplete bool
+	failObserve  map[string]bool
+}
+
+func (c *flakyClient) set(failComplete bool) { c.mu.Lock(); c.failComplete = failComplete; c.mu.Unlock() }
+
+func (c *flakyClient) NewRun(ctx context.Context, a tracekit.Agent) (tracekit.Run, error) {
+	r, err := c.Client.NewRun(ctx, a)
+	if err != nil {
+		return nil, err
+	}
+	return &flakyRun{Run: r, c: c}, nil
+}
+
+type flakyRun struct {
+	tracekit.Run
+	c *flakyClient
+}
+
+func (r *flakyRun) Complete(ctx context.Context, call tracekit.Call, d tracekit.Decision, status string, result any) error {
+	r.c.mu.Lock()
+	fail := r.c.failComplete
+	r.c.mu.Unlock()
+	if fail {
+		return &tracekit.RPCError{Code: "internal", Message: "complete refused"}
+	}
+	return r.Run.Complete(ctx, call, d, status, result)
+}
+
+func (r *flakyRun) Observe(ctx context.Context, source, trust string, value any) error {
+	r.c.mu.Lock()
+	fail := r.c.failObserve[source]
+	r.c.mu.Unlock()
+	if fail {
+		return &tracekit.RPCError{Code: "internal", Message: "observe refused"}
+	}
+	return r.Run.Observe(ctx, source, trust, value)
+}
+
+// gapsOf sums the tkbox.gap records of kind in run i.
+func gapsOf(e *testEnv, i int, kind string) int {
+	n := 0
+	for _, r := range e.run(i).Records {
+		if r.Method == "observe" && r.Source == sourceGap {
+			if m, _ := r.Value.(map[string]any); m["kind"] == kind {
+				n += m["dropped"].(int)
+			}
+		}
+	}
+	return n
+}
+
+// L8: a complete the signer refuses is counted into tkbox.gap (kind "complete"), for execs and egress while the box
+// runs (recorded when it stops) and for an apply of a stopped box (recorded at once).
+func TestReview1FailedCompletesRecordedAsGap(t *testing.T) {
+	e := newTestEnv(t, nil)
+	fc := &flakyClient{Client: e.tk, failComplete: true}
+	e.d.opts.Tracekit = fc
+	ws := t.TempDir()
+	gitInit(t, ws)
+	os.WriteFile(filepath.Join(ws, "a.txt"), []byte("old\n"), 0o644)
+	e.guest.Patch = modify("a.txt")
+	e.create(api.CreateBoxRequest{Name: "c", Workspace: ws, Allow: []string{"pypi.org"}})
+	sock := e.serve()
+	_, frames := execStream(t, sock, "c", api.ExecRequest{Argv: []string{"true"}}, nil)
+	if frames[len(frames)-1].Type != proto.TypeExit {
+		t.Fatalf("exec: %s", frames[len(frames)-1].Payload)
+	}
+	if v, _ := e.proxy(0).cfg.Decider.Decide(context.Background(), egress.Request{Host: "pypi.org", Port: 443, URL: "https://pypi.org:443", OnAllowlist: true}); !v.Allow {
+		t.Fatalf("egress: %+v", v)
+	}
+	if n := gapsOf(e, 0, gapComplete); n != 0 {
+		t.Fatalf("gap recorded before the stop: %d", n)
+	}
+	e.d.Stop(context.Background(), "c", api.StopRequest{})
+	if n := gapsOf(e, 0, gapComplete); n != 2 {
+		t.Fatalf("tkbox.gap complete = %d after the stop, want 2 (exec + egress): %v", n, e.run(0).Methods())
+	}
+	if _, err := e.d.Apply(context.Background(), "c", api.ApplyRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if n := gapsOf(e, 0, gapComplete); n != 3 {
+		t.Fatalf("tkbox.gap complete = %d after the apply, want 3", n)
 	}
 }
 

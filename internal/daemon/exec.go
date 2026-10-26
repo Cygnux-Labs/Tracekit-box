@@ -398,7 +398,7 @@ func (b *box) runExec(parent context.Context, conn net.Conn, r io.Reader, w io.W
 		cctx, cancel := context.WithTimeout(b.d.ctx, 30*time.Second)
 		defer cancel()
 		if err := run.Complete(cctx, call, dec, status, result); err != nil {
-			b.event(api.EventSignerProblem, "exec", "complete failed: "+err.Error(), nil)
+			b.completeFailed("exec", err)
 		}
 	}
 	if run != nil {

@@ -77,7 +77,7 @@ func (bd *boxDecider) Decide(ctx context.Context, req egress.Request) (egress.Ve
 		cctx, cancel := context.WithTimeout(b.d.ctx, 30*time.Second)
 		defer cancel()
 		if err := run.Complete(cctx, call, dec, status, result); err != nil {
-			b.event(api.EventSignerProblem, "egress", "complete failed: "+err.Error(), nil)
+			b.completeFailed("egress", err)
 		}
 	}
 	hostPort := net.JoinHostPort(req.Host, strconv.Itoa(req.Port))
