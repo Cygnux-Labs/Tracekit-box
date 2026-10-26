@@ -1198,3 +1198,30 @@ func TestEchoInStatusAndNamesRedacted(t *testing.T) {
 	tc.Close()
 	e.waitKind(EventClosed)
 }
+
+// ---- fuzzing: opaque targets, statuses below 100, redaction markers ----
+
+// An opaque target ("https:http://evil.example/x") leaves no URL host for the tunnel's check, and net/http writes
+// it upstream as the absolute-form "http://evil.example/x" (or a bare "evil.example"): a front end that routes by
+// the target would hand the swapped credential to another site. It is refused before anything is swapped in.
+func TestOpaqueInnerTargetRefused(t *testing.T) {
+	checkGoroutines(t)
+	e, rec, port, gh, _ := secretEnv(t, nil)
+	for _, target := range []string{"https:http://evil.example/x", "https:HTTPS://evil.example:" + port + "/", "https:evil.example"} {
+		tc, br := e.tunnelTLS("example.com:"+port, "example.com")
+		fmt.Fprintf(tc, "GET %s HTTP/1.1\r\nHost: example.com:%s\r\nAuthorization: Bearer %s\r\n\r\n", target, port, gh.Placeholder)
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b := body(t, resp); resp.StatusCode != 400 || !strings.Contains(b, "opaque request target") {
+			t.Errorf("%s: %s %q", target, resp.Status, b)
+		}
+		tc.Close()
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	for _, r := range rec.reqs {
+		t.Errorf("the bound host received %q with Authorization %q", r.RequestURI, r.Header.Get("Authorization"))
+	}
+}

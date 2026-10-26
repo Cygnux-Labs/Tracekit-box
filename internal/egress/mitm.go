@@ -441,6 +441,10 @@ func (x *exchange) checkInner(req *http.Request) *refusal {
 	if req.URL.Scheme != "" && req.URL.Scheme != "https" {
 		return &refusal{status: 400, reason: "an absolute URL with scheme " + req.URL.Scheme + " inside a TLS tunnel", todo: "Send origin-form requests."}
 	}
+	if req.URL.Opaque != "" {
+		// "https:http://evil.example/x" has no URL host to check, and would go upstream as "http://evil.example/x".
+		return &refusal{status: 400, reason: "an opaque request target inside a TLS tunnel", todo: "Send origin-form requests."}
+	}
 	if req.Host == "" {
 		return &refusal{status: 400, reason: "the request has no Host header", todo: "Send Host: " + t.host + "."}
 	}
