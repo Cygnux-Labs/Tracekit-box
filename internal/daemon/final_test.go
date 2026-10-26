@@ -2,13 +2,16 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
+	"github.com/Cygnux-Labs/tracekit-box/internal/egress"
 	"github.com/Cygnux-Labs/tracekit-box/internal/image"
 )
 
@@ -83,5 +86,28 @@ func TestFinalDeletionRemovesOnlyAFileOrSymlink(t *testing.T) {
 	}
 	if readFile(t, filepath.Join(target, "t.txt")) != "target" {
 		t.Fatal("a symlink's target went with it")
+	}
+}
+
+// Info (final check): when the secrets' values together hold every printable ASCII character JSON writes as it is
+// (several strong random passwords can), the filler that keeps a rebuilt value out of a record is a non-ASCII
+// character none of whose bytes a value holds, not a control byte JSON would write as \u00XX.
+func TestFinalScrubberFillStaysPlainInJSON(t *testing.T) {
+	var all strings.Builder
+	for c := byte('!'); c <= '~'; c++ {
+		all.WriteByte(c)
+	}
+	ph, _ := egress.NewPlaceholder("S")
+	// every printable character, starting with ]; then also the first non-ASCII filler
+	for _, value := range []string{"]" + all.String(), "]" + all.String() + "·"} {
+		secrets := []egress.Secret{{Name: "S", Placeholder: ph, Value: value}}
+		b := &box{secrets: secrets}
+		text := value + value[1:] // the tag's "]" and the rest rebuild the value
+		for what, out := range map[string]string{"scrubber": newScrubber(secrets).str(text), "decision": b.redactor()(text)} {
+			js, _ := json.Marshal(out)
+			if strings.Contains(out, value) || strings.Contains(string(js), `\u00`) || !utf8.ValidString(out) {
+				t.Errorf("%s: %q, as JSON %s", what, out, js)
+			}
+		}
 	}
 }

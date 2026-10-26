@@ -202,37 +202,46 @@ func newScrubber(secrets []egress.Secret) *scrubber {
 	return s
 }
 
-// unrebuild returns a replacer that turns each secret value into a run of a byte no value holds, the same length,
-// for after the tags go in: a tag (or a placeholder's mark) can complete a value with the text around it ("]abc…"
-// before its own tail, or a value inside "secret NAME"). No value can take in a byte of such a run, so after the one
-// leftmost pass none is left. nil when no secret has a value.
+// unrebuild returns a replacer that turns each secret value into a run of a filler no value holds a byte of, for
+// after the tags go in: a tag (or a placeholder's mark) can complete a value with the text around it ("]abc…" before
+// its own tail, or a value inside "secret NAME"). No value can take in a byte of such a run, so after the one leftmost
+// pass none is left. nil when no secret has a value.
 func unrebuild(secrets []egress.Secret) *strings.Replacer {
-	holds := func(c byte) bool {
-		return slices.ContainsFunc(secrets, func(s egress.Secret) bool { return strings.IndexByte(s.Value, c) >= 0 })
+	free := func(fill string) bool { // byte by byte: no value may hold any byte of the filler
+		for i := 0; i < len(fill); i++ {
+			if slices.ContainsFunc(secrets, func(s egress.Secret) bool { return strings.IndexByte(s.Value, fill[i]) >= 0 }) {
+				return false
+			}
+		}
+		return true
 	}
-	// "*#~" first, then printable ASCII that JSON writes as it is, then any byte; no value holds a NUL (the daemon
-	// refuses one), so the search ends there at the latest
-	fill := byte(0)
-	for _, c := range []byte("*#~") {
-		if !holds(c) {
+	// records are JSON, so a filler JSON writes as it is: "*#~", then other printable ASCII, then a non-ASCII
+	// character (values that together hold every printable character, as several strong random passwords can, hold
+	// none of these as a rule); any other byte only after that, and no value holds a NUL (the daemon refuses one)
+	var cands []string
+	for _, c := range "*#~" {
+		cands = append(cands, string(c))
+	}
+	for c := byte('!'); c <= '~'; c++ {
+		if !strings.ContainsRune(`"\<>&*#~`, rune(c)) {
+			cands = append(cands, string(rune(c)))
+		}
+	}
+	cands = append(cands, "·", "•", "░", "█")
+	for c := 1; c < 256; c++ {
+		cands = append(cands, string([]byte{byte(c)}))
+	}
+	fill := "\x00"
+	for _, c := range cands {
+		if free(c) {
 			fill = c
 			break
-		}
-	}
-	for c := byte('!'); fill == 0 && c <= '~'; c++ {
-		if !strings.ContainsRune(`"\<>&`, rune(c)) && !holds(c) {
-			fill = c
-		}
-	}
-	for c := 1; fill == 0 && c < 256; c++ {
-		if !holds(byte(c)) {
-			fill = byte(c)
 		}
 	}
 	var pairs []string
 	for _, s := range secrets {
 		if s.Value != "" {
-			pairs = append(pairs, s.Value, strings.Repeat(string([]byte{fill}), len(s.Value)))
+			pairs = append(pairs, s.Value, strings.Repeat(fill, len(s.Value)))
 		}
 	}
 	if len(pairs) == 0 {
