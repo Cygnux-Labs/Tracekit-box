@@ -261,7 +261,7 @@ and generated directories (`node_modules`, `__pycache__`, `.venv`, `venv`, `.tox
 `.gradle`, `.next`, `.cache`, at any depth) are left out.
 
 When stdout is a terminal, control characters (escape sequences, carriage returns, C1 controls) and Unicode bidi
-overrides in the patch are printed as escapes (`\x1b`, `‮`), so a patch cannot redraw what you review. Redirected
+overrides in the patch are printed as escapes (`\x1b`, `\u202e`), so a patch cannot redraw what you review. Redirected
 to a file, the patch is written as is. A stopped box with no saved patch says why: `box demo (stopped) has no saved
 diff: <reason>` (see [limits.md](limits.md#commands-approvals-and-changes)).
 
