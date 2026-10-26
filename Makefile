@@ -41,6 +41,12 @@ lint:
 # every fuzz target for FUZZTIME each, one after another; a failing input is saved under its package's testdata/fuzz
 # (`go test ./...` runs the saved inputs and seeds, so add it there once fixed). FuzzParsePatchVsGit needs git.
 fuzz:
+	$(GO) test -run='^$$' -fuzz='^FuzzReadFrame$$' -fuzztime=$(FUZZTIME) ./internal/proto
+	$(GO) test -run='^$$' -fuzz='^FuzzChunkWriter$$' -fuzztime=$(FUZZTIME) ./internal/proto
+	$(GO) test -run='^$$' -fuzz='^FuzzClientReplies$$' -fuzztime=$(FUZZTIME) ./internal/agentrpc
+	$(GO) test -run='^$$' -fuzz='^FuzzShellQuote$$' -fuzztime=$(FUZZTIME) ./internal/tracekit
+	$(GO) test -run='^$$' -fuzz='^FuzzDebugfsQuote$$' -fuzztime=$(FUZZTIME) ./internal/image
+	$(GO) test -run='^$$' -fuzz='^FuzzFixups$$' -fuzztime=$(FUZZTIME) ./internal/image
 	$(GO) test -run='^$$' -fuzz='^FuzzParse$$' -fuzztime=$(FUZZTIME) ./internal/config
 	$(GO) test -run='^$$' -fuzz='^FuzzParseSecretFlag$$' -fuzztime=$(FUZZTIME) ./internal/config
 	$(GO) test -run='^$$' -fuzz='^FuzzParsePatch$$' -fuzztime=$(FUZZTIME) ./internal/daemon
