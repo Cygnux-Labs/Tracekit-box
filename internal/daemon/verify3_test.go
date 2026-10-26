@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -222,5 +223,64 @@ func TestVerify3ExecEnvInTheDecidedCommand(t *testing.T) {
 	if _, e2 := e.d.prepareExec("a", api.ExecRequest{Argv: []string{"X=1", "echo"}, Env: map[string]string{"A": "b"}}); e2 == nil ||
 		e2.Code != api.CodeBadRequest {
 		t.Fatalf("a program name with = and a per-command env: %v", e2)
+	}
+}
+
+// flipGuest answers each diff with the next patch in turn: a running box whose workspace changes between two asks.
+type flipGuest struct {
+	agentrpc.Guest
+	mu      sync.Mutex
+	patches []string
+	n       int
+}
+
+func (g *flipGuest) DiffWith(ctx context.Context, req proto.DiffRequest, w io.Writer) (proto.DiffSummary, error) {
+	g.mu.Lock()
+	p := g.patches[g.n%len(g.patches)]
+	g.n++
+	g.mu.Unlock()
+	_, err := io.WriteString(w, p)
+	return proto.DiffSummary{}, err
+}
+
+// L7 (verify3): every summary names the sha256 of the patch it was built from, and the diff response names its body's
+// sha256 in a header, so a client can tell a running box's separately read summary is of another patch.
+func TestVerify3DiffSummaryNamesItsPatch(t *testing.T) {
+	e := newTestEnv(t, nil)
+	first, second := modify(".github/workflows/release.yml"), modify("docs/readme.md")
+	e.create(api.CreateBoxRequest{Name: "run"})
+	b := e.box("run")
+	b.mu.Lock()
+	b.guest = &flipGuest{Guest: e.guest, patches: []string{first, second}}
+	b.mu.Unlock()
+	hc := httpClient(e.serve())
+	resp, err := hc.Get("http://tkbox/v1/boxes/run/diff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var hdr api.DiffSummary
+	json.Unmarshal([]byte(resp.Header.Get(api.DiffSummaryHeader)), &hdr)
+	if string(patch) != first || resp.Header.Get(api.DiffSHA256Header) != sha(patch) || hdr.PatchSHA256 != sha(patch) {
+		t.Fatalf("diff: sha header %q, summary %+v, sha of body %s", resp.Header.Get(api.DiffSHA256Header), hdr, sha(patch))
+	}
+	resp, err = hc.Get("http://tkbox/v1/boxes/run/diff/summary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sum api.DiffSummary
+	json.NewDecoder(resp.Body).Decode(&sum)
+	resp.Body.Close()
+	if sum.PatchSHA256 != sha([]byte(second)) || len(sum.Files) != 1 || sum.Files[0].Path != "docs/readme.md" {
+		t.Fatalf("a running box's /diff/summary (a second guest diff): %+v, want patch_sha256 %s", sum, sha([]byte(second)))
+	}
+	// the patch saved at stop: the same patch, the same sha256
+	e.guest.Patch = second
+	e.create(api.CreateBoxRequest{Name: "saved"})
+	e.d.Stop(context.Background(), "saved", api.StopRequest{})
+	p2, s2, err := e.d.Diff(context.Background(), "saved")
+	if err != nil || s2.PatchSHA256 != sha(p2) || len(p2) == 0 {
+		t.Fatalf("saved diff: %v %+v", err, s2)
 	}
 }

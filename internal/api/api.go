@@ -11,9 +11,10 @@
 //	POST   /v1/boxes/{box}/exec           ExecRequest, Upgrade: tkbox-exec/1 → 101, then frames (see below)
 //	POST   /v1/boxes/{box}/stop           StopRequest → Box
 //	DELETE /v1/boxes/{box}                → 204            (a running box is stopped first)
-//	GET    /v1/boxes/{box}/diff           → text/x-diff patch body; header X-Tkbox-Diff-Summary: DiffSummary JSON
-//	                                        (only when at most 8 KiB; else X-Tkbox-Diff-Summary-Omitted: 1)
-//	GET    /v1/boxes/{box}/diff/summary   → DiffSummary
+//	GET    /v1/boxes/{box}/diff           → text/x-diff patch body; header X-Tkbox-Diff-Sha256: the body's sha256;
+//	                                        header X-Tkbox-Diff-Summary: DiffSummary JSON (only when at most 8 KiB;
+//	                                        else X-Tkbox-Diff-Summary-Omitted: 1)
+//	GET    /v1/boxes/{box}/diff/summary   → DiffSummary (patch_sha256: the sha256 of the patch it summarizes)
 //	POST   /v1/boxes/{box}/apply          ApplyRequest → ApplyResult
 //	POST   /v1/boxes/{box}/export         ExportRequest → ExportResult
 //	GET    /v1/boxes/{box}/events         → application/x-ndjson stream of Event (?follow=1 keeps it open)
@@ -54,6 +55,14 @@ const DiffSummaryOmittedHeader = "X-Tkbox-Diff-Summary-Omitted"
 
 // MaxDiffSummaryHeader caps the DiffSummaryHeader value.
 const MaxDiffSummaryHeader = 8 << 10
+
+// DiffSHA256Header carries the hex sha256 of the patch in a diff response's body. A client that reads the summary
+// from /diff/summary compares it with the summary's patch_sha256: for a running box the two come from two guest
+// diffs, and a workspace that changed in between gives a summary of another patch (read both again).
+const DiffSHA256Header = "X-Tkbox-Diff-Sha256"
+
+// DiffChangedMessage is what a client says when the patch and its summary still differ after one retry.
+const DiffChangedMessage = "the workspace changed while the diff was read; run it again"
 
 // Box states.
 const (

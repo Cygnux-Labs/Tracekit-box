@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -572,9 +574,12 @@ func checkSymlink(f *patchFile, dir string) error {
 	return nil
 }
 
-// summarize is the host's own summary of a patch (the guest's is never trusted): one entry per file section.
+// summarize is the host's own summary of a patch (the guest's is never trusted): one entry per file section, and the
+// patch's sha256, so a client can tell whether a patch it holds is the one summarized (for a running box, the patch
+// and a summary read separately come from two guest diffs).
 func summarize(patch []byte) api.DiffSummary {
-	sum := api.DiffSummary{Files: []proto.DiffFile{}, Bytes: int64(len(patch))}
+	ps := sha256.Sum256(patch)
+	sum := api.DiffSummary{Files: []proto.DiffFile{}, Bytes: int64(len(patch)), PatchSHA256: hex.EncodeToString(ps[:])}
 	files, err := parsePatch(string(patch))
 	if err != nil {
 		return sum

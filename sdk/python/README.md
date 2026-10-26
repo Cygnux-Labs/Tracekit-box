@@ -60,8 +60,8 @@ ignores, left out) and `sha256` (of the patch that was decided).
 | `list_boxes()`, `get_box(box)` | `GET /v1/boxes`, `GET /v1/boxes/{box}` |
 | `exec(box, argv, stdin=None, env=None, cwd=None, timeout=None, *, on_output=None, on_event=None)` | `POST /v1/boxes/{box}/exec`, upgraded to `tkbox-exec/1` |
 | `stop(box, *, kill=False, reason=None)`, `rm(box)` | `POST …/stop`, `DELETE /v1/boxes/{box}` |
-| `diff(box)` | `GET …/diff` → `Diff(patch, summary)`; the summary comes from the `X-Tkbox-Diff-Summary` header when it is at most 8 KiB, else from `GET …/diff/summary` |
-| `diff_summary(box)` | `GET …/diff/summary` → the summary (`files`, `bytes`) without the patch |
+| `diff(box)` | `GET …/diff` → `Diff(patch, summary)`; the summary comes from the `X-Tkbox-Diff-Summary` header when it is at most 8 KiB, else from `GET …/diff/summary`. Its `patch_sha256` must be the patch's sha256: for a running box the two are separate guest diffs, so on a mismatch both are read once more, then `Conflict` (`the workspace changed while the diff was read; run it again`) |
+| `diff_summary(box)` | `GET …/diff/summary` → the summary (`files`, `bytes`, `patch_sha256`) without the patch |
 | `apply(box, *, dir=None, check=False, allow_sensitive=False)` | `POST …/apply` |
 | `export(box, out)` | `POST …/export` |
 | `events(box, *, follow=False)` | `GET …/events` (a generator of dicts) |

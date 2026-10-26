@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -96,8 +98,29 @@ func decodeError(resp *http.Response) error {
 
 func boxPath(box string, rest string) string { return "/v1/boxes/" + url.PathEscape(box) + rest }
 
-// diff fetches a box's patch and its summary.
+// diff fetches a box's patch and its summary, and makes sure the summary is of that patch: for a running box, a summary
+// too large for the header is read from /diff/summary, a second guest diff, and the workspace may have changed in
+// between. Then both are read once more; a second mismatch is an error.
 func (c *client) diff(ctx context.Context, box string) ([]byte, api.DiffSummary, error) {
+	for try := 0; ; try++ {
+		patch, sum, err := c.diffOnce(ctx, box)
+		if err != nil {
+			return nil, api.DiffSummary{}, err
+		}
+		h := sha256.Sum256(patch)
+		// a daemon before patch_sha256 sends none: nothing to compare
+		if sum.PatchSHA256 == "" || sum.PatchSHA256 == hex.EncodeToString(h[:]) {
+			return patch, sum, nil
+		}
+		if try == 1 {
+			return nil, api.DiffSummary{}, &api.ErrorDetail{Code: api.CodeConflict, Message: api.DiffChangedMessage,
+				Hint: "stop the box first (`tkbox stop`) to read the patch saved at stop"}
+		}
+	}
+}
+
+// diffOnce reads GET /diff and the summary that goes with it (its header, or /diff/summary for a large one).
+func (c *client) diffOnce(ctx context.Context, box string) ([]byte, api.DiffSummary, error) {
 	req, _ := http.NewRequestWithContext(ctx, "GET", "http://tkbox"+boxPath(box, "/diff"), nil)
 	resp, err := c.hc.Do(req)
 	if err != nil {
@@ -114,6 +137,9 @@ func (c *client) diff(ctx context.Context, box string) ([]byte, api.DiffSummary,
 	patch, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, api.DiffSummary{}, err
+	}
+	if h, want := sha256.Sum256(patch), resp.Header.Get(api.DiffSHA256Header); want != "" && want != hex.EncodeToString(h[:]) {
+		return nil, api.DiffSummary{}, fmt.Errorf("the patch read does not match its %s header", api.DiffSHA256Header)
 	}
 	// a small summary rides in a header; a large one (the guest decides its size) is read from /diff/summary
 	if h := resp.Header.Get(api.DiffSummaryHeader); h != "" {

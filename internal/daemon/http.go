@@ -200,6 +200,7 @@ func (d *Daemon) hDiff(w http.ResponseWriter, r *http.Request) {
 	} else {
 		w.Header().Set(api.DiffSummaryOmittedHeader, "1")
 	}
+	w.Header().Set(api.DiffSHA256Header, sum.PatchSHA256)
 	w.Header().Set("Content-Type", "text/x-diff")
 	w.Header().Set("Content-Length", strconv.Itoa(len(patch)))
 	w.WriteHeader(http.StatusOK)

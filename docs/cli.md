@@ -245,7 +245,11 @@ patch saved at stop. The file list is built on the host from the patch itself, n
 served as JSON at `GET /v1/boxes/{box}/diff/summary`, which `--stat` reads. The diff response carries it in the
 `X-Tkbox-Diff-Summary` header only when that JSON is at most 8 KiB; otherwise it sends
 `X-Tkbox-Diff-Summary-Omitted: 1`, and clients (`tkbox diff`, the SDK's `diff()`, MCP's `tkbox_diff`) fetch the
-endpoint, so a patch with very many or very long paths still reviews. Paths that the workspace's `.gitignore` ignores
+endpoint, so a patch with very many or very long paths still reviews. Every summary names the sha256 of the patch it
+was built from (`patch_sha256`), and the diff response names its body's in `X-Tkbox-Diff-Sha256`: on a running box
+the endpoint is a second guest diff, so when the two differ the client reads both once more, and then fails with
+`the workspace changed while the diff was read; run it again` (stop the box to read the patch saved at stop).
+`--stat` reads only the endpoint, whose list is of one diff. Paths that the workspace's `.gitignore` ignores
 and generated directories (`node_modules`, `__pycache__`, `.venv`, `venv`, `.tox`, `.mypy_cache`, `.pytest_cache`,
 `.gradle`, `.next`, `.cache`, at any depth) are left out.
 

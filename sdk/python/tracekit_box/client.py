@@ -4,6 +4,7 @@ request, and the exec stream (Upgrade: tkbox-exec/1, then frames)."""
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import socket as _socket
@@ -13,7 +14,7 @@ from typing import Any, BinaryIO, Callable, Dict, Iterator, List, Mapping, Optio
 from urllib.parse import quote
 
 from . import frames
-from .errors import DaemonUnreachable, ProtocolError, TkboxError, from_detail
+from .errors import Conflict, DaemonUnreachable, ProtocolError, TkboxError, from_detail
 
 __all__ = ["Client", "ExecResult", "Diff", "Secret", "Limits", "default_socket"]
 
@@ -21,6 +22,8 @@ VERSION = "0.1.0"
 EXEC_UPGRADE = "tkbox-exec/1"
 MAX_STDIN_DATA = 1 << 20  # api.MaxStdinData: stdin known up front, sent in the exec request and decided with it
 DIFF_SUMMARY_HEADER = "x-tkbox-diff-summary"
+DIFF_SHA256_HEADER = "x-tkbox-diff-sha256"  # api.DiffSHA256Header: the sha256 of the diff response's body
+DIFF_CHANGED = "the workspace changed while the diff was read; run it again"  # api.DiffChangedMessage
 
 StdinLike = Union[bytes, bytearray, str, BinaryIO, None]
 Seconds = Union[int, float, str, None]
@@ -411,8 +414,22 @@ class Client:
 
     def diff(self, box: str) -> Diff:
         """GET /v1/boxes/{box}/diff: the workspace patch and its summary. A small summary comes in a header; a large
-        one (thousands of files) is fetched from GET /v1/boxes/{box}/diff/summary."""
+        one (thousands of files) is fetched from GET /v1/boxes/{box}/diff/summary. The summary's patch_sha256 must be
+        the sha256 of the patch: for a running box the two are separate guest diffs, so on a mismatch both are read
+        once more, and a second mismatch raises Conflict ("the workspace changed while the diff was read")."""
+        for _ in range(2):
+            data, summary = self._diff_once(box)
+            want = summary.get("patch_sha256") if isinstance(summary, dict) else None
+            # a daemon before patch_sha256 sends none: nothing to compare
+            if not want or want == hashlib.sha256(data).hexdigest():
+                return Diff(patch=data.decode("utf-8", "replace"), summary=summary)
+        raise Conflict(DIFF_CHANGED, hint="stop the box first to read the patch saved at stop")
+
+    def _diff_once(self, box: str) -> Tuple[bytes, Dict[str, Any]]:
         resp, data = self._request("GET", self._box_path(box, "/diff"))
+        sha = resp.header(DIFF_SHA256_HEADER)
+        if sha and sha != hashlib.sha256(data).hexdigest():
+            raise ProtocolError(f"the patch read does not match its {DIFF_SHA256_HEADER} header")
         raw = resp.header(DIFF_SUMMARY_HEADER)
         if raw:
             try:
@@ -421,7 +438,7 @@ class Client:
                 raise ProtocolError(f"bad {DIFF_SUMMARY_HEADER} header") from None
         else:
             summary = self.diff_summary(box)
-        return Diff(patch=data.decode("utf-8", "replace"), summary=summary)
+        return data, summary
 
     def diff_summary(self, box: str) -> Dict[str, Any]:
         """GET /v1/boxes/{box}/diff/summary: the summary of the workspace patch ({files, bytes}) without the patch."""

@@ -97,8 +97,10 @@ HTTP on `run/tkbox.sock` (0600 in a 0700 dir; the daemon also checks the peer ui
 the connection (`Upgrade: tkbox-exec/1`) and then speaks the same frames as the guest protocol, plus JSON
 `ExecEvent` frames for decision and approval states; stdin known up front travels in the request as `stdin_data`
 (base64, at most 1 MiB) instead of stdin frames. `GET /v1/boxes/{box}/diff` returns the patch, with the file summary
-in `X-Tkbox-Diff-Summary` only when that JSON is at most 8 KiB (else `X-Tkbox-Diff-Summary-Omitted: 1`);
-`GET /v1/boxes/{box}/diff/summary` always returns the summary as JSON.
+in `X-Tkbox-Diff-Summary` only when that JSON is at most 8 KiB (else `X-Tkbox-Diff-Summary-Omitted: 1`) and the
+patch's sha256 in `X-Tkbox-Diff-Sha256`; `GET /v1/boxes/{box}/diff/summary` always returns the summary as JSON. A
+summary's `patch_sha256` is the sha256 of the patch it describes; clients compare it with the patch they hold (for a
+running box the two reads are two guest diffs), read both once more on a mismatch, then fail.
 
 ## Disks
 
