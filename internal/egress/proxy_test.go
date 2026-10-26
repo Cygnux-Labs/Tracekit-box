@@ -592,6 +592,36 @@ func TestIPv4MappedAnswerExempted(t *testing.T) {
 	}
 }
 
+// An IPv4-mapped literal is matched on the allowlist as its IPv4 address, so the Decider (and the signer's WebFetch
+// url) must name the IPv4 address too: a rule keyed on 127.0.0.1 would otherwise not see [::ffff:127.0.0.1].
+func TestIPv4MappedLiteralReachesDeciderUnmapped(t *testing.T) {
+	checkGoroutines(t)
+	e := newEnv(t, func(c *Config) { c.Allow = []string{"127.0.0.1:8443"} })
+	e.dec.Func = func(context.Context, Request) (Verdict, error) {
+		return Verdict{Reason: "test refuses everything"}, nil
+	}
+	for _, target := range []string{"[::ffff:127.0.0.1]:8443", "[::FFFF:7f00:1]:8443"} {
+		_, _, resp := e.rawConnect(target)
+		if b := body(t, resp); resp.StatusCode != 403 || strings.Contains(b, "ffff") {
+			t.Errorf("%s: %s %q", target, resp.Status, b)
+		}
+	}
+	e.stop()
+	if len(e.dec.Requests) != 2 {
+		t.Fatalf("decider asked %d times", len(e.dec.Requests))
+	}
+	for _, r := range e.dec.Requests {
+		if r.Host != "127.0.0.1" || !strings.HasSuffix(r.URL, "://127.0.0.1:8443") || !r.OnAllowlist {
+			t.Errorf("decider request %+v, want host 127.0.0.1 on the allowlist", r)
+		}
+	}
+	for _, ev := range e.sink.events() {
+		if strings.Contains(ev.Host, "ffff") {
+			t.Errorf("event names the mapped form: %+v", ev)
+		}
+	}
+}
+
 func TestMetadataRefusedOverPlainHTTP(t *testing.T) {
 	checkGoroutines(t)
 	e := newEnv(t, func(c *Config) {
