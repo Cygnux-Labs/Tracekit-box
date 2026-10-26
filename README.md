@@ -12,6 +12,10 @@ agent can't reach decides each one, and you get one `.tkb` file per job that any
 <img src="https://img.shields.io/badge/Go-1.26-F3B23B?style=flat-square&labelColor=1C1A1C" alt="Go 1.26">
 <img src="https://img.shields.io/badge/runs_on-Linux_%2B_KVM-F3B23B?style=flat-square&labelColor=1C1A1C" alt="Runs on Linux with KVM">
 
+<img src="docs/readme/demo.gif" alt="Tracekit Box in 60 seconds: a real box allows pip, holds example.com for a person, refuses the cloud metadata address, shows only a placeholder for the GitHub token, returns changes as a patch, and verifies its signed record offline" width="840">
+
+<sub>A real recording of one box (tkbox fbc1ad1): every terminal line on screen is from the recording.</sub>
+
 **[Quick look](#quick-look) · [What it stops](#what-it-stops) · [How it works](#how-it-works) · [Requirements](#requirements) ·
 [Install](#install) · [Demo](#demo) · [Verify a bundle](#verify-a-bundle) · [GitHub Action](#github-action) · [Python](#python) · [Docs](#docs)**
 
