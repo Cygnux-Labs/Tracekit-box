@@ -1,0 +1,56 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&family=IBM+Plex+Mono:wght@400;500;600&display=block" rel="stylesheet">
+<style>
+:root{--bg:#0e0d0c;--grid:rgba(255,236,210,.055);--ink:#f1ebe0;--soft:#a79f92;--dim:#6d665d;--amber:#f1b23c;
+  --card:#171513;--line:rgba(255,236,210,.14);--glow:rgba(241,178,60,.16);--ok:#8fcf8a;--no:#e8836b}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:1280px;height:420px;overflow:hidden;background:transparent}
+.frame{position:absolute;inset:0;border-radius:18px;overflow:hidden;background-color:var(--bg);
+  background-image:linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);background-size:40px 40px}
+body{font-family:Archivo,sans-serif;color:var(--ink);position:relative}
+.glow{position:absolute;inset:0;background:radial-gradient(520px 300px at 24% 52%,var(--glow),transparent 70%)}
+.vig{position:absolute;inset:0;box-shadow:inset 0 0 120px 30px var(--bg);pointer-events:none}
+.left{position:absolute;left:72px;top:92px;width:580px}
+.label{font:600 15px/1 "IBM Plex Mono",monospace;letter-spacing:.14em;color:var(--amber);text-transform:uppercase}
+.word{margin-top:18px;white-space:nowrap;font-weight:900;font-size:76px;line-height:.9;letter-spacing:-.035em;display:flex;align-items:baseline;gap:18px}
+.word .chev{color:var(--amber);font-size:60px;transform:translateY(-4px)}
+.word .box{color:var(--amber)}
+.tag{margin-top:26px;font-weight:700;font-size:29px;letter-spacing:-.01em;line-height:1.2}
+.tag em{font-style:normal;color:var(--amber)}
+.sub{margin-top:16px;font:500 15.5px/1.5 "IBM Plex Mono",monospace;color:var(--soft)}
+.vm{position:absolute;left:668px;top:82px;width:540px;border:1px solid var(--line);background:var(--card);border-radius:10px;
+  font:500 13.5px/1.4 "IBM Plex Mono",monospace;color:var(--soft)}
+.vm .head{display:flex;justify-content:space-between;padding:11px 16px;border-bottom:1px solid var(--line);font-size:12.5px}
+.vm .head b{color:var(--ink);font-weight:600}
+.vm .head span{color:var(--dim)}
+.row{display:grid;grid-template-columns:262px 1fr;align-items:center;padding:9px 16px;border-bottom:1px dashed var(--line)}
+.row:last-child{border-bottom:0}
+.cmd{color:var(--ink)}
+.cmd:before{content:"$ ";color:var(--dim)}
+.v{font-weight:600;white-space:nowrap}
+.v.ok{color:var(--ok)}.v.no{color:var(--no)}.v.hold{color:var(--amber)}.v.ph{color:var(--soft);font-weight:500}
+.v small{font-weight:500;color:var(--dim);font-size:12px}
+.cap{position:absolute;left:668px;top:334px;font:500 14.5px/1.5 "IBM Plex Mono",monospace;color:var(--soft)}
+.cap span{color:var(--amber);font-weight:600}
+</style>
+</head><body><div class="frame">
+<div class="glow"></div>
+<div class="left">
+  <div class="label">Firecracker micro-VMs · Linux · MIT</div>
+  <div class="word"><span class="chev">&gt;</span><span>tracekit <span class="box">box</span></span></div>
+  <div class="tag">Run AI agents in a micro-VM.<br><em>Every way out</em> is checked and signed.</div>
+  <div class="sub">No network card. Your keys stay outside.<br>One .tkb file per job, verifiable offline.</div>
+</div>
+<div class="vm">
+  <div class="head"><b>micro-VM · job demo</b><span>no network card · vsock only</span></div>
+  <div class="row"><span class="cmd">pip install requests</span><span class="v ok">✓ allowed <small>pypi preset</small></span></div>
+  <div class="row"><span class="cmd">curl https://example.com</span><span class="v hold">⏸ held <small>for a person</small></span></div>
+  <div class="row"><span class="cmd">curl 169.254.169.254</span><span class="v no">✕ refused <small>cloud metadata</small></span></div>
+  <div class="row"><span class="cmd">echo $GH</span><span class="v ph">tkbox_GH_3f9c… <small>not your token</small></span></div>
+  <div class="row"><span class="cmd">echo fix &gt; app.py</span><span class="v ok">✓ signed on apply <small>per file</small></span></div>
+</div>
+<div class="cap">tracekit verify demo.tkb → <span>VERIFIED</span></div>
+<div class="vig"></div>
+</div></body></html>

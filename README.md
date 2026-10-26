@@ -1,24 +1,54 @@
-# Tracekit Box
+<div align="center">
 
-**Run AI agents in a micro-VM. Box decides every way out, keeps your keys out of the VM, and leaves a signed record of
-what crossed each door that anyone can verify offline.**
+<img src="docs/readme/banner.png" alt="Tracekit Box: run AI agents in a micro-VM where every way out is checked and signed" width="840">
 
-Tracekit Box runs each AI agent job in its own Firecracker micro-VM on a Linux server or CI runner. The ways out of the
-VM (the network, secrets, model calls, code changes, and the commands you start in it) are doors that Box controls, and
-a [Tracekit](https://github.com/Cygnux-Labs/Tracekit) signer the agent cannot reach decides and signs what happens at
-each door. When the job ends, Box writes one `.tkb` bundle that anyone can verify offline with `tracekit verify`.
+# Let AI agents run real jobs without giving them your network or your keys.
 
-It is for teams whose agents change real systems: DevOps and SRE, and fintech and healthcare engineering teams that run
-agents in CI and in production and need to show afterwards what those agents did.
+**Each agent job runs in its own Firecracker micro-VM with no network card. Network, secrets, model calls, commands
+and code changes all go through doors on the host, a [Tracekit](https://github.com/Cygnux-Labs/Tracekit) signer the
+agent can't reach decides each one, and you get one `.tkb` file per job that anyone can verify offline.**
 
-This is v0, and there is no release yet: you build it from source. It runs on one Linux host with KVM. Firecracker runs
-with its default seccomp filter but without the jailer (no chroot, namespaces or cgroups around the VMM). The signer
-must run on the same host, because Box reaches it over a Unix socket. A same-user dev signer, which the GitHub Action
-uses, gives only dev assurance. [docs/limits.md](docs/limits.md) lists every limit and [SECURITY.md](SECURITY.md) what
-Box guarantees and what it does not.
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-F3B23B?style=flat-square&labelColor=1C1A1C" alt="MIT licence"></a>
+<img src="https://img.shields.io/badge/Go-1.26-F3B23B?style=flat-square&labelColor=1C1A1C" alt="Go 1.26">
+<img src="https://img.shields.io/badge/runs_on-Linux_%2B_KVM-F3B23B?style=flat-square&labelColor=1C1A1C" alt="Runs on Linux with KVM">
 
-**[How it works](#how-it-works) · [Requirements](#requirements) · [Install](#install) · [Demo](#demo) ·
-[Verify a bundle](#verify-a-bundle) · [GitHub Action](#github-action) · [Python](#python) · [Docs](#docs)**
+**[Quick look](#quick-look) · [What it stops](#what-it-stops) · [How it works](#how-it-works) · [Requirements](#requirements) ·
+[Install](#install) · [Demo](#demo) · [Verify a bundle](#verify-a-bundle) · [GitHub Action](#github-action) · [Python](#python) · [Docs](#docs)**
+
+</div>
+
+## Quick look
+
+```sh
+tkbox run --image python:3.12-slim --allow pypi --workspace . --name demo \
+  --secret GH=env:GH_TOKEN@api.github.com
+tkbox exec demo -- pip install -q requests                 # allowed: on the allowlist
+tkbox exec demo -- curl -sI https://example.com            # held until a person runs tkbox approve
+tkbox exec demo -- curl -sS https://169.254.169.254/       # refused: cloud metadata
+tkbox exec demo -- sh -c 'echo "$GH"'                      # prints a placeholder, not your token
+tkbox exec demo -- sh -c 'echo fix > /workspace/app.py'    # comes back as a patch
+tkbox stop demo && tkbox export demo -o demo.tkb && tracekit verify demo.tkb   # Integrity: VERIFIED.
+```
+
+## What it stops
+
+- **Leaks through DNS.** Box never looks up a name it hasn't allowed, so a job can't send data out in DNS queries,
+  the way OpenAI reported a model getting out of its sandbox on 20 Sep 2026.
+- **Key theft.** The VM only holds a placeholder. The real key is added on the way out, and only for the hosts it's
+  bound to.
+- **Cloud metadata and private networks.** Refused before any decision, in every address form we fuzzed (decimal,
+  octal, hex, IPv6, IPv4-mapped).
+- **Code changes nobody approved.** A job's edits come back as a patch, and each file is decided and signed before
+  it's written to your checkout.
+
+**Tested:** 13 of 13 end-to-end checks on real KVM in CI, three independent review rounds and a fuzzing campaign.
+Each fix comes with a test that fails without it.
+
+Built for teams whose agents change real systems: DevOps and SRE, and fintech and healthcare engineering, running
+agents in CI and production.
+
+**Status:** v0, build from source, one Linux host with KVM. Every limit is in [docs/limits.md](docs/limits.md), and
+what Box guarantees is in [SECURITY.md](SECURITY.md).
 
 ## How it works
 
