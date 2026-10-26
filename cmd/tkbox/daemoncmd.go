@@ -61,10 +61,18 @@ func cmdDaemon(args []string, env *cliEnv) error {
 	if *approvalTimeout < time.Second || *approvalTimeout > 4*time.Minute {
 		return usagef("--approval-timeout %s: use 1s..4m (a connection waits for its approval at most that long plus 30s)", *approvalTimeout)
 	}
-	// checked now, so a bad value fails before anything touches the host; daemonOptions parses it for the boxes
-	_, err := parseEgressBlock(egressBlock.vals)
+	// what the flags say, taken once: daemonOptions builds the Options from it once the host is set up
+	setup := daemonSetup{stateDir: *stateDir, unrecorded: *unrecorded, maxBoxes: *maxBoxes, approvalTimeout: *approvalTimeout,
+		egressBlock: egressBlock.vals, allowPrivate: allowPrivate.vals, upstreamCA: *upstreamCA, logger: logger}
+	// --egress-block is checked now, so a bad value fails before anything touches the host
+	_, err := parseEgressBlock(setup.egressBlock)
 	if err != nil {
 		return err
+	}
+	if daemonFlagsHook != nil {
+		if err := daemonFlagsHook(setup); err != nil {
+			return err
+		}
 	}
 	socketSet := false
 	fs.Visit(func(f *flag.Flag) { socketSet = socketSet || f.Name == "socket" })
@@ -159,9 +167,8 @@ func cmdDaemon(args []string, env *cliEnv) error {
 		return fmt.Errorf("image builder: %w", err)
 	}
 
-	opts, err := daemonOptions(daemonSetup{stateDir: *stateDir, kernel: *kernel, unrecorded: *unrecorded,
-		maxBoxes: *maxBoxes, approvalTimeout: *approvalTimeout, egressBlock: egressBlock.vals,
-		allowPrivate: allowPrivate.vals, upstreamCA: *upstreamCA, launcher: launcher, builder: builder, tk: tk, logger: logger})
+	setup.kernel, setup.launcher, setup.builder, setup.tk = *kernel, launcher, builder, tk
+	opts, err := daemonOptions(setup)
 	if err != nil {
 		return err
 	}
@@ -191,6 +198,10 @@ type daemonSetup struct {
 	tk                           tracekit.Client
 	logger                       *log.Logger
 }
+
+// daemonFlagsHook, when set (by tests), sees the setup cmdDaemon took from its flags, before anything touches the
+// host; an error it returns ends the command.
+var daemonFlagsHook func(daemonSetup) error
 
 // daemonOptions builds the daemon's Options. It parses the egress flags: --egress-block, and the test-only
 // --egress-allow-private and --upstream-ca, whose warnings it logs.
