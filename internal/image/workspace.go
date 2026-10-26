@@ -185,12 +185,35 @@ func (s *valueScan) in(b string) string {
 	return ""
 }
 
-// tag writes every value in p as [secret NAME], so a path that holds one can be named in an error.
+// tag writes p with every value in it as [secret NAME], so a path that holds one can be named in an error. Every byte
+// any value covers in p is found first, so a value inside or overlapping another goes as one run, named after the
+// value its first byte belongs to: replacing values one at a time would leave the rest of an outer one in the clear.
 func (s *valueScan) tag(p string) string {
+	owner := make([]string, len(p)) // the secret a byte of p belongs to, or ""
 	for i, v := range s.values {
-		p = strings.ReplaceAll(p, string(v), "[secret "+s.names[i]+"]")
+		for k := 0; k+len(v) <= len(p); k++ {
+			if p[k:k+len(v)] == string(v) {
+				for j := k; j < k+len(v); j++ {
+					if owner[j] == "" {
+						owner[j] = s.names[i]
+					}
+				}
+			}
+		}
 	}
-	return p
+	var b strings.Builder
+	for k := 0; k < len(p); {
+		if owner[k] == "" {
+			b.WriteByte(p[k])
+			k++
+			continue
+		}
+		b.WriteString("[secret " + owner[k] + "]")
+		for k < len(p) && owner[k] != "" {
+			k++
+		}
+	}
+	return b.String()
 }
 
 func (s *valueScan) reset() { s.tail, s.found = s.tail[:0], "" }

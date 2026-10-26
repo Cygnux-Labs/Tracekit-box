@@ -198,32 +198,48 @@ func (p *Proxy) redact(s string) string {
 	return p.markRebuilt(p.tag(s))
 }
 
-// tag puts "[secret NAME]" in for every value form and placeholder in s.
+// tag puts "[secret NAME]" in for every value form and placeholder in s. Every byte any of them covers is found first
+// (without regard to case, as they are matched), so one inside or overlapping another goes as one run, named after the
+// secret its first byte belongs to: tagging them one at a time would leave the rest of an outer one in the clear.
 func (p *Proxy) tag(s string) string {
 	if len(p.secrets) == 0 || s == "" {
 		return s
 	}
+	low := asciiLower(s)
+	owner := make([]*secretRule, len(s)) // the secret a byte of s belongs to, or nil
+	cover := func(lf string, r *secretRule) {
+		for i := 0; lf != ""; i++ {
+			k := strings.Index(low[i:], lf)
+			if k < 0 {
+				return
+			}
+			i += k
+			for j := i; j < i+len(lf); j++ {
+				if owner[j] == nil {
+					owner[j] = r
+				}
+			}
+		}
+	}
 	for _, r := range p.secrets {
 		for _, f := range r.forms {
-			s = replaceFold(s, f, "[secret "+r.Name+"]") // any case: host names arrive lower-cased
+			cover(asciiLower(f), r)
+		}
+		cover(r.lowerPH, r)
+	}
+	var b strings.Builder
+	for k := 0; k < len(s); {
+		if owner[k] == nil {
+			b.WriteByte(s[k])
+			k++
+			continue
+		}
+		b.WriteString("[secret " + owner[k].Name + "]")
+		for k < len(s) && owner[k] != nil {
+			k++
 		}
 	}
-	low := asciiLower(s)
-	if !strings.Contains(low, placeholderPrefix) {
-		return s
-	}
-	for _, r := range p.secrets {
-		for {
-			i := strings.Index(low, r.lowerPH)
-			if i < 0 {
-				break
-			}
-			repl := "[secret " + r.Name + "]"
-			s = s[:i] + repl + s[i+len(r.Placeholder):]
-			low = low[:i] + asciiLower(repl) + low[i+len(r.Placeholder):]
-		}
-	}
-	return s
+	return b.String()
 }
 
 // markRebuilt overwrites with markers any value form left in s: a "[secret NAME]" tag, or a placeholder put in for a

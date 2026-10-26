@@ -296,3 +296,33 @@ func TestRedactReaderStaysLinearOnMatches(t *testing.T) {
 		t.Errorf("1 MiB of a value's echoes took %v, %d times ordinary text (%v)", echoes, echoes/max(plain, 1), plain)
 	}
 }
+
+// N1's egress side (final check 2): in events and refusals, a value that holds or overlaps another's goes into one
+// [secret NAME] whole, in either order of the secrets and any case: tagging the inner one first left the outer one's
+// other parts in a signed event ("GET /AKIAXK7Q:[secret INNER]:Zq9Pw").
+func TestRedactNamesNoPartOfANestedValue(t *testing.T) {
+	for _, c := range []struct {
+		values     [][2]string
+		text, want string
+	}{
+		{[][2]string{{"INNER", "tok-123456"}, {"OUTER", "AKIAXK7Q:tok-123456:Zq9Pw"}}, "GET /AKIAXK7Q:tok-123456:Zq9Pw", "GET /[secret OUTER]"},
+		{[][2]string{{"OUTER", "AKIAXK7Q:tok-123456:Zq9Pw"}, {"INNER", "tok-123456"}}, "GET /akiaxk7q:TOK-123456:zq9pw x", "GET /[secret OUTER] x"},
+		{[][2]string{{"X", "secret-abc"}, {"Y", "abc-other9"}}, "path /secret-abc-other9/", "path /[secret X]/"},
+	} {
+		var rules []*secretRule
+		for _, v := range c.values {
+			s := mkSecret(t, v[0], "", "a.example.com")
+			s.Value = v[1]
+			r, err := newSecretRule(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rules = append(rules, r)
+		}
+		p := &Proxy{secrets: rules}
+		p.valMatch = newMatcher(p.valuePatterns())
+		if got := p.redact(c.text); got != c.want {
+			t.Errorf("%q redacts to %q, want %q", c.text, got, c.want)
+		}
+	}
+}

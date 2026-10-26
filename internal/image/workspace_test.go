@@ -276,3 +276,26 @@ func TestWorkspaceRefusesSecretValue(t *testing.T) {
 		t.Fatalf("a workspace without a value (a 4-byte one is not looked for): %v", err)
 	}
 }
+
+// N1 (final check 2): when a file's name holds a secret value that holds or overlaps another's, the refusal shows no
+// part of either: every byte any value covers in the name goes into one [secret NAME], whatever order the secrets come
+// in (replacing the inner value first left "AKIAXK7Q:" and ":Zq9Pw" of the outer one in the message).
+func TestWorkspaceRefusalNamesNoPartOfAValue(t *testing.T) {
+	for _, c := range []struct {
+		secrets    []SecretValue
+		file, want string
+	}{
+		{[]SecretValue{{Name: "INNER", Value: "tok-123456"}, {Name: "OUTER", Value: "AKIAXK7Q:tok-123456:Zq9Pw"}},
+			"n-AKIAXK7Q:tok-123456:Zq9Pw.txt", "n-[secret OUTER].txt"},
+		{[]SecretValue{{Name: "X", Value: "secret-abc"}, {Name: "Y", Value: "abc-other9"}},
+			"n-secret-abc-other9.txt", "n-[secret X].txt"},
+	} {
+		dir := t.TempDir()
+		os.WriteFile(filepath.Join(dir, c.file), nil, 0o600)
+		_, _, err := newTestBuilder(t, nil, nil).copyWorkspace(t.Context(), dir, t.TempDir(), c.secrets)
+		var se *SecretInWorkspaceError
+		if !errors.As(err, &se) || se.Path != c.want {
+			t.Errorf("%s: %v", c.file, err)
+		}
+	}
+}
