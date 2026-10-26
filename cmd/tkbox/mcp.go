@@ -57,6 +57,7 @@ type mcpServer struct {
 	roots  []string     // dirs (symlinks resolved) a tkbox_run workspace must be inside
 	out    io.Writer
 	mu     sync.Mutex
+	owned  map[string]string // box id → name of every box this session's tkbox_run created: the only boxes it may use
 }
 
 func cmdMCP(ctx context.Context, args []string, env *cliEnv) error {
@@ -104,6 +105,10 @@ func (s *mcpServer) runRequest(a mcpRunArgs) (api.CreateBoxRequest, error) {
 	if len(a.Env) > 0 {
 		return api.CreateBoxRequest{}, mcpRefused("tkbox_run may not set env for every command (it would apply to commands without being decided); put env in the command itself")
 	}
+	if a.Task != "" {
+		// the run records the task as the operator's trusted instruction; an agent's words must not take its place
+		return api.CreateBoxRequest{}, mcpRefused("tkbox_run takes no task: the run records only the operator's configured task as trusted; keep your own notes in your prompt")
+	}
 	image := a.Image
 	switch {
 	case len(s.images) == 0:
@@ -147,7 +152,7 @@ func (s *mcpServer) runRequest(a mcpRunArgs) (api.CreateBoxRequest, error) {
 		}
 	}
 	req, err := config.Request(s.base, config.Flags{Image: image, Name: a.Name, Workspace: workspace,
-		CPUs: a.CPUs, Memory: a.Memory, Timeout: a.Timeout, Task: a.Task, Agent: "mcp"}, config.Resolver{})
+		CPUs: a.CPUs, Memory: a.Memory, Timeout: a.Timeout, Agent: "mcp"}, config.Resolver{})
 	if err != nil {
 		return api.CreateBoxRequest{}, err
 	}
@@ -337,21 +342,20 @@ func mcpTools() []map[string]any {
 				"cpus":      map[string]any{"type": "integer", "minimum": 1, "maximum": 32},
 				"memory":    strProp("e.g. 2GiB (at most the operator's limit)"),
 				"timeout":   strProp("box lifetime, e.g. 1h (at most the operator's limit)"),
-				"task":      strProp("the task, recorded in the Tracekit run"),
 			})},
 		{"name": "tkbox_exec", "description": "Run a command in a box (decided by the Tracekit signer first) and return its exit code and output.",
 			"inputSchema": schema(map[string]any{
-				"box":     strProp("box id or name"),
+				"box":     strProp("id or name of a box this session created with tkbox_run"),
 				"argv":    arrProp("the command and its arguments, e.g. [\"pytest\", \"-q\"]"),
 				"stdin":   strProp("text sent to the command's stdin"),
 				"cwd":     strProp("working dir in the box (default /workspace)"),
 				"timeout": strProp("e.g. 10m (default the box's exec timeout)"),
 			}, "box", "argv")},
 		{"name": "tkbox_diff", "description": "Show the workspace changes of a box as a git patch.",
-			"inputSchema": schema(map[string]any{"box": strProp("box id or name")}, "box")},
+			"inputSchema": schema(map[string]any{"box": strProp("id or name of a box this session created with tkbox_run")}, "box")},
 		{"name": "tkbox_stop", "description": "Stop a box (its diff is saved first unless kill is set).",
-			"inputSchema": schema(map[string]any{"box": strProp("box id or name"), "kill": map[string]any{"type": "boolean"}}, "box")},
-		{"name": "tkbox_ls", "description": "List boxes.", "inputSchema": schema(map[string]any{})},
+			"inputSchema": schema(map[string]any{"box": strProp("id or name of a box this session created with tkbox_run"), "kill": map[string]any{"type": "boolean"}}, "box")},
+		{"name": "tkbox_ls", "description": "List the boxes this session created with tkbox_run.", "inputSchema": schema(map[string]any{})},
 	}
 }
 
@@ -391,7 +395,41 @@ func (c *capWriter) String() string {
 	return s
 }
 
+// ownBox resolves the "box" argument of a tool call through the boxes this session created and rewrites it to that
+// box's id, so a session can never reach a box someone else started (or a later box that reused an owned name).
+func (s *mcpServer) ownBox(raw json.RawMessage) (json.RawMessage, error) {
+	var args map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return nil, &api.ErrorDetail{Code: api.CodeBadRequest, Message: "arguments: " + err.Error()}
+	}
+	var ref string
+	if err := json.Unmarshal(args["box"], &ref); err != nil || ref == "" {
+		return nil, &api.ErrorDetail{Code: api.CodeBadRequest, Message: "box is required"}
+	}
+	s.mu.Lock()
+	id := ""
+	for bid, name := range s.owned {
+		if ref == bid || ref == name {
+			id = bid
+			break
+		}
+	}
+	s.mu.Unlock()
+	if id == "" {
+		return nil, mcpRefused("box %s was not created by this tkbox mcp session: it may only use the boxes its tkbox_run created", ref)
+	}
+	args["box"], _ = json.Marshal(id)
+	return json.Marshal(args)
+}
+
 func (s *mcpServer) call(ctx context.Context, name string, raw json.RawMessage) (string, bool, error) {
+	switch name {
+	case "tkbox_exec", "tkbox_diff", "tkbox_stop":
+		var err error
+		if raw, err = s.ownBox(raw); err != nil {
+			return "", true, err
+		}
+	}
 	switch name {
 	case "tkbox_run":
 		var a mcpRunArgs
@@ -406,6 +444,12 @@ func (s *mcpServer) call(ctx context.Context, name string, raw json.RawMessage) 
 		if err := s.c.do(ctx, "POST", "/v1/boxes", req, &b); err != nil {
 			return "", true, err
 		}
+		s.mu.Lock()
+		if s.owned == nil {
+			s.owned = map[string]string{}
+		}
+		s.owned[b.ID] = b.Name
+		s.mu.Unlock()
 		text := fmt.Sprintf("box %s (id %s) is running %s; allowed egress: %s", b.Name, b.ID, b.Image, orNone(b.Allow))
 		if b.Unrecorded {
 			text += "\n" + unrecordedWarning
@@ -509,8 +553,17 @@ func (s *mcpServer) call(ctx context.Context, name string, raw json.RawMessage) 
 		if err := s.c.do(ctx, "GET", "/v1/boxes", nil, &boxes); err != nil {
 			return "", true, err
 		}
+		s.mu.Lock()
+		mine := boxes[:0]
+		for _, x := range boxes {
+			if _, ok := s.owned[x.ID]; ok {
+				mine = append(mine, x)
+			}
+		}
+		s.mu.Unlock()
+		boxes = mine
 		if len(boxes) == 0 {
-			return "no boxes", false, nil
+			return "no boxes created by this session", false, nil
 		}
 		var b strings.Builder
 		for _, x := range boxes {

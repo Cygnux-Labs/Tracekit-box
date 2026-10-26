@@ -53,6 +53,7 @@ func TestMCPLimitsNarrowOnly(t *testing.T) {
 		return b
 	}
 	s.base = &config.File{}
+	s.owned = map[string]string{"tkb-00000000000b": "b"} // as if this session's tkbox_run had created box b
 	if _, _, err := s.call(context.Background(), "tkbox_exec", execArgs("1h")); err == nil || !strings.Contains(err.Error(), "over the operator's exec timeout 30m0s") {
 		t.Fatalf("exec timeout over the default: %v", err)
 	}
