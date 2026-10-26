@@ -322,15 +322,23 @@ func (x *redactReader) Read(b []byte) (int, error) {
 			x.buf = append(x.buf, x.tmp[:n]...)
 			final := err != nil // nothing more comes: a pattern gets only what is here
 			end, wait := 0, -1
+			// pend is where the earliest pattern that runs past what has arrived starts, at or after i (len(x.buf):
+			// none). Markers never take part in a pattern, so writing one only removes such patterns: pend holds
+			// until i passes it, and is worked out again only then (once per match would make a read of many
+			// matches quadratic)
+			pend := len(x.buf) - x.m.hold(x.buf, 0)
 			for i := 0; ; {
 				j, p := x.m.index(x.buf, i)
 				if j < 0 {
 					break
 				}
+				if pend < i {
+					pend = len(x.buf) - x.m.hold(x.buf, i)
+				}
 				// a pattern starting at or before j that runs past what has arrived may still match, and would win
 				// (leftmost, then longest, as when the body is read whole): the rest waits for more
-				if h := x.m.hold(x.buf, i); !final && h > 0 && len(x.buf)-h <= j {
-					wait = len(x.buf) - h
+				if !final && pend < len(x.buf) && pend <= j {
+					wait = pend
 					break
 				}
 				copy(x.buf[j:], x.m.marker(len(p.s)))

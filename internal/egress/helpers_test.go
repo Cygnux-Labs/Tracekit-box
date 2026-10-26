@@ -1,6 +1,7 @@
 package egress
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"io"
@@ -258,5 +259,40 @@ func TestRedactReaderPiecesMatchWhole(t *testing.T) {
 		if string(pieces) != string(whole) || m.findString(string(whole)) != nil {
 			t.Errorf("%q read in pieces gives %q, read whole %q", c.body, pieces, whole)
 		}
+	}
+}
+
+// N3 (final check 2): a read full of matches stays linear. The pending pattern that makes a match wait is worked out
+// again only when a match passes it, not once per match, which made a 32 KiB read of a short value's echoes cost
+// (matches × the longest form): over 100 times slower than ordinary text.
+func TestRedactReaderStaysLinearOnMatches(t *testing.T) {
+	matcherFor := func(values ...string) *matcher {
+		var rules []*secretRule
+		for i, v := range values {
+			s := mkSecret(t, "S"+strconv.Itoa(i), "", "a.example.com")
+			s.Value = v
+			r, err := newSecretRule(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rules = append(rules, r)
+		}
+		return newMatcher((&Proxy{secrets: rules}).valuePatterns())
+	}
+	best := func(m *matcher, body []byte) time.Duration {
+		d := time.Duration(1 << 62)
+		for range 5 {
+			start := time.Now()
+			io.Copy(io.Discard, newRedactReader(m, bytes.NewReader(body)))
+			d = min(d, time.Since(start))
+		}
+		return d
+	}
+	short := "Q7xV9mK2pL4nR8sT1wZ3yB6cD0fG5hJ8kM2nP4q" // 40 bytes, with a 4 KiB secret's long forms beside it
+	m := matcherFor(short, strings.Repeat("Ab3xQ9z", 600))
+	echoes := best(m, []byte(strings.Repeat(short, (1<<20)/len(short))))
+	plain := best(m, bytes.Repeat([]byte(`{"k":"some ordinary json text"}`), (1<<20)/31))
+	if echoes > 20*plain {
+		t.Errorf("1 MiB of a value's echoes took %v, %d times ordinary text (%v)", echoes, echoes/max(plain, 1), plain)
 	}
 }
