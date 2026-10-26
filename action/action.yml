@@ -59,7 +59,7 @@ outputs:
     description: "The verifier's integrity result, e.g. VERIFIED (or FAILED)"
     value: ${{ steps.verify.outputs.result }}
   changed-files:
-    description: "Files the box changed in /workspace, one per line"
+    description: "Files the box changed in /workspace, one per line. The agent chose these names: pass them to a later step through its env, never write the output expression inside a run: script"
     value: ${{ steps.changes.outputs.files }}
   patch:
     description: "Path of the box's patch file"
