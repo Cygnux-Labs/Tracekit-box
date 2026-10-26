@@ -26,6 +26,7 @@ type patchFile struct {
 	NewMode      string // "new file mode" / "new mode"
 	OldMode      string // "old mode" / "deleted file mode"
 	IndexMode    string // mode on the index line (unchanged mode)
+	NewFile      bool   // a "new file mode" line
 	Deleted      bool
 	Rename, Copy bool
 	Binary       bool
@@ -196,6 +197,14 @@ func parsePatch(patch string) ([]*patchFile, error) {
 				return nil, bad("%v", err)
 			}
 			if name == "/dev/null" {
+				// git reads /dev/null as "no file" only after "new file mode" (---) or "deleted file mode" (+++);
+				// otherwise it is a file named dev/null (a rename of x to it), not the deletion or creation it looks like
+				switch {
+				case ln[0] == '-' && !cur.NewFile:
+					return nil, bad("--- /dev/null without \"new file mode\" (git reads it as a file named dev/null); a box never makes such patches")
+				case ln[0] == '+' && !cur.Deleted:
+					return nil, bad("+++ /dev/null without \"deleted file mode\" (git reads it as a file named dev/null); a box never makes such patches")
+				}
 				if ln[0] == '-' {
 					cur.Old = ""
 				} else {
@@ -234,6 +243,7 @@ func parsePatch(patch string) ([]*patchFile, error) {
 			}
 		case strings.HasPrefix(ln, "new file mode "):
 			cur.NewMode = strings.TrimPrefix(ln, "new file mode ")
+			cur.NewFile = true
 			cur.Old = ""
 		case strings.HasPrefix(ln, "deleted file mode "):
 			cur.Deleted = true
