@@ -544,8 +544,17 @@ func (b *box) runExec(parent context.Context, conn net.Conn, r io.Reader, w io.W
 				hint = "install it in the box or use an image that has it"
 			}
 		}
-		complete("error", map[string]any{"error": m2})
-		b.event(api.EventExecExited, "exec", "exec failed: "+m2, map[string]any{"command": line, "error": m2})
+		res := map[string]any{"error": m2}
+		data := map[string]any{"command": line, "error": m2}
+		if req.Stdin {
+			// the process may have read (and run) streamed stdin before it failed, was stopped or lost its client:
+			// the run keeps the digest of what it was given on every path, not only a clean exit
+			sum, n := stdin.digest()
+			res["stdin_sha256"], res["stdin_bytes"] = sum, n
+			data["stdin_sha256"], data["stdin_bytes"] = sum, n
+		}
+		complete("error", res)
+		b.event(api.EventExecExited, "exec", "exec failed: "+m2, data)
 		final(proto.TypeError, api.ErrorDetail{Code: code, Message: m2, Hint: hint})
 		return
 	}

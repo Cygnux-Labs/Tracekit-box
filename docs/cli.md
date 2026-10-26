@@ -151,7 +151,8 @@ Stdin comes in one of two kinds:
   placeholder shown as `tkbox_NAME_…`, its value as `[secret NAME]`), and exactly that data is the process's stdin.
   MCP's `tkbox_exec` sends its `stdin` this way, and so does the SDK for bytes or str of at most 1 MiB.
 - **Streamed** (`-i`; in the SDK, larger input and file objects). It can't be known before the start, so the exec's
-  completion record has its `stdin_sha256` and `stdin_bytes`: what the process was given.
+  completion record has its `stdin_sha256` and `stdin_bytes`: what the process was given, whether it exits, fails, is
+  stopped with the box or loses its client.
 
 `stdin_data` over 1 MiB is refused (`stdin_data is 1100000 bytes, over the 1 MiB limit`, or for a body too large to
 read, `the exec request is too large: the command is too long to record (over 1 MiB) or stdin_data is over 1 MiB`), and
