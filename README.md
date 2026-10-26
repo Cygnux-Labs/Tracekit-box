@@ -192,6 +192,9 @@ The API key reaches only the daemon on the runner; inside the box Claude Code se
 `api.anthropic.com`. The action's signer is a dev signer it creates in the same job, and the trust file it verifies
 against comes from that same job, so its bundles have dev assurance: they show the record was not changed after the
 job, not that the runner was honest. Inputs, outputs and the steps are in [action/action.yml](action/action.yml).
+The agent's output, and the file names `tkbox stop`, `diff` and `apply` print, reach the job log with workflow
+commands stopped (`::stop-commands::` with a random token, resumed however the step ends), so the agent can't add
+annotations, masks or step outputs by printing `::error::` and the like.
 
 The action applies the agent's changes to the runner's checkout. Building or testing them there runs the agent's code
 on the runner. [examples/claude-code-fix.yml](examples/claude-code-fix.yml) shows the safe shape: one job runs the box
