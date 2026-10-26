@@ -73,6 +73,7 @@ class FakeDaemon:
         self.exec_requests: List[Dict[str, Any]] = []
         self.signer_ok = True
         self.max_boxes = 8
+        self.huge_diff = 0  # files in the diff summary; set: a summary too large for a header
         # what the fake's apply reports: paths of the patch that steer host automation, and ignored new files
         self.sensitive: List[str] = []
         self.ignored: List[str] = []
@@ -253,16 +254,16 @@ class FakeDaemon:
                 box["state"] = "stopped"
                 box["stop_reason"] = (payload or {}).get("reason") or ("killed" if (payload or {}).get("kill") else "stopped")
                 return self._respond(conn, 200, box)
-            if sub == ["diff"] and method == "GET":
+            if sub in (["diff"], ["diff", "summary"]) and method == "GET":
                 summary = {"files": [{"path": "x.txt", "status": "added", "new_mode": 0o644}], "bytes": len(PATCH)}
-                return self._respond(
-                    conn,
-                    200,
-                    PATCH,
-                    headers={"X-Tkbox-Diff-Summary": json.dumps(summary)},
-                    chunked=True,
-                    content_type="text/x-diff",
-                )
+                if self.huge_diff:  # thousands of long paths: too large for a header, like the real daemon's
+                    summary = {"files": [{"path": "d/" + "x" * 180 + f"/f{i:05d}.txt", "status": "added"}
+                                         for i in range(self.huge_diff)], "bytes": len(PATCH)}
+                if sub == ["diff", "summary"]:
+                    return self._respond(conn, 200, summary)
+                js = json.dumps(summary)
+                hdrs = {"X-Tkbox-Diff-Summary": js} if len(js) <= 8192 else {"X-Tkbox-Diff-Summary-Omitted": "1"}
+                return self._respond(conn, 200, PATCH, headers=hdrs, chunked=True, content_type="text/x-diff")
             if sub == ["apply"] and method == "POST":
                 p = payload or {}
                 if box["state"] != "stopped":

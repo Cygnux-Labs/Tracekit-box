@@ -111,12 +111,27 @@ func (c *client) diff(ctx context.Context, box string) ([]byte, api.DiffSummary,
 	if resp.StatusCode != http.StatusOK {
 		return nil, api.DiffSummary{}, decodeError(resp)
 	}
-	var sum api.DiffSummary
-	if h := resp.Header.Get(api.DiffSummaryHeader); h != "" {
-		json.Unmarshal([]byte(h), &sum)
-	}
 	patch, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, api.DiffSummary{}, err
+	}
+	// a small summary rides in a header; a large one (the guest decides its size) is read from /diff/summary
+	if h := resp.Header.Get(api.DiffSummaryHeader); h != "" {
+		var sum api.DiffSummary
+		if err := json.Unmarshal([]byte(h), &sum); err != nil {
+			return nil, api.DiffSummary{}, fmt.Errorf("bad %s header: %w", api.DiffSummaryHeader, err)
+		}
+		return patch, sum, nil
+	}
+	sum, err := c.diffSummary(ctx, box)
 	return patch, sum, err
+}
+
+// diffSummary fetches the summary of a box's diff (GET /v1/boxes/{box}/diff/summary).
+func (c *client) diffSummary(ctx context.Context, box string) (api.DiffSummary, error) {
+	var sum api.DiffSummary
+	err := c.do(ctx, "GET", boxPath(box, "/diff/summary"), nil, &sum)
+	return sum, err
 }
 
 // events reads a box's events.ndjson as it is now (nil on any error).

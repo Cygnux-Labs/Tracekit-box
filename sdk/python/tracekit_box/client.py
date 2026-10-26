@@ -410,16 +410,22 @@ class Client:
         self._request("DELETE", self._box_path(box))
 
     def diff(self, box: str) -> Diff:
-        """GET /v1/boxes/{box}/diff: the workspace patch and its summary."""
+        """GET /v1/boxes/{box}/diff: the workspace patch and its summary. A small summary comes in a header; a large
+        one (thousands of files) is fetched from GET /v1/boxes/{box}/diff/summary."""
         resp, data = self._request("GET", self._box_path(box, "/diff"))
-        summary: Dict[str, Any] = {"files": [], "bytes": len(data)}
         raw = resp.header(DIFF_SUMMARY_HEADER)
         if raw:
             try:
                 summary = json.loads(raw)
             except ValueError:
                 raise ProtocolError(f"bad {DIFF_SUMMARY_HEADER} header") from None
+        else:
+            summary = self.diff_summary(box)
         return Diff(patch=data.decode("utf-8", "replace"), summary=summary)
+
+    def diff_summary(self, box: str) -> Dict[str, Any]:
+        """GET /v1/boxes/{box}/diff/summary: the summary of the workspace patch ({files, bytes}) without the patch."""
+        return self._json("GET", self._box_path(box, "/diff/summary"))
 
     def apply(
         self, box: str, *, dir: Optional[str] = None, check: bool = False, allow_sensitive: bool = False

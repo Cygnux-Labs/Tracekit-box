@@ -256,6 +256,15 @@ def test_exec_argv_must_be_a_list(client, box):
         client.exec("demo", "echo hi")
 
 
+def test_diff_with_a_huge_summary(client, box, daemon):
+    # thousands of long paths: the summary comes from /diff/summary, not a header the client can't read
+    daemon.huge_diff = 3000
+    d = client.diff("demo")
+    assert "+++ b/x.txt" in d.patch
+    assert len(d.files) == 3000 and d.files[2999]["path"].endswith("/f02999.txt")
+    assert client.diff_summary("demo")["files"] == d.files
+
+
 def test_stop_diff_apply_export_rm(client, box, tmp_path):
     assert client.stop("demo", reason="done")["state"] == "stopped"
     d = client.diff("demo")

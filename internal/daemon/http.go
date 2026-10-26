@@ -44,6 +44,7 @@ func (d *Daemon) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/boxes/{box}/stop", d.hStop)
 	mux.HandleFunc("DELETE /v1/boxes/{box}", d.hRemove)
 	mux.HandleFunc("GET /v1/boxes/{box}/diff", d.hDiff)
+	mux.HandleFunc("GET /v1/boxes/{box}/diff/summary", d.hDiffSummary)
 	mux.HandleFunc("POST /v1/boxes/{box}/apply", d.hApply)
 	mux.HandleFunc("POST /v1/boxes/{box}/export", d.hExport)
 	mux.HandleFunc("GET /v1/boxes/{box}/events", d.hEvents)
@@ -193,12 +194,28 @@ func (d *Daemon) hDiff(w http.ResponseWriter, r *http.Request) {
 	if sum.Files == nil {
 		sum.Files = []proto.DiffFile{}
 	}
-	js, _ := json.Marshal(sum)
-	w.Header().Set(api.DiffSummaryHeader, string(js))
+	// the guest decides how large the summary is: only a small one rides in a header, the rest is at /diff/summary
+	if js, _ := json.Marshal(sum); len(js) <= api.MaxDiffSummaryHeader {
+		w.Header().Set(api.DiffSummaryHeader, string(js))
+	} else {
+		w.Header().Set(api.DiffSummaryOmittedHeader, "1")
+	}
 	w.Header().Set("Content-Type", "text/x-diff")
 	w.Header().Set("Content-Length", strconv.Itoa(len(patch)))
 	w.WriteHeader(http.StatusOK)
 	w.Write(patch)
+}
+
+func (d *Daemon) hDiffSummary(w http.ResponseWriter, r *http.Request) {
+	_, sum, err := d.Diff(r.Context(), r.PathValue("box"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if sum.Files == nil {
+		sum.Files = []proto.DiffFile{}
+	}
+	writeJSON(w, http.StatusOK, sum)
 }
 
 func (d *Daemon) hApply(w http.ResponseWriter, r *http.Request) {

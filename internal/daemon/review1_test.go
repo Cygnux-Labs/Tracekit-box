@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/netip"
@@ -508,6 +509,62 @@ func TestReview1StdinInTheDecision(t *testing.T) {
 	if result["stdin_sha256"] != sha(streamed) || result["stdin_bytes"] != int64(len(streamed)) {
 		t.Fatalf("streamed complete %v", result)
 	}
+}
+
+// L7: the diff summary never rides in an unbounded header: a summary over 8 KiB (thousands of long paths, which the
+// guest controls) is left out of the diff response and served as JSON at /diff/summary; a small one stays a header.
+func TestReview1DiffSummaryNotAHugeHeader(t *testing.T) {
+	e := newTestEnv(t, nil)
+	var patch strings.Builder
+	long := strings.Repeat("p", 180)
+	for i := range 3000 {
+		p := fmt.Sprintf("d/%s/f%05d.txt", long, i)
+		fmt.Fprintf(&patch, "diff --git a/%s b/%s\nnew file mode 100644\n--- /dev/null\n+++ b/%s\n@@ -0,0 +1 @@\n+x\n", p, p, p)
+	}
+	e.guest.Patch = patch.String()
+	e.create(api.CreateBoxRequest{Name: "big"})
+	e.d.Stop(context.Background(), "big", api.StopRequest{})
+	hc := httpClient(e.serve())
+
+	resp, err := hc.Get("http://tkbox/v1/boxes/big/diff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(body) != patch.String() {
+		t.Fatalf("diff: %d, %d bytes", resp.StatusCode, len(body))
+	}
+	if h := resp.Header.Get(api.DiffSummaryHeader); len(h) > api.MaxDiffSummaryHeader || resp.Header.Get(api.DiffSummaryOmittedHeader) != "1" {
+		t.Fatalf("diff response: a %d-byte summary header, omitted %q", len(h), resp.Header.Get(api.DiffSummaryOmittedHeader))
+	}
+	resp, err = hc.Get("http://tkbox/v1/boxes/big/diff/summary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sum api.DiffSummary
+	err = json.NewDecoder(resp.Body).Decode(&sum)
+	resp.Body.Close()
+	if err != nil || resp.StatusCode != 200 || len(sum.Files) != 3000 || sum.Bytes != int64(patch.Len()) ||
+		sum.Files[2999].Path != fmt.Sprintf("d/%s/f%05d.txt", long, 2999) || sum.Files[0].Status != "added" {
+		t.Fatalf("diff/summary: %d %v, %d files", resp.StatusCode, err, len(sum.Files))
+	}
+
+	e.guest.Patch = modify("a.txt")
+	e.create(api.CreateBoxRequest{Name: "small"})
+	resp, err = hc.Get("http://tkbox/v1/boxes/small/diff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if h := resp.Header.Get(api.DiffSummaryHeader); !strings.Contains(h, `"a.txt"`) || resp.Header.Get(api.DiffSummaryOmittedHeader) != "" {
+		t.Fatalf("small diff: header %q", h)
+	}
+	resp, _ = hc.Get("http://tkbox/v1/boxes/nope/diff/summary")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("summary of an unknown box: %d", resp.StatusCode)
+	}
+	resp.Body.Close()
 }
 
 // L6: the daemon's extra block prefixes (--egress-block: e.g. a cloud VM's NAT'd public IP, which is on no interface)

@@ -12,6 +12,8 @@
 //	POST   /v1/boxes/{box}/stop           StopRequest → Box
 //	DELETE /v1/boxes/{box}                → 204            (a running box is stopped first)
 //	GET    /v1/boxes/{box}/diff           → text/x-diff patch body; header X-Tkbox-Diff-Summary: DiffSummary JSON
+//	                                        (only when at most 8 KiB; else X-Tkbox-Diff-Summary-Omitted: 1)
+//	GET    /v1/boxes/{box}/diff/summary   → DiffSummary
 //	POST   /v1/boxes/{box}/apply          ApplyRequest → ApplyResult
 //	POST   /v1/boxes/{box}/export         ExportRequest → ExportResult
 //	GET    /v1/boxes/{box}/events         → application/x-ndjson stream of Event (?follow=1 keeps it open)
@@ -41,8 +43,17 @@ const Version = "v1"
 // Upgrade protocol token for the exec stream.
 const ExecUpgrade = "tkbox-exec/1"
 
-// DiffSummaryHeader carries the proto.DiffSummary of a diff response, JSON-encoded.
+// DiffSummaryHeader carries the proto.DiffSummary of a diff response, JSON-encoded, when that JSON is at most
+// MaxDiffSummaryHeader bytes; a larger summary is left out (DiffSummaryOmittedHeader is "1" instead) and read from
+// GET /v1/boxes/{box}/diff/summary. A guest decides how many files and how long their paths are, so the summary is
+// never an unbounded header.
 const DiffSummaryHeader = "X-Tkbox-Diff-Summary"
+
+// DiffSummaryOmittedHeader is "1" on a diff response whose summary was too large for DiffSummaryHeader.
+const DiffSummaryOmittedHeader = "X-Tkbox-Diff-Summary-Omitted"
+
+// MaxDiffSummaryHeader caps the DiffSummaryHeader value.
+const MaxDiffSummaryHeader = 8 << 10
 
 // Box states.
 const (
