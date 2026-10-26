@@ -99,3 +99,14 @@ func TestMCPStopsItsBoxesWhenTheSessionEnds(t *testing.T) {
 		t.Fatalf("boxes stopped at session end: %+v (refs %q)", fd.stopped, fd.refs)
 	}
 }
+
+// docs-pass follow-up: a name in the operator's config must not name MCP boxes (the second tkbox_run would clash).
+func TestMCPBoxIgnoresConfigName(t *testing.T) {
+	s := &mcpServer{images: []string{"alpine:3"}, base: &config.File{Name: "fixed-name"}}
+	for i := 0; i < 2; i++ {
+		req, err := s.runRequest(mcpRunArgs{Image: "alpine:3"})
+		if err != nil || req.Name != "" {
+			t.Fatalf("run %d: name %q err %v", i, req.Name, err)
+		}
+	}
+}

@@ -163,6 +163,8 @@ func (s *mcpServer) runRequest(a mcpRunArgs) (api.CreateBoxRequest, error) {
 	if len(a.Allow) > 0 {
 		req.Allow = append([]string(nil), a.Allow...) // narrowed to the hosts the agent named
 	}
+	// an MCP box is named by its id: a name from the operator's config would clash on the session's second tkbox_run
+	req.Name = ""
 	return req, nil
 }
 
