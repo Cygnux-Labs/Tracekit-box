@@ -19,6 +19,7 @@ import (
 	"github.com/Cygnux-Labs/tracekit-box/internal/agentrpc"
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
 	"github.com/Cygnux-Labs/tracekit-box/internal/egress"
+	"github.com/Cygnux-Labs/tracekit-box/internal/image"
 	"github.com/Cygnux-Labs/tracekit-box/internal/proto"
 	"github.com/Cygnux-Labs/tracekit-box/internal/tracekit"
 	"github.com/Cygnux-Labs/tracekit-box/internal/vmm"
@@ -397,7 +398,18 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 		}
 	}
 	base := filepath.Join(b.dir, "workspace-base.ext4")
-	if _, err := d.opts.Builder.Workspace(ctx, wsSrc, base); err != nil {
+	values := make([]image.SecretValue, 0, len(s.secrets))
+	for _, sec := range s.secrets {
+		values = append(values, image.SecretValue{Name: sec.Name, Value: sec.Value})
+	}
+	if _, err := d.opts.Builder.Workspace(ctx, wsSrc, base, values); err != nil {
+		var se *image.SecretInWorkspaceError
+		if errors.As(err, &se) {
+			// a secret's value never enters the box: a file holding it (say the from_file next to tkbox.yaml under
+			// `workspace: .`) refuses the box rather than being copied in
+			return errf(api.CodeBadRequest, "move the file out of the workspace, or add it to .gitignore in a git workspace; the box gets the secret's placeholder, never its value",
+				"%s, so the box was not started", se.Error())
+		}
 		return fmt.Errorf("build the workspace image: %w", err)
 	}
 	upper := filepath.Join(b.dir, "workspace-upper.ext4")

@@ -16,7 +16,10 @@ type Builder struct {
 	Config     image.Config
 	Rootfses   []string // refs asked for
 	Workspaces []string // dirs asked for
-	Scratches  []string
+	// WorkspaceSecrets are the secrets each Workspace call was given; WorkspaceErr, when set, is what it returns.
+	WorkspaceSecrets [][]image.SecretValue
+	WorkspaceErr     error
+	Scratches        []string
 }
 
 func (b *Builder) Rootfs(ctx context.Context, ref, arch string) (image.Rootfs, error) {
@@ -34,12 +37,17 @@ func (b *Builder) Rootfs(ctx context.Context, ref, arch string) (image.Rootfs, e
 		Config: b.Config}, nil
 }
 
-func (b *Builder) Workspace(ctx context.Context, dir, out string) (image.Workspace, error) {
+func (b *Builder) Workspace(ctx context.Context, dir, out string, secrets []image.SecretValue) (image.Workspace, error) {
 	b.mu.Lock()
 	b.Workspaces = append(b.Workspaces, dir)
+	b.WorkspaceSecrets = append(b.WorkspaceSecrets, secrets)
+	werr := b.WorkspaceErr
 	b.mu.Unlock()
 	if b.Err != nil {
 		return image.Workspace{}, b.Err
+	}
+	if werr != nil {
+		return image.Workspace{}, werr
 	}
 	return image.Workspace{Path: out}, os.WriteFile(out, []byte("fake workspace"), 0o644)
 }

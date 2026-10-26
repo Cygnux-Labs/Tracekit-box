@@ -122,7 +122,7 @@ secrets:
 |---|---|
 | `NAME` | The environment variable the box sees: upper-case letters, digits and `_`, not starting with a digit (`GITHUB_TOKEN`) |
 | `from_env` | Read the value from this environment variable of the `tkbox run` process. Unset or empty is an error |
-| `from_file` | Read the value from this file; trailing line breaks are dropped. `~/` is expanded; a relative path is relative to the `tkbox.yaml` |
+| `from_file` | Read the value from this file; trailing line breaks are dropped. `~/` is expanded; a relative path is relative to the `tkbox.yaml`. Keep the file outside the workspace (or `.gitignore` it in a git workspace): a workspace file that holds a secret's value refuses the box |
 | `hosts` | Exact host names, without ports and without wildcards (`*.github.com` is refused: `host "*.github.com" is a wildcard: a secret goes to exact hosts only; list each one (e.g. [api.github.com, uploads.github.com])`). Required. A secret's hosts join the box's allowlist |
 | `header` | The one request header the placeholder is replaced in, for example `Authorization` or `X-Api-Key`. Left out or empty, it is `Authorization`; it is never "any header". `Host` and hop-by-hop headers cannot be used. `tkbox run` prints each secret's header when the box starts |
 

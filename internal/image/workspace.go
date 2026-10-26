@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-func (b *builder) Workspace(ctx context.Context, dir, out string) (Workspace, error) {
+func (b *builder) Workspace(ctx context.Context, dir, out string, secrets []SecretValue) (Workspace, error) {
 	mkfs, debugfs, err := b.tools()
 	if err != nil {
 		return Workspace{}, err
@@ -37,7 +37,7 @@ func (b *builder) Workspace(ctx context.Context, dir, out string) (Workspace, er
 		return Workspace{}, fmt.Errorf("workspace: %w", err)
 	}
 	defer os.RemoveAll(staging)
-	ws, meta, err := b.copyWorkspace(ctx, src, staging)
+	ws, meta, err := b.copyWorkspace(ctx, src, staging, secrets)
 	if err != nil {
 		return Workspace{}, err
 	}
@@ -59,7 +59,7 @@ func (b *builder) Workspace(ctx context.Context, dir, out string) (Workspace, er
 
 // copyWorkspace copies the workspace files of src into staging and returns what it copied plus the owner and mode
 // of every staged path (root-owned, permission bits only: no setuid from a host checkout).
-func (b *builder) copyWorkspace(ctx context.Context, src, staging string) (Workspace, map[string]entryMeta, error) {
+func (b *builder) copyWorkspace(ctx context.Context, src, staging string, secrets []SecretValue) (Workspace, map[string]entryMeta, error) {
 	staging, err := filepath.EvalSymlinks(staging)
 	if err != nil {
 		return Workspace{}, nil, err
@@ -81,6 +81,7 @@ func (b *builder) copyWorkspace(ctx context.Context, src, staging string) (Works
 	}()
 	entries := 0 // files and symlinks, for the cap
 	meta := map[string]entryMeta{}
+	scan := newValueScan(secrets)
 	for _, name := range names {
 		if err := ctx.Err(); err != nil {
 			return Workspace{}, nil, err
@@ -104,6 +105,10 @@ func (b *builder) copyWorkspace(ctx context.Context, src, staging string) (Works
 		if !mode.IsRegular() && mode&fs.ModeSymlink == 0 && !mode.IsDir() {
 			continue // sockets, fifos, devices
 		}
+		rel := strings.Join(comps, "/")
+		if s := scan.in(rel); s != "" {
+			return Workspace{}, nil, &SecretInWorkspaceError{Path: scan.tag(rel), Secret: s}
+		}
 		if mode.IsDir() {
 			if err := mkdirs(staging, comps, meta, fi.Mode().Perm()); err != nil {
 				return Workspace{}, nil, err
@@ -118,11 +123,13 @@ func (b *builder) copyWorkspace(ctx context.Context, src, staging string) (Works
 		}
 		from := filepath.Join(src, filepath.Join(comps...))
 		to := filepath.Join(staging, filepath.Join(comps...))
-		rel := strings.Join(comps, "/")
 		if mode&fs.ModeSymlink != 0 {
 			target, err := os.Readlink(from)
 			if err != nil {
 				return Workspace{}, nil, fmt.Errorf("workspace: %w", err)
+			}
+			if s := scan.in(target); s != "" {
+				return Workspace{}, nil, &SecretInWorkspaceError{Path: scan.tag(rel), Secret: s}
 			}
 			if err := os.Symlink(target, to); err != nil {
 				return Workspace{}, nil, fmt.Errorf("workspace: %w", err)
@@ -133,15 +140,74 @@ func (b *builder) copyWorkspace(ctx context.Context, src, staging string) (Works
 		if ws.Bytes+fi.Size() > b.lim.WorkspaceBytes {
 			return Workspace{}, nil, fmt.Errorf("workspace %s holds more than %s of files (WorkspaceBytes); add large or generated files to .gitignore, or point the box at a smaller directory", src, human(b.lim.WorkspaceBytes))
 		}
-		n, err := copyFile(from, to, fi)
+		scan.reset()
+		n, err := copyFile(from, to, fi, scan)
 		if err != nil {
 			return Workspace{}, nil, err
+		}
+		if scan.found != "" {
+			return Workspace{}, nil, &SecretInWorkspaceError{Path: scan.tag(rel), Secret: scan.found}
 		}
 		ws.Bytes += n
 		ws.Files++
 		meta[rel] = entryMeta{mode: uint32(fi.Mode().Perm()) | 0o400}
 	}
 	return ws, meta, nil
+}
+
+// valueScan looks for secret values in a file as it is copied (across the copy's reads), and in names.
+type valueScan struct {
+	names  []string
+	values [][]byte // each MinSecretScan bytes or longer
+	keep   int      // the longest value's length less one: the tail that may still start a value
+	tail   []byte
+	found  string // the first secret found in what was written since reset
+}
+
+func newValueScan(secrets []SecretValue) *valueScan {
+	s := &valueScan{}
+	for _, v := range secrets {
+		if len(v.Value) >= MinSecretScan {
+			s.names, s.values = append(s.names, v.Name), append(s.values, []byte(v.Value))
+			s.keep = max(s.keep, len(v.Value)-1)
+		}
+	}
+	return s
+}
+
+// in returns the secret whose value b holds, or "".
+func (s *valueScan) in(b string) string {
+	for i, v := range s.values {
+		if strings.Contains(b, string(v)) {
+			return s.names[i]
+		}
+	}
+	return ""
+}
+
+// tag writes every value in p as [secret NAME], so a path that holds one can be named in an error.
+func (s *valueScan) tag(p string) string {
+	for i, v := range s.values {
+		p = strings.ReplaceAll(p, string(v), "[secret "+s.names[i]+"]")
+	}
+	return p
+}
+
+func (s *valueScan) reset() { s.tail, s.found = s.tail[:0], "" }
+
+func (s *valueScan) Write(p []byte) (int, error) {
+	if s.found != "" || len(s.values) == 0 {
+		return len(p), nil
+	}
+	buf := append(s.tail, p...)
+	for i, v := range s.values {
+		if bytes.Contains(buf, v) {
+			s.found = s.names[i]
+			return len(p), nil
+		}
+	}
+	s.tail = append(s.tail[:0], buf[len(buf)-min(len(buf), s.keep):]...)
+	return len(p), nil
 }
 
 // Credential files never enter a workspace, git-ignored or not: an apply that edits .gitignore must not be able to
@@ -250,7 +316,7 @@ func mkdirs(staging string, comps []string, meta map[string]entryMeta, perm fs.F
 }
 
 // copyFile copies one regular file, opened without following symlinks and checked to be the file that was listed.
-func copyFile(from, to string, listed fs.FileInfo) (int64, error) {
+func copyFile(from, to string, listed fs.FileInfo, scan io.Writer) (int64, error) {
 	in, err := os.OpenFile(from, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return 0, fmt.Errorf("workspace: cannot read %s: %v; fix its permissions or add it to .gitignore", from, err)
@@ -267,7 +333,7 @@ func copyFile(from, to string, listed fs.FileInfo) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("workspace: %w", err)
 	}
-	n, err := io.CopyN(out, in, fi.Size())
+	n, err := io.CopyN(io.MultiWriter(out, scan), in, fi.Size())
 	if err == nil {
 		err = out.Chmod(fi.Mode().Perm() | 0o400)
 	}

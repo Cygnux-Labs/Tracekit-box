@@ -1,6 +1,7 @@
 package image
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -74,7 +75,7 @@ func TestWorkspaceGitListing(t *testing.T) {
 	dir := gitRepo(t)
 	b := newTestBuilder(t, nil, nil)
 	staging := t.TempDir()
-	ws, meta, err := b.copyWorkspace(t.Context(), dir, staging)
+	ws, meta, err := b.copyWorkspace(t.Context(), dir, staging, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +96,7 @@ func TestWorkspaceGitListing(t *testing.T) {
 
 	// From a subdirectory, only that subtree, still filtered by git.
 	sub := t.TempDir()
-	if _, _, err := b.copyWorkspace(t.Context(), filepath.Join(dir, "src"), sub); err != nil {
+	if _, _, err := b.copyWorkspace(t.Context(), filepath.Join(dir, "src"), sub, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := strings.Join(stagedNames(t, sub), ","); got != "main.go" {
@@ -104,7 +105,7 @@ func TestWorkspaceGitListing(t *testing.T) {
 
 	// A git failure inside a work tree is an error, never a fallback that would copy .env.
 	b.opts.Git = "/bin/false"
-	if _, _, err := b.copyWorkspace(t.Context(), dir, t.TempDir()); err == nil {
+	if _, _, err := b.copyWorkspace(t.Context(), dir, t.TempDir(), nil); err == nil {
 		t.Error("git failure fell back to copying everything")
 	}
 }
@@ -115,7 +116,7 @@ func TestWorkspaceWalkAndLimits(t *testing.T) {
 	os.Mkdir(filepath.Join(dir, "empty"), 0o750)
 	b := newTestBuilder(t, nil, nil)
 	staging := t.TempDir()
-	ws, meta, err := b.copyWorkspace(t.Context(), dir, staging)
+	ws, meta, err := b.copyWorkspace(t.Context(), dir, staging, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +129,7 @@ func TestWorkspaceWalkAndLimits(t *testing.T) {
 	// A .git that git does not accept fails closed instead of copying everything.
 	fake := t.TempDir()
 	writeFiles(t, fake, map[string]string{".git/config": "not a repo", ".env": "secret"})
-	if _, _, err := b.copyWorkspace(t.Context(), fake, t.TempDir()); err == nil || !strings.Contains(err.Error(), "git ls-files") {
+	if _, _, err := b.copyWorkspace(t.Context(), fake, t.TempDir(), nil); err == nil || !strings.Contains(err.Error(), "git ls-files") {
 		t.Errorf("fake .git: got %v", err)
 	}
 	for _, c := range []struct {
@@ -136,7 +137,7 @@ func TestWorkspaceWalkAndLimits(t *testing.T) {
 		want string
 	}{{Limits{WorkspaceFiles: 1}, "WorkspaceFiles"}, {Limits{WorkspaceBytes: 2}, "WorkspaceBytes"}} {
 		b := newTestBuilder(t, nil, func(o *Options) { o.Limits = c.lim })
-		if _, _, err := b.copyWorkspace(t.Context(), dir, t.TempDir()); err == nil || !strings.Contains(err.Error(), c.want) {
+		if _, _, err := b.copyWorkspace(t.Context(), dir, t.TempDir(), nil); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%+v: got %v", c.lim, err)
 		}
 	}
@@ -147,7 +148,7 @@ func TestWorkspaceExt4(t *testing.T) {
 	dir := gitRepo(t)
 	b := newTestBuilder(t, nil, nil)
 	out := filepath.Join(t.TempDir(), "workspace-base.ext4")
-	ws, err := b.Workspace(t.Context(), dir, out)
+	ws, err := b.Workspace(t.Context(), dir, out, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +194,7 @@ func TestCredentialFilesSkippedUnlessIgnored(t *testing.T) {
 		t.Helper()
 		b := newTestBuilder(t, nil, nil)
 		staging := t.TempDir()
-		if _, _, err := b.copyWorkspace(t.Context(), dir, staging); err != nil {
+		if _, _, err := b.copyWorkspace(t.Context(), dir, staging, nil); err != nil {
 			t.Fatal(err)
 		}
 		if got := strings.Join(stagedNames(t, staging), ","); got != "src/main.go" {
@@ -236,5 +237,42 @@ func TestCredentialPath(t *testing.T) {
 		if got := credentialPath(comps); got != want {
 			t.Errorf("credentialPath(%q) = %v, want %v", name, got, want)
 		}
+	}
+}
+
+// B1 (final check): a workspace file whose content, path or symlink target holds a secret's value refuses the copy,
+// naming the file and the secret, never the value: a value read from a from_file next to tkbox.yaml under
+// `workspace: .`, or kept in a file under an MCP --workspace-root, would otherwise be in the box. A value split
+// across the copy's reads is found too; one shorter than MinSecretScan is not looked for.
+func TestWorkspaceRefusesSecretValue(t *testing.T) {
+	const val = "ghp_finalcheck0123456789"
+	secrets := []SecretValue{{Name: "OTHER", Value: "never-in-this-workspace"}, {Name: "GH", Value: val}, {Name: "PIN", Value: "1234"}}
+	for _, c := range []struct {
+		name, path string
+		setup      func(dir string)
+	}{
+		{"content", "key.txt", func(dir string) { os.WriteFile(filepath.Join(dir, "key.txt"), []byte("token: "+val+"\n"), 0o600) }},
+		{"split across reads", "secrets/gh.txt", func(dir string) {
+			os.Mkdir(filepath.Join(dir, "secrets"), 0o755)
+			body := strings.Repeat("x", 32<<10-10) + val + strings.Repeat("y", 1000)
+			os.WriteFile(filepath.Join(dir, "secrets", "gh.txt"), []byte(body), 0o600)
+		}},
+		{"name", "notes-[secret GH].txt", func(dir string) { os.WriteFile(filepath.Join(dir, "notes-"+val+".txt"), nil, 0o600) }},
+		{"symlink target", "link", func(dir string) { os.Symlink("/tmp/"+val, filepath.Join(dir, "link")) }},
+	} {
+		dir := t.TempDir()
+		os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main // PIN 1234\n"), 0o644)
+		c.setup(dir)
+		b := newTestBuilder(t, nil, nil)
+		_, _, err := b.copyWorkspace(t.Context(), dir, t.TempDir(), secrets)
+		var se *SecretInWorkspaceError
+		if !errors.As(err, &se) || se.Path != c.path || se.Secret != "GH" || strings.Contains(err.Error(), val[4:]) {
+			t.Errorf("%s: %v", c.name, err)
+		}
+	}
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main // PIN 1234\n"), 0o644)
+	if _, _, err := newTestBuilder(t, nil, nil).copyWorkspace(t.Context(), dir, t.TempDir(), secrets); err != nil {
+		t.Fatalf("a workspace without a value (a 4-byte one is not looked for): %v", err)
 	}
 }

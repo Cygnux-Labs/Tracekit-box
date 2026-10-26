@@ -4,7 +4,10 @@
 // them (agent C). Tests above this package use imagefake.
 package image
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 // Rootfs is a built root filesystem image.
 type Rootfs struct {
@@ -33,6 +36,21 @@ type Workspace struct {
 	Bytes int64  // their total size
 }
 
+// SecretValue is a box's secret, which no workspace file may hold. Values shorter than MinSecretScan bytes are not
+// looked for: they can't be told apart from ordinary text (as the egress proxy does not redact them either).
+type SecretValue struct{ Name, Value string }
+
+// MinSecretScan is the shortest secret value a workspace is checked for.
+const MinSecretScan = 6
+
+// SecretInWorkspaceError is a workspace file whose content, path or symlink target holds a secret's value. It names
+// the file and the secret, never the value: a value in Path is written as [secret NAME].
+type SecretInWorkspaceError struct{ Path, Secret string }
+
+func (e *SecretInWorkspaceError) Error() string {
+	return fmt.Sprintf("workspace file %s holds the value of secret %s", e.Path, e.Secret)
+}
+
 // Builder builds and caches images. Implementations are safe for concurrent use; concurrent builds of the same
 // image share one result.
 type Builder interface {
@@ -43,8 +61,9 @@ type Builder interface {
 	// Workspace builds an ext4 at out holding the files of dir: in a git work tree, the tracked and untracked
 	// files that are not ignored (git ls-files -co --exclude-standard), so .env files a .gitignore covers stay out;
 	// elsewhere every file. Never the .git dir. Symlinks are copied as symlinks; special files are skipped. Files are
-	// owned by root in the image.
-	Workspace(ctx context.Context, dir, out string) (Workspace, error)
+	// owned by root in the image. A file whose content, path or symlink target holds one of secrets refuses the build
+	// with a *SecretInWorkspaceError: a box gets a secret's placeholder, never its value.
+	Workspace(ctx context.Context, dir, out string, secrets []SecretValue) (Workspace, error)
 	// Scratch creates an empty ext4 of sizeBytes (sparse) at out.
 	Scratch(ctx context.Context, out string, sizeBytes int64) error
 }
