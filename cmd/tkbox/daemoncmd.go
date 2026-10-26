@@ -61,7 +61,8 @@ func cmdDaemon(args []string, env *cliEnv) error {
 	if *approvalTimeout < time.Second || *approvalTimeout > 4*time.Minute {
 		return usagef("--approval-timeout %s: use 1s..4m (a connection waits for its approval at most that long plus 30s)", *approvalTimeout)
 	}
-	blocked, err := parseEgressBlock(egressBlock.vals)
+	// checked now, so a bad value fails before anything touches the host; daemonOptions parses it for the boxes
+	_, err := parseEgressBlock(egressBlock.vals)
 	if err != nil {
 		return err
 	}
@@ -158,34 +159,13 @@ func cmdDaemon(args []string, env *cliEnv) error {
 		return fmt.Errorf("image builder: %w", err)
 	}
 
-	var prefixes []netip.Prefix
-	for _, c := range allowPrivate.vals {
-		p, err := netip.ParsePrefix(c)
-		if err != nil {
-			return usagef("--egress-allow-private %q: want a CIDR like 10.0.0.0/8", c)
-		}
-		prefixes = append(prefixes, p)
-		logger.Printf("WARNING: --egress-allow-private %s: boxes may reach that private range (test only)", p)
+	opts, err := daemonOptions(daemonSetup{stateDir: *stateDir, kernel: *kernel, unrecorded: *unrecorded,
+		maxBoxes: *maxBoxes, approvalTimeout: *approvalTimeout, egressBlock: egressBlock.vals,
+		allowPrivate: allowPrivate.vals, upstreamCA: *upstreamCA, launcher: launcher, builder: builder, tk: tk, logger: logger})
+	if err != nil {
+		return err
 	}
-	var roots *x509.CertPool
-	if *upstreamCA != "" {
-		pem, err := os.ReadFile(*upstreamCA)
-		if err != nil {
-			return err
-		}
-		roots = x509.NewCertPool()
-		if !roots.AppendCertsFromPEM(pem) {
-			return fmt.Errorf("--upstream-ca %s: no PEM certificates in it", *upstreamCA)
-		}
-		logger.Printf("WARNING: --upstream-ca %s replaces the system roots for upstream TLS (test only)", *upstreamCA)
-	}
-
-	d, err := daemon.New(daemon.Options{
-		StateDir: *stateDir, Launcher: launcher, Builder: builder, Tracekit: tk, Unrecorded: *unrecorded,
-		KernelPath: *kernel, Arch: arch, Version: version, ApprovalTimeout: *approvalTimeout, MaxBoxes: *maxBoxes,
-		EgressAllowPrivate: prefixes, EgressUpstreamRoots: roots, EgressBlock: blocked, Logger: logger,
-		// GuestClient, NewProxy and Gate default to agentrpc.New, egress.New and tracekit.Gate
-	})
+	d, err := daemon.New(opts)
 	if err != nil {
 		return err
 	}
@@ -196,6 +176,56 @@ func cmdDaemon(args []string, env *cliEnv) error {
 	defer cancel()
 	d.Shutdown(sctx)
 	return serveErr
+}
+
+// daemonSetup is what daemonOptions builds the daemon's Options from: flag values as cmdDaemon parsed them (the egress
+// ones as given) and what it set up from them.
+type daemonSetup struct {
+	stateDir, kernel, upstreamCA string
+	unrecorded                   bool
+	maxBoxes                     int
+	approvalTimeout              time.Duration
+	egressBlock, allowPrivate    []string
+	launcher                     vmm.Launcher
+	builder                      image.Builder
+	tk                           tracekit.Client
+	logger                       *log.Logger
+}
+
+// daemonOptions builds the daemon's Options. It parses the egress flags: --egress-block, and the test-only
+// --egress-allow-private and --upstream-ca, whose warnings it logs.
+func daemonOptions(s daemonSetup) (daemon.Options, error) {
+	blocked, err := parseEgressBlock(s.egressBlock)
+	if err != nil {
+		return daemon.Options{}, err
+	}
+	var prefixes []netip.Prefix
+	for _, c := range s.allowPrivate {
+		p, err := netip.ParsePrefix(c)
+		if err != nil {
+			return daemon.Options{}, usagef("--egress-allow-private %q: want a CIDR like 10.0.0.0/8", c)
+		}
+		prefixes = append(prefixes, p)
+		s.logger.Printf("WARNING: --egress-allow-private %s: boxes may reach that private range (test only)", p)
+	}
+	var roots *x509.CertPool
+	if s.upstreamCA != "" {
+		pem, err := os.ReadFile(s.upstreamCA)
+		if err != nil {
+			return daemon.Options{}, err
+		}
+		roots = x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(pem) {
+			return daemon.Options{}, fmt.Errorf("--upstream-ca %s: no PEM certificates in it", s.upstreamCA)
+		}
+		s.logger.Printf("WARNING: --upstream-ca %s replaces the system roots for upstream TLS (test only)", s.upstreamCA)
+	}
+	return daemon.Options{
+		StateDir: s.stateDir, Launcher: s.launcher, Builder: s.builder, Tracekit: s.tk, Unrecorded: s.unrecorded,
+		KernelPath: s.kernel, Arch: runtime.GOARCH, Version: version, ApprovalTimeout: s.approvalTimeout, MaxBoxes: s.maxBoxes,
+		EgressAllowPrivate: prefixes, EgressUpstreamRoots: roots, EgressBlock: blocked, Logger: s.logger,
+		// GuestClient, NewProxy and Gate default to agentrpc.New, egress.New and tracekit.Gate
+	}, nil
 }
 
 // parseEgressBlock parses --egress-block values: CIDRs (or single addresses) no box may reach.
