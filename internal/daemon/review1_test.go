@@ -195,6 +195,37 @@ func TestReview1FailedCompletesRecordedAsGap(t *testing.T) {
 	}
 }
 
+// L9: a daemon restarted with a signer applies nothing from a box that ran unrecorded (it has no run to decide the
+// writes in); it names the saved patch to apply by hand. An unrecorded daemon still applies it.
+func TestReview1RecordedDaemonRefusesUnrecordedPatch(t *testing.T) {
+	e := newTestEnv(t, func(o *Options) { o.Tracekit, o.Unrecorded = nil, true })
+	ws := t.TempDir()
+	gitInit(t, ws)
+	os.WriteFile(filepath.Join(ws, "a.txt"), []byte("old\n"), 0o644)
+	e.guest.Patch = modify("a.txt")
+	e.create(api.CreateBoxRequest{Name: "u", Workspace: ws})
+	e.d.Stop(context.Background(), "u", api.StopRequest{})
+
+	opts := e.opts
+	opts.Tracekit, opts.Unrecorded = e.tk, false
+	d2, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d2.eg = fakeEgress()
+	_, err = d2.Apply(context.Background(), "u", api.ApplyRequest{})
+	if errCode(err) != api.CodeConflict || !strings.Contains(err.Error(), "ran unrecorded") ||
+		!strings.Contains(err.Error(), filepath.Join(e.d.boxDir(e.box("u").id), "diff.patch")) || !strings.Contains(err.Error(), "by hand after review") {
+		t.Fatalf("recorded daemon applying an unrecorded box: %v", err)
+	}
+	if readFile(t, filepath.Join(ws, "a.txt")) != "old\n" {
+		t.Fatal("written with no decision")
+	}
+	if _, err := e.d.Apply(context.Background(), "u", api.ApplyRequest{}); err != nil {
+		t.Fatalf("the unrecorded daemon itself: %v", err)
+	}
+}
+
 // L6: the daemon's extra block prefixes (--egress-block: e.g. a cloud VM's NAT'd public IP, which is on no interface)
 // reach every box's proxy alongside the host's own addresses.
 func TestReview1EgressBlockReachesEveryBox(t *testing.T) {

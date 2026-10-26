@@ -142,6 +142,12 @@ func (d *Daemon) Apply(ctx context.Context, ref string, req api.ApplyRequest) (a
 	if len(bytes.TrimSpace(patch)) == 0 {
 		return res, nil
 	}
+	// an unrecorded box's patch has no run to decide its writes in: a daemon that records (restarted with a signer)
+	// does not write it ungated
+	if v.Unrecorded && d.opts.Tracekit != nil {
+		return api.ApplyResult{}, errf(api.CodeConflict, "review it with `tkbox diff "+ref+"`, then apply it yourself: git apply "+patchPath,
+			"box %s ran unrecorded, so this recording daemon can't decide or record its writes; apply the saved patch by hand after review: %s", ref, patchPath)
+	}
 	// a recorded box's writes are decided in its own run, or not at all
 	if !v.Unrecorded {
 		byHand := "review the saved patch and apply it yourself: git apply " + patchPath
