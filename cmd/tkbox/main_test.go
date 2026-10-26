@@ -28,6 +28,7 @@ type fakeDaemon struct {
 	created []api.CreateBoxRequest
 	stopped []api.StopRequest
 	execs   []api.ExecRequest
+	refs    []string // the {box} of every exec and stop request
 }
 
 func startFakeDaemon(t *testing.T) (string, *fakeDaemon) {
@@ -62,6 +63,7 @@ func startFakeDaemon(t *testing.T) (string, *fakeDaemon) {
 		json.NewDecoder(r.Body).Decode(&req)
 		fd.mu.Lock()
 		fd.stopped = append(fd.stopped, req)
+		fd.refs = append(fd.refs, r.PathValue("box"))
 		fd.mu.Unlock()
 		b := box
 		b.State = api.StateStopped
@@ -81,6 +83,7 @@ func startFakeDaemon(t *testing.T) (string, *fakeDaemon) {
 		json.NewDecoder(r.Body).Decode(&req)
 		fd.mu.Lock()
 		fd.execs = append(fd.execs, req)
+		fd.refs = append(fd.refs, r.PathValue("box"))
 		fd.mu.Unlock()
 		conn, brw, _ := http.NewResponseController(w).Hijack()
 		defer conn.Close()

@@ -105,6 +105,10 @@ func (s *mcpServer) runRequest(a mcpRunArgs) (api.CreateBoxRequest, error) {
 	if len(a.Env) > 0 {
 		return api.CreateBoxRequest{}, mcpRefused("tkbox_run may not set env for every command (it would apply to commands without being decided); put env in the command itself")
 	}
+	if a.Name != "" {
+		// the name lands in the run's trusted record of the box; an MCP box is named by its id
+		return api.CreateBoxRequest{}, mcpRefused("tkbox_run takes no name: a box created over MCP is named by its id")
+	}
 	if a.Task != "" {
 		// the run records the task as the operator's trusted instruction; an agent's words must not take its place
 		return api.CreateBoxRequest{}, mcpRefused("tkbox_run takes no task: the run records only the operator's configured task as trusted; keep your own notes in your prompt")
@@ -151,7 +155,7 @@ func (s *mcpServer) runRequest(a mcpRunArgs) (api.CreateBoxRequest, error) {
 			return api.CreateBoxRequest{}, mcpRefused("timeout %s is over the operator's %s", a.Timeout, time.Duration(l.Timeout))
 		}
 	}
-	req, err := config.Request(s.base, config.Flags{Image: image, Name: a.Name, Workspace: workspace,
+	req, err := config.Request(s.base, config.Flags{Image: image, Workspace: workspace,
 		CPUs: a.CPUs, Memory: a.Memory, Timeout: a.Timeout, Agent: "mcp"}, config.Resolver{})
 	if err != nil {
 		return api.CreateBoxRequest{}, err
@@ -239,6 +243,7 @@ func (s *mcpServer) serve(parent context.Context, in io.Reader) error {
 	// when the client goes away (stdin closes) its in-flight calls are cancelled: execs stop instead of running on
 	ctx, cancel := context.WithCancel(parent)
 	var wg sync.WaitGroup
+	defer s.stopOwned() // last: nothing else can reach them once this session is gone
 	defer wg.Wait()
 	defer cancel()
 	for sc.Scan() {
@@ -267,6 +272,29 @@ func (s *mcpServer) serve(parent context.Context, in io.Reader) error {
 		}(req)
 	}
 	return sc.Err()
+}
+
+// stopOwned stops every box this session created: no later session can reach them, so left running they would only
+// hold a slot of the daemon's --max-boxes until their timeout. Their patches are saved and their runs stay open for the
+// operator's apply and export.
+func (s *mcpServer) stopOwned() {
+	s.mu.Lock()
+	ids := make([]string, 0, len(s.owned))
+	for id := range s.owned {
+		ids = append(ids, id)
+	}
+	s.mu.Unlock()
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			s.c.do(ctx, "POST", boxPath(id, "/stop"), api.StopRequest{Reason: "the tkbox mcp session that created it ended"}, nil)
+		}()
+	}
+	wg.Wait()
 }
 
 func (s *mcpServer) handle(ctx context.Context, req rpcRequest) (any, *rpcError) {
@@ -336,7 +364,6 @@ func mcpTools() []map[string]any {
 		{"name": "tkbox_run", "description": "Create a box (a micro-VM) and return its id. Image, allowlist, secrets and env come from the operator's setup; these arguments can only narrow it.",
 			"inputSchema": schema(map[string]any{
 				"image":     strProp("OCI image (default: the operator's; only images the operator allows)"),
-				"name":      strProp("box name: lower case letters, digits and -"),
 				"allow":     arrProp("narrow the egress allowlist to these entries of the operator's allowlist (nothing can be added)"),
 				"workspace": strProp("absolute host dir copied into /workspace (default: the operator's; only inside the operator's workspace roots)"),
 				"cpus":      map[string]any{"type": "integer", "minimum": 1, "maximum": 32},
@@ -401,6 +428,12 @@ func (s *mcpServer) ownBox(raw json.RawMessage) (json.RawMessage, error) {
 	var args map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &args); err != nil {
 		return nil, &api.ErrorDetail{Code: api.CodeBadRequest, Message: "arguments: " + err.Error()}
+	}
+	for k := range args {
+		// encoding/json matches field names case-insensitively: a second "BOX" must not decide which box is used
+		if k != "box" && strings.EqualFold(k, "box") {
+			return nil, &api.ErrorDetail{Code: api.CodeBadRequest, Message: fmt.Sprintf("argument %q: use \"box\"", k)}
+		}
 	}
 	var ref string
 	if err := json.Unmarshal(args["box"], &ref); err != nil || ref == "" {

@@ -23,3 +23,17 @@ func TestShellQuote(t *testing.T) {
 		}
 	}
 }
+
+// Every word a POSIX shell or bash reads as syntax in command position is quoted as argv[0], so the signer's parser
+// sees it as the program; the list is pinned here, not taken from the implementation's set.
+func TestShellQuoteReservedWords(t *testing.T) {
+	for _, w := range []string{"case", "coproc", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if",
+		"in", "select", "then", "time", "until", "while"} {
+		if got, want := ShellQuote([]string{w, "x"}), "'"+w+"' x"; got != want {
+			t.Errorf("ShellQuote([%q x]) = %s, want %s", w, got, want)
+		}
+		if got := ShellQuote([]string{"echo", w}); got != "echo "+w {
+			t.Errorf("a reserved word after the program must stay bare: %s", got)
+		}
+	}
+}
