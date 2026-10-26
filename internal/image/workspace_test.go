@@ -299,3 +299,23 @@ func TestWorkspaceRefusalNamesNoPartOfAValue(t *testing.T) {
 		}
 	}
 }
+
+// N2 (final check 2): Workspace hands the box's secrets to the copy's scan, so the real builder refuses a workspace
+// file that holds a value before it makes a disk. The tools are paths that are never run: the refusal comes first.
+func TestWorkspacePassesSecretsToTheScan(t *testing.T) {
+	const val = "ghp_finalcheck0123456789"
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "key.txt"), []byte(val), 0o600)
+	b := newTestBuilder(t, nil, func(o *Options) {
+		o.Mkfs, o.Debugfs = filepath.Join(dir, "no-mkfs"), filepath.Join(dir, "no-debugfs")
+	})
+	out := filepath.Join(t.TempDir(), "workspace-base.ext4")
+	_, err := b.Workspace(t.Context(), dir, out, []SecretValue{{Name: "GH", Value: val}})
+	var se *SecretInWorkspaceError
+	if !errors.As(err, &se) || se.Path != "key.txt" || se.Secret != "GH" {
+		t.Fatalf("a workspace file holding a secret's value: %v", err)
+	}
+	if _, err := os.Stat(out); err == nil {
+		t.Fatal("a workspace disk was made")
+	}
+}
