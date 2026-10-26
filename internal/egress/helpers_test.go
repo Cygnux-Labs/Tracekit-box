@@ -3,11 +3,14 @@ package egress
 import (
 	"context"
 	"encoding/hex"
+	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -126,5 +129,48 @@ func TestRedactAndFind(t *testing.T) {
 	}
 	if f := p.findTarget("/" + strings.Replace(gh.Placeholder, "_", "%5F", 1)); len(f) != 1 {
 		t.Error("percent-encoded placeholder not found")
+	}
+}
+
+// A marker never rebuilds a value with the bytes around it, and is never the value itself: value "a*****" in
+// "aa*****", "******" alone, "]abc…" before its own tail. That holds in bodies however they are split, and in
+// headers, where a case-changed echo gets a marker.
+func TestMarkerNeverRebuildsValue(t *testing.T) {
+	for _, c := range []struct{ value, text string }{
+		{"a*****", "aa*****"},
+		{"******", "******"},
+		{"[redacted]", "x[redacted]y"},
+		{"]abcdefghijklmnop", "]abcdefghijklmnopabcdefghijklmnop"},
+		{"tkbox: redacted*", "[tkbox: redacted**]"},
+		{"ghp_ordinaryValue0123", "echo ghp_ordinaryValue0123 and GHP_ORDINARYVALUE0123"},
+	} {
+		s := mkSecret(t, "S", "", "a.example.com")
+		s.Value = c.value
+		r, err := newSecretRule(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := &Proxy{secrets: []*secretRule{r}}
+		p.valMatch = newMatcher(p.valuePatterns())
+		for name, src := range map[string]io.Reader{"whole": strings.NewReader(c.text), "bytewise": iotest.OneByteReader(strings.NewReader(c.text))} {
+			out, err := io.ReadAll(newRedactReader(p.valMatch, src))
+			if err != nil || len(out) != len(c.text) || p.valMatch.findString(string(out)) != nil {
+				t.Errorf("value %q, %s body %q: redacted to %q (%v)", c.value, name, c.text, out, err)
+			}
+		}
+		for _, v := range []string{c.text, strings.ToUpper(c.text)} {
+			h := http.Header{"X-Echo": {v}}
+			p.redactValues(h)
+			if got := h.Get("X-Echo"); p.valMatch.findString(got) != nil {
+				t.Errorf("value %q, header %q: redacted to %q", c.value, v, got)
+			}
+		}
+	}
+	// A value that shares nothing with the marker text keeps the readable marker.
+	s := mkSecret(t, "S", "", "a.example.com")
+	r, _ := newSecretRule(s)
+	m := newMatcher((&Proxy{secrets: []*secretRule{r}}).valuePatterns())
+	if out, _ := io.ReadAll(newRedactReader(m, strings.NewReader(s.Value))); !strings.HasPrefix(string(out), "[tkbox: redacted") {
+		t.Errorf("an ordinary value redacts to %q", out)
 	}
 }

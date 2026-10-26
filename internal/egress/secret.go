@@ -372,7 +372,7 @@ func (p *Proxy) redactValues(h http.Header) {
 					if j == 0 && strings.Contains(v, f) {
 						v = strings.ReplaceAll(v, f, r.Placeholder)
 					}
-					v = replaceFold(v, f, "[tkbox: redacted]")
+					v = replaceFold(v, f, p.valMatch.marker(len(f)))
 				}
 				h[k][i] = v
 			}

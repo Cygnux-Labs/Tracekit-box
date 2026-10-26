@@ -84,6 +84,10 @@ type matcher struct {
 	pats   []pattern
 	first  [256][]int
 	maxLen int
+	// Markers carry markerText when no pattern can match across it (text), and are a run of fill, a byte no
+	// pattern holds, otherwise.
+	text bool
+	fill byte
 }
 
 func newMatcher(pats []pattern) *matcher {
@@ -109,6 +113,7 @@ func newMatcher(pats []pattern) *matcher {
 		m.pats = append(m.pats, p)
 		m.maxLen = max(m.maxLen, len(p.s))
 	}
+	m.chooseMarkers()
 	return m
 }
 
@@ -233,17 +238,56 @@ func lowerPercentHex(s string) string {
 	return string(b)
 }
 
-// redactMarker stands in for n bytes of a secret value in a response body; same length, so Content-Length and
-// Content-Range stay right.
-func redactMarker(n int) string {
-	const long, short = "[tkbox: redacted]", "[redacted]"
-	switch {
-	case n >= len(long):
-		return long[:len(long)-1] + strings.Repeat("*", n-len(long)) + "]"
-	case n >= len(short):
-		return short[:len(short)-1] + strings.Repeat("*", n-len(short)) + "]"
+// markerText is what a marker says between its brackets, padded with "*" (or cut to "redacted", or to nothing) to
+// the length it stands in for.
+const markerText = "tkbox: redacted"
+
+// fillBytes are the bytes a marker may be made of instead, in order of preference: no letters (patterns match
+// without regard to case), and control bytes last, which no value holds and so no form of one either.
+var fillBytes = func() []byte {
+	b := []byte("*#~")
+	for c := byte('!'); c <= '~'; c++ {
+		if lowerByte(c) == upperByte(c) && !bytes.Contains(b, []byte{c}) {
+			b = append(b, c)
+		}
 	}
-	return strings.Repeat("*", n)
+	for c := byte(1); c < ' '; c++ {
+		b = append(b, c)
+	}
+	return b
+}()
+
+// chooseMarkers makes sure no marker can complete a pattern with the bytes around it, or be one: value "]abc…"
+// followed by its own tail would become "[tkbox: redacted]abc…", and a value of "*"s would stand in for itself. A
+// bracketed marker can take part in a match only if a pattern holds "[" or "]" or lies within the text between
+// them; then markers are a run of a byte that no pattern holds.
+func (m *matcher) chooseMarkers() {
+	inner := markerText + strings.Repeat("*", m.maxLen)
+	m.text = !slices.ContainsFunc(m.pats, func(p pattern) bool {
+		return bytes.ContainsAny(p.s, "[]") || strings.Contains(inner, asciiLower(string(p.s)))
+	})
+	for _, c := range fillBytes {
+		if !slices.ContainsFunc(m.pats, func(p pattern) bool { return bytes.IndexByte(p.s, c) >= 0 }) {
+			m.fill = c
+			return
+		}
+	}
+}
+
+// marker stands in for n bytes of a secret value: the same length, so Content-Length and Content-Range stay right,
+// and never part of a match (see chooseMarkers).
+func (m *matcher) marker(n int) string {
+	if !m.text || n < 2 {
+		return strings.Repeat(string([]byte{m.fill}), n)
+	}
+	text := markerText
+	if n < len(text)+2 {
+		text = "redacted"
+	}
+	if n < len(text)+2 {
+		text = ""
+	}
+	return "[" + text + strings.Repeat("*", n-len(text)-2) + "]"
 }
 
 // redactReader passes a response body through, overwriting every secret value form with a marker of the same
@@ -280,7 +324,7 @@ func (x *redactReader) Read(b []byte) (int, error) {
 				if j < 0 {
 					break
 				}
-				copy(x.buf[j:], redactMarker(len(p.s)))
+				copy(x.buf[j:], x.m.marker(len(p.s)))
 				i = j + len(p.s)
 				end = i
 			}
