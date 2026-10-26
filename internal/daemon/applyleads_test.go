@@ -375,7 +375,7 @@ func TestApplyLeadsCheckoutGitRunsNoProgram(t *testing.T) {
 			}
 		}
 		if sub == "config" {
-			if n := len(c.args); n < 2 || c.args[n-2] != "--get" || (c.args[n-1] != "core.excludesFile" && c.args[n-1] != "core.hooksPath") {
+			if n := len(c.args); n < 2 || c.args[n-2] != "--get-all" || (c.args[n-1] != "core.excludesFile" && c.args[n-1] != "core.hooksPath") {
 				t.Errorf("unexpected git config read in the checkout: %v", c.args)
 			}
 			continue // reading config is the one call that sees the global config: it runs nothing

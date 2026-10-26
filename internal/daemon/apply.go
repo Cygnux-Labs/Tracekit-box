@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
+	"github.com/Cygnux-Labs/tracekit-box/internal/image"
 	"github.com/Cygnux-Labs/tracekit-box/internal/tracekit"
 )
 
@@ -691,22 +692,13 @@ func copyEntry(src, dst string) error {
 	return fmt.Errorf("%s is neither a file nor a symlink", src)
 }
 
-// checkoutGitConf are the -c settings of every git command apply runs: no fsmonitor (a hook program or a daemon), no
-// pager, no external diff and no untracked cache (an index write). Command-line settings beat every config file, the
-// checkout's own .git/config and whatever it includes among them.
-var checkoutGitConf = []string{"core.fsmonitor=false", "core.pager=cat", "diff.external=", "core.untrackedCache=false"}
+// checkoutGitConf are the -c settings of every git command apply runs (image.HostGitConf, shared with the workspace
+// build): no fsmonitor, no pager, no external diff and no untracked cache.
+var checkoutGitConf = image.HostGitConf
 
-// hostGitEnv is the env of a git command in the operator's checkout: the caller's without GIT_* (no GIT_DIR,
-// GIT_EXTERNAL_DIFF, GIT_CONFIG_*) or PAGER, never prompting, paging or taking optional locks.
-func hostGitEnv() []string {
-	env := []string{}
-	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "GIT_") && !strings.HasPrefix(kv, "PAGER=") {
-			env = append(env, kv)
-		}
-	}
-	return append(env, "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C", "GIT_PAGER=cat", "PAGER=cat")
-}
+// hostGitEnv is the env of a git command in the operator's checkout (image.HostGitEnv): the caller's without GIT_* or
+// PAGER, never prompting, paging or taking optional locks.
+func hostGitEnv() []string { return image.HostGitEnv() }
 
 // checkoutGit is a git command run in the operator's real checkout dir, made unable to run a program there:
 // hostGitEnv, no global or system config or attributes (the only config read is the checkout's own, and
@@ -724,21 +716,14 @@ func checkoutGit(ctx context.Context, dir string, conf []string, args ...string)
 }
 
 // hostGitConfig reads one path setting as git resolves it in dir from every config file (system, global, the
-// checkout's own): `git config --type=path --get key`, "" when unset. Reading config runs no program; the value is
-// passed on with -c, so the commands that use it still read no global or system config.
+// checkout's own; image.GitConfigValues, the read the workspace build uses too), "" when unset. Reading config runs no
+// program; the value is passed on with -c, so the commands that use it still read no global or system config.
 func hostGitConfig(ctx context.Context, dir, key string) string {
-	a := []string{"--no-pager"}
-	for _, c := range checkoutGitConf {
-		a = append(a, "-c", c)
-	}
-	cmd := exec.CommandContext(ctx, "git", append(a, "config", "--type=path", "--get", key)...)
-	cmd.Dir = dir
-	cmd.Env = hostGitEnv()
-	out, err := cmd.Output()
-	if err != nil {
+	vals := image.GitConfigValues(ctx, "git", dir, "", key, true)
+	if len(vals) == 0 {
 		return ""
 	}
-	return strings.TrimRight(string(out), "\n")
+	return vals[len(vals)-1]
 }
 
 // gitAgrees asks git itself what the patch touches (`git apply --numstat -z` and `--summary -z`, with an empty git

@@ -73,3 +73,43 @@ func TestWorkspaceGitIsIsolated(t *testing.T) {
 		t.Errorf("ls-files must run without global config and with no pager:\n%s", log)
 	}
 }
+
+// verify3b V2: the workspace build reads core.excludesFile from the system config too, as apply does (one shared
+// read), so a file the system excludes file ignores stays out of the box. The shim gives git a system config (it runs
+// after Box drops every GIT_* variable); the contained ls-files itself still reads no system config.
+func TestWorkspaceHonoursTheSystemExcludesFile(t *testing.T) {
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("no git")
+	}
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "repo")
+	os.MkdirAll(repo, 0o755)
+	if out, err := exec.Command(realGit, "-C", repo, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v %s", err, out)
+	}
+	os.WriteFile(filepath.Join(repo, "a.txt"), []byte("a"), 0o644)
+	os.WriteFile(filepath.Join(repo, "secret.txt"), []byte("s"), 0o644)
+	excl := filepath.Join(dir, "system-ignore")
+	os.WriteFile(excl, []byte("secret.txt\n"), 0o644)
+	sys := filepath.Join(dir, "system-gitconfig")
+	os.WriteFile(sys, []byte("[core]\n\texcludesFile = "+excl+"\n"), 0o644)
+	home := filepath.Join(dir, "home")
+	os.MkdirAll(home, 0o755)
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	shim := filepath.Join(dir, "git-shim")
+	os.WriteFile(shim, []byte("#!/bin/sh\nGIT_CONFIG_SYSTEM='"+sys+"'; export GIT_CONFIG_SYSTEM\nexec "+realGit+" \"$@\"\n"), 0o755)
+
+	b := &builder{opts: Options{Git: shim}, lim: Limits{}.withDefaults()}
+	names, err := b.listWorkspace(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(names, ",") != "a.txt" {
+		t.Fatalf("listed %q: the system excludes file must keep secret.txt out, as at apply", names)
+	}
+	if got := HostExcludesFile(context.Background(), shim, repo); got != excl {
+		t.Fatalf("HostExcludesFile = %q, want %q", got, excl)
+	}
+}
