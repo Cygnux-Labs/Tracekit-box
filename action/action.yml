@@ -337,7 +337,7 @@ runs:
           if [ "$apply_code" = 0 ]; then
             applied=true
           else
-            echo "::warning::tkbox apply failed (exit $apply_code): nothing was applied; the patch is in $patch"
+            echo "::warning::tkbox apply failed (exit $apply_code): a refusal writes nothing, a failure part-way names the files it wrote (no rollback); the patch is in $patch"
           fi
         fi
         echo "applied=$applied" >> "$GITHUB_OUTPUT"
@@ -418,6 +418,6 @@ runs:
           exit 1
         fi
         if [ "${TKB_APPLY_CODE:-0}" != 0 ]; then
-          echo "::error::tkbox apply failed (exit $TKB_APPLY_CODE), so nothing was applied; the patch is in the artifact"
+          echo "::error::tkbox apply failed (exit $TKB_APPLY_CODE): see the apply step for which files, if any, it wrote; the patch is in the artifact"
           exit 1
         fi
