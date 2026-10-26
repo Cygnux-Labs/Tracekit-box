@@ -117,8 +117,9 @@ func TestApplyLeadsGitIsTheOracle(t *testing.T) {
 	}
 
 	// through apply, on a patch git applies cleanly but the parser (made to misread it) reads as another file: refused
-	// because the two disagree, before anything is decided or written. Without the oracle, b.txt would be decided and
-	// git's change to a.txt would never be.
+	// because the two disagree, before anything is decided or written. Without the oracle this patch is still refused,
+	// later and for another reason (the scratch copy holds only b.txt, so git's apply to a.txt fails with a conflict);
+	// the code and message checks below are what tie the refusal to the oracle.
 	e := newTestEnv(t, nil)
 	ws := t.TempDir()
 	gitInit(t, ws)
