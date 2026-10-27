@@ -529,7 +529,7 @@ func TestRereviewSensitivePaths(t *testing.T) {
 		".yarnrc.yml": true, "lefthook.yml": true, ".gitlab-ci.yml": true, ".circleci/config.yml": true,
 		".devcontainer/devcontainer.json": true, "sub/.npmrc": true, ".netrc": true, ".pypirc": true, "deploy/key.pem": true,
 		"certs/server.key": true, ".env": true, ".ssh/config": true, ".github/workflows/ci.yml": true,
-		"src/main.go": false, ".vscode/settings.json": false, "docs/actions.md": false, "cargo/config.toml": false,
+		"src/main.go": false, "docs/actions.md": false, "cargo/config.toml": false,
 		".github/CODEOWNERS": false, "README.md": false,
 	} {
 		if got := isSensitive(p); got != want {

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -166,6 +167,61 @@ func TestApply(t *testing.T) {
 	}
 	if _, err := e.d.Apply(ctx, "evil", api.ApplyRequest{Dir: "relative"}); errCode(err) != api.CodeBadRequest {
 		t.Fatalf("relative dir: %v", err)
+	}
+}
+
+// The config files coding agents read when they next run on the host need --allow-sensitive, in any directory and
+// any case. The host's global git excludes (which often list .claude/settings.local.json) are kept out.
+func TestApplyAgentConfigNeedsAllowSensitive(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	e := newTestEnv(t, nil)
+	ws := t.TempDir()
+	gitInit(t, ws)
+	ctx := context.Background()
+	n := 0
+	box := func(p string) string {
+		t.Helper()
+		n++
+		name := fmt.Sprintf("b%d", n)
+		e.guest.Patch = "diff --git a/" + p + " b/" + p + "\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/" + p +
+			"\n@@ -0,0 +1 @@\n+steer\n"
+		e.create(api.CreateBoxRequest{Name: name, Workspace: ws})
+		e.d.Stop(ctx, name, api.StopRequest{})
+		return name
+	}
+	for _, f := range []string{".claude/settings.json", ".claude/settings.local.json", ".mcp.json", "CLAUDE.md", "AGENTS.md",
+		".codex/config.toml", ".gemini/settings.json", ".vscode/settings.json", ".vscode/tasks.json"} {
+		for _, p := range []string{f, "svc/api/" + f} {
+			name := box(p)
+			if _, err := e.d.Apply(ctx, name, api.ApplyRequest{}); errCode(err) != api.CodeBadRequest ||
+				!strings.Contains(err.Error(), "steer the next run or host automation: "+p) {
+				t.Errorf("%s without --allow-sensitive: %v", p, err)
+			}
+			if _, err := os.Lstat(filepath.Join(ws, p)); !os.IsNotExist(err) {
+				t.Fatalf("%s written although refused", p)
+			}
+			res, err := e.d.Apply(ctx, name, api.ApplyRequest{AllowSensitive: true})
+			if err != nil || !slices.Equal(res.Applied, []string{p}) || !slices.Equal(res.Sensitive, []string{p}) ||
+				readFile(t, filepath.Join(ws, p)) != "steer\n" {
+				t.Errorf("%s with --allow-sensitive: %+v %v", p, res, err)
+			}
+		}
+	}
+	name := box("docs/settings.json.md")
+	if res, err := e.d.Apply(ctx, name, api.ApplyRequest{}); err != nil || len(res.Sensitive) != 0 ||
+		readFile(t, filepath.Join(ws, "docs", "settings.json.md")) != "steer\n" {
+		t.Fatalf("an unrelated file: %+v %v", res, err)
+	}
+	for p, want := range map[string]bool{
+		"Web/.Claude/Settings.JSON": true, "pkg/Agents.MD": true, "a/b/.MCP.json": true, ".CODEX/config.TOML": true,
+		"settings.json": false, "config.toml": false, "claude/settings.json": false, ".claude/settings.json.bak": false,
+		"docs/claude.md.txt": false, "codex/config.toml": false, ".gemini/settings.json/x": false,
+	} {
+		if got := isSensitive(p); got != want {
+			t.Errorf("isSensitive(%q) = %v, want %v", p, got, want)
+		}
 	}
 }
 

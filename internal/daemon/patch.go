@@ -636,8 +636,9 @@ func summarize(patch []byte) api.DiffSummary {
 // isSensitive reports whether a path steers the next run or host automation: git's own trust inputs (.gitignore,
 // .gitattributes, .gitmodules), tkbox.yaml, files tools run on the host (.husky/, .github/workflows/,
 // .github/actions/, .circleci/, .devcontainer/, .gitlab-ci.yml, .envrc, .pre-commit-config.yaml, lefthook.yml,
-// .vscode/tasks.json, .cargo/config.toml, .yarnrc.yml), and credential files (.npmrc, .netrc, *.pem, *.key, …: the
-// ones a workspace never copies into a box). Case-insensitive, at any depth.
+// .vscode/tasks.json, .cargo/config.toml, .yarnrc.yml), coding agents' config (CLAUDE.md, AGENTS.md, .mcp.json,
+// .claude/settings.json, .codex/config.toml, .gemini/settings.json, .vscode/settings.json), and credential files
+// (.npmrc, .netrc, *.pem, *.key, …: the ones a workspace never copies into a box). Case-insensitive, at any depth.
 func isSensitive(p string) bool {
 	if image.IsCredentialPath(p) {
 		return true
@@ -646,7 +647,8 @@ func isSensitive(p string) bool {
 	switch path.Base(lower) {
 	case ".gitignore", ".gitattributes", ".gitmodules", "tkbox.yaml", "tkbox.yml", ".envrc", ".pre-commit-config.yaml",
 		".pre-commit-config.yml", ".gitlab-ci.yml", ".gitlab-ci.yaml", ".yarnrc.yml", ".yarnrc.yaml", ".yarnrc",
-		"lefthook.yml", "lefthook.yaml", ".lefthook.yml", ".lefthook.yaml", "lefthook-local.yml", "lefthook-local.yaml":
+		"lefthook.yml", "lefthook.yaml", ".lefthook.yml", ".lefthook.yaml", "lefthook-local.yml", "lefthook-local.yaml",
+		"claude.md", "agents.md", ".mcp.json":
 		return true
 	}
 	comps := strings.Split(lower, "/")
@@ -660,10 +662,9 @@ func isSensitive(p string) bool {
 			return true
 		}
 		if i+1 == len(comps)-1 {
-			if c == ".vscode" && next == "tasks.json" {
-				return true
-			}
-			if c == ".cargo" && (next == "config.toml" || next == "config") {
+			switch c + "/" + next {
+			case ".vscode/tasks.json", ".vscode/settings.json", ".cargo/config.toml", ".cargo/config", ".claude/settings.json",
+				".claude/settings.local.json", ".codex/config.toml", ".gemini/settings.json":
 				return true
 			}
 		}
