@@ -546,6 +546,38 @@ func TestMustRecordFloodRecordsGap(t *testing.T) {
 	}
 }
 
+// S7: egress refusals Box made itself that the signer refuses, one by one or in a summary, are counted in tkbox.gap
+// (kind tkbox.egress), without stopping the box.
+func TestEgressRefusalsRefusedRecordGap(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.d.opts.Tracekit = &failingClient{Client: e.tk, fail: map[string]bool{tracekit.SourceEgress: true}}
+	e.create(api.CreateBoxRequest{Name: "r"})
+	sink := e.proxy(0).cfg.Sink
+	const n = 200 // past bulkRate: most go into a summary
+	for range n {
+		sink.Emit(egress.Event{Kind: egress.EventDenied, Host: "x.example", Port: 443, Reason: "off the allowlist"})
+	}
+	e.d.Stop(context.Background(), "r", api.StopRequest{})
+	if v, _ := e.d.Get("r"); strings.Contains(v.StopReason, "could not record") {
+		t.Fatalf("box %+v", v)
+	}
+	if got := gapsOf(e, 0, tracekit.SourceEgress); got != n {
+		t.Fatalf("%d refusals in tkbox.gap, want %d", got, n)
+	}
+}
+
+// S7: an egress refusal that arrives while the run is closing is counted in tkbox.gap.
+func TestEgressRefusalWhileClosingRecordsGap(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.create(api.CreateBoxRequest{Name: "c"})
+	e.box("c").flushObserver(context.Background()) // what a stopping box does first
+	e.proxy(0).cfg.Sink.Emit(egress.Event{Kind: egress.EventDenied, Host: "x.example", Port: 443, Reason: "off the allowlist"})
+	e.d.Stop(context.Background(), "c", api.StopRequest{})
+	if got := gapsOf(e, 0, tracekit.SourceEgress); got != 1 {
+		t.Fatalf("%d refusals in tkbox.gap, want 1", got)
+	}
+}
+
 type failingClient struct {
 	tracekit.Client
 	fail map[string]bool
