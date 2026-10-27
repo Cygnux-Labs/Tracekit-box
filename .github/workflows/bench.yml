@@ -1,0 +1,47 @@
+name: bench
+# The README's numbers (dev/bench.sh) on a host anyone can reproduce: a GitHub-hosted ubuntu-latest runner, set up as
+# the e2e job in ci.yml. The full output is in the log and in the bench artifact.
+on:
+  workflow_dispatch:
+  push:
+    branches: [bench-ci]
+    paths: [dev/bench.sh, .github/workflows/bench.yml]
+permissions:
+  contents: read
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Enable KVM for the runner user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo timeout 30 udevadm trigger --settle --name-match=kvm  # --settle has no timeout of its own
+          ls -l /dev/kvm
+      - name: Install e2fsprogs and the Tracekit 1.4.2 signer
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q e2fsprogs
+          python -m pip install -q tracekit-ai==1.4.2
+          tracekit init --dev --v2 --no-hooks
+          tracekit up --wait
+      - name: Run dev/bench.sh
+        shell: bash # -o pipefail, so a failing bench fails the step through tee
+        run: dev/bench.sh 2>&1 | tee /tmp/tkbox-bench.txt
+      # bench.sh keeps its daemons' logs under /tmp/tkbox-bench.* only when it fails
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench
+          path: |
+            /tmp/tkbox-bench.txt
+            /tmp/tkbox-bench.*/*.log
