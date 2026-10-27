@@ -7,7 +7,7 @@ GOARCH    ?= $(shell $(GO) env GOARCH)
 BIN       := bin
 FUZZTIME  ?= 60s
 
-.PHONY: all build guest host linux test race lint fuzz runs e2e clean
+.PHONY: all build guest host linux test race lint fuzz runs e2e bench clean
 
 all: build
 
@@ -66,6 +66,10 @@ runs:
 # end-to-end on a Linux host with /dev/kvm, mkfs.ext4 and a running Tracekit 1.4.2 signer (see docs/development.md)
 e2e: build
 	TKBOX_BIN=$(abspath $(BIN)) $(GO) test -tags e2e -count=1 -timeout 30m -v ./e2e/...
+
+# the README's numbers: box start, per-command overhead and a fuzz pass, with the conditions (on a Mac, in the Lima VM)
+bench:
+	FUZZTIME=$(FUZZTIME) dev/bench.sh
 
 clean:
 	rm -rf $(BIN)
