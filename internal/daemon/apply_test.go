@@ -172,8 +172,9 @@ func TestApply(t *testing.T) {
 
 // The config and instruction files coding agents read when they next run on the host, and anything under their
 // config dirs (.claude/, .opencode/, .cursor/, .kilocode/), need --allow-sensitive, in any directory and any case
-// (as a case-insensitive APFS checkout folds it: U+017F is s), and so does a symlink in a sensitive dir's place. The host's
-// global git excludes (which often list .claude/settings.local.json) are kept out.
+// (as a case-insensitive APFS checkout folds it: U+017F is s; and with the code points HFS+ ignores, such as U+FEFF), and
+// so does a symlink in a sensitive dir's place. The host's global git excludes (which often list
+// .claude/settings.local.json) are kept out.
 func TestApplyAgentConfigNeedsAllowSensitive(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -259,6 +260,10 @@ func TestApplyAgentConfigNeedsAllowSensitive(t *testing.T) {
 		"AGENT\u017f.md": true, ".cur\u017for/rules/r.mdc": true, ".hu\u017fky/pre-commit": true, ".mcp.j\u017fon": true,
 		".github/copilot-in\ufb06ructions.md": true, ".cargo/con\ufb01g.toml": true, ".pre-commit-con\ufb01g.yaml": true,
 		".\u00dfh/config": true, ".\u1e9eh/config": true, "deploy/id_r\u017fa": true,
+		".cl\u200caude/x": true, "AGENTS\ufeff.md": true, ".git\u200dhub/workflows/ci.yml": true, "CLAUDE\u200e.md": true,
+		"\u200f.envrc": true, ".mcp\u202a.json": true, ".hu\u202bsky/pre-commit": true, "\u202c.npmrc": true,
+		"tkbox\u202d.yaml": true, ".gitignore\u202e": true, ".cur\u206asor/rules/r.mdc": true, ".vscode/tasks\u206f.json": true,
+		".\u206dssh/config": true, "AGENT\u200c\u017f.md": true, "\u200cclaude/x": false, "AGENTS\ufeff.md.txt": false,
 		"Web/.Claude/Settings.JSON": true, "pkg/Agents.MD": true, "a/b/.MCP.json": true, ".CODEX/config.TOML": true,
 		".claude/settings.json.bak": true, "a/.OpenCode/Plugin/p.ts": true, ".Cursor/rules/r.mdc": true,
 		"x/.KiloCode/r.md": true, "web/.clinerules/r.md": true, "pkg/Gemini.MD": true, "Claude.Local.MD": true,

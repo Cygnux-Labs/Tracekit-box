@@ -451,15 +451,17 @@ func checkRelPath(p string) error {
 // gitLike reports whether a path component is, or on some file system resolves to, .git: any case, trailing dots and
 // spaces (NTFS), code points HFS+ ignores when it compares names, and the NTFS short name GIT~1.
 func gitLike(c string) bool {
-	c = strings.Map(func(r rune) rune {
-		switch {
-		case r == 0x200b, r >= 0x200c && r <= 0x200f, r >= 0x202a && r <= 0x202e, r >= 0x206a && r <= 0x206f, r == 0xfeff:
-			return -1
-		}
-		return r
-	}, c)
-	c = strings.TrimRight(c, ". ")
+	c = strings.TrimRight(strings.Map(hfsIgnored, c), ". ")
 	return strings.EqualFold(c, ".git") || strings.EqualFold(c, "git~1")
+}
+
+// hfsIgnored drops, for strings.Map, the code points HFS+ ignores when it compares names (and U+200B).
+func hfsIgnored(r rune) rune {
+	switch {
+	case r == 0x200b, r >= 0x200c && r <= 0x200f, r >= 0x202a && r <= 0x202e, r >= 0x206a && r <= 0x206f, r == 0xfeff:
+		return -1
+	}
+	return r
 }
 
 // checkPatch validates every path of a parsed patch against dir and returns the paths it writes (sorted, unique).
@@ -645,11 +647,11 @@ var apfsFold = strings.NewReplacer("\u017f", "s", "\u00df", "ss", "\ufb00", "ff"
 // .opencode/, .cursor/, .kilocode/, .clinerules/, CLAUDE.md, CLAUDE.local.md, AGENTS.md, GEMINI.md, .mcp.json,
 // opencode.json, opencode.jsonc, .cursorrules, .windsurfrules, .clinerules, .goosehints,
 // .github/copilot-instructions.md, .codex/config.toml, .gemini/settings.json, .vscode/settings.json), and credential
-// files (.npmrc, .netrc, *.pem, *.key, …: the ones a workspace never copies into a box). At any depth, and with the
-// case folding of a case-insensitive APFS checkout (a Lima mount of a Mac dir). A path that is one of those dirs (a
-// symlink in its place) is sensitive too.
+// files (.npmrc, .netrc, *.pem, *.key, …: the ones a workspace never copies into a box). At any depth, with the
+// case folding of a case-insensitive APFS checkout (a Lima mount of a Mac dir), and without the code points a
+// case-insensitive HFS+ checkout ignores. A path that is one of those dirs (a symlink in its place) is sensitive too.
 func isSensitive(p string) bool {
-	lower := apfsFold.Replace(strings.ToLower(p))
+	lower := apfsFold.Replace(strings.ToLower(strings.Map(hfsIgnored, p)))
 	if image.IsCredentialPath(lower) {
 		return true
 	}
