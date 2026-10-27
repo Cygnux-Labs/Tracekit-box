@@ -170,8 +170,9 @@ func TestApply(t *testing.T) {
 	}
 }
 
-// The config files coding agents read when they next run on the host need --allow-sensitive, in any directory and
-// any case. The host's global git excludes (which often list .claude/settings.local.json) are kept out.
+// The config and instruction files coding agents read when they next run on the host, and anything under their
+// config dirs (.claude/, .opencode/, .cursor/, .kilocode/), need --allow-sensitive, in any directory and any case.
+// The host's global git excludes (which often list .claude/settings.local.json) are kept out.
 func TestApplyAgentConfigNeedsAllowSensitive(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -192,7 +193,10 @@ func TestApplyAgentConfigNeedsAllowSensitive(t *testing.T) {
 		return name
 	}
 	for _, f := range []string{".claude/settings.json", ".claude/settings.local.json", ".mcp.json", "CLAUDE.md", "AGENTS.md",
-		".codex/config.toml", ".gemini/settings.json", ".vscode/settings.json", ".vscode/tasks.json"} {
+		".codex/config.toml", ".gemini/settings.json", ".vscode/settings.json", ".vscode/tasks.json",
+		".claude/commands/review.md", ".claude/hooks/pre.sh", ".claude/skills/x/SKILL.md", ".opencode/plugin/p.ts",
+		".cursor/rules/r.mdc", ".kilocode/rules/r.md", "CLAUDE.local.md", "GEMINI.md", "opencode.json", "opencode.jsonc",
+		".cursorrules", ".windsurfrules", ".clinerules", ".goosehints", ".github/copilot-instructions.md"} {
 		for _, p := range []string{f, "svc/api/" + f} {
 			name := box(p)
 			if _, err := e.d.Apply(ctx, name, api.ApplyRequest{}); errCode(err) != api.CodeBadRequest ||
@@ -209,15 +213,22 @@ func TestApplyAgentConfigNeedsAllowSensitive(t *testing.T) {
 			}
 		}
 	}
-	name := box("docs/settings.json.md")
-	if res, err := e.d.Apply(ctx, name, api.ApplyRequest{}); err != nil || len(res.Sensitive) != 0 ||
-		readFile(t, filepath.Join(ws, "docs", "settings.json.md")) != "steer\n" {
-		t.Fatalf("an unrelated file: %+v %v", res, err)
+	for _, p := range []string{"docs/settings.json.md", "docs/claude.md.txt", "src/opencode.json.bak", "claude/commands/x.md",
+		"docs/cursor/rules.md", "copilot-instructions.md"} {
+		name := box(p)
+		if res, err := e.d.Apply(ctx, name, api.ApplyRequest{}); err != nil || len(res.Sensitive) != 0 ||
+			readFile(t, filepath.Join(ws, p)) != "steer\n" {
+			t.Fatalf("an unrelated file %s: %+v %v", p, res, err)
+		}
 	}
 	for p, want := range map[string]bool{
 		"Web/.Claude/Settings.JSON": true, "pkg/Agents.MD": true, "a/b/.MCP.json": true, ".CODEX/config.TOML": true,
-		"settings.json": false, "config.toml": false, "claude/settings.json": false, ".claude/settings.json.bak": false,
-		"docs/claude.md.txt": false, "codex/config.toml": false, ".gemini/settings.json/x": false,
+		".claude/settings.json.bak": true, "a/.OpenCode/Plugin/p.ts": true, ".Cursor/rules/r.mdc": true,
+		"x/.KiloCode/r.md": true, "web/.clinerules/r.md": true, "pkg/Gemini.MD": true, "Claude.Local.MD": true,
+		"svc/.GitHub/Copilot-Instructions.md": true, "OpenCode.JSONC": true, "a/.GooseHints": true,
+		"settings.json": false, "config.toml": false, "claude/settings.json": false, "docs/claude.md.txt": false,
+		"codex/config.toml": false, ".gemini/settings.json/x": false, "src/opencode.json.bak": false, "opencode/p.ts": false,
+		".github/copilot-instructions.md.bak": false, "docs/.cursorrules.txt": false,
 	} {
 		if got := isSensitive(p); got != want {
 			t.Errorf("isSensitive(%q) = %v, want %v", p, got, want)

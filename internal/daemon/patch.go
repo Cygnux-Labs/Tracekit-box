@@ -636,9 +636,12 @@ func summarize(patch []byte) api.DiffSummary {
 // isSensitive reports whether a path steers the next run or host automation: git's own trust inputs (.gitignore,
 // .gitattributes, .gitmodules), tkbox.yaml, files tools run on the host (.husky/, .github/workflows/,
 // .github/actions/, .circleci/, .devcontainer/, .gitlab-ci.yml, .envrc, .pre-commit-config.yaml, lefthook.yml,
-// .vscode/tasks.json, .cargo/config.toml, .yarnrc.yml), coding agents' config (CLAUDE.md, AGENTS.md, .mcp.json,
-// .claude/settings.json, .codex/config.toml, .gemini/settings.json, .vscode/settings.json), and credential files
-// (.npmrc, .netrc, *.pem, *.key, …: the ones a workspace never copies into a box). Case-insensitive, at any depth.
+// .vscode/tasks.json, .cargo/config.toml, .yarnrc.yml), coding agents' config and instructions (.claude/,
+// .opencode/, .cursor/, .kilocode/, .clinerules/, CLAUDE.md, CLAUDE.local.md, AGENTS.md, GEMINI.md, .mcp.json,
+// opencode.json, opencode.jsonc, .cursorrules, .windsurfrules, .clinerules, .goosehints,
+// .github/copilot-instructions.md, .codex/config.toml, .gemini/settings.json, .vscode/settings.json), and credential
+// files (.npmrc, .netrc, *.pem, *.key, …: the ones a workspace never copies into a box). Case-insensitive, at any
+// depth.
 func isSensitive(p string) bool {
 	if image.IsCredentialPath(p) {
 		return true
@@ -648,13 +651,14 @@ func isSensitive(p string) bool {
 	case ".gitignore", ".gitattributes", ".gitmodules", "tkbox.yaml", "tkbox.yml", ".envrc", ".pre-commit-config.yaml",
 		".pre-commit-config.yml", ".gitlab-ci.yml", ".gitlab-ci.yaml", ".yarnrc.yml", ".yarnrc.yaml", ".yarnrc",
 		"lefthook.yml", "lefthook.yaml", ".lefthook.yml", ".lefthook.yaml", "lefthook-local.yml", "lefthook-local.yaml",
-		"claude.md", "agents.md", ".mcp.json":
+		"claude.md", "claude.local.md", "agents.md", "gemini.md", ".mcp.json", "opencode.json", "opencode.jsonc",
+		".cursorrules", ".windsurfrules", ".clinerules", ".goosehints":
 		return true
 	}
 	comps := strings.Split(lower, "/")
 	for i, c := range comps[:len(comps)-1] {
 		switch c {
-		case ".husky", ".circleci", ".devcontainer":
+		case ".husky", ".circleci", ".devcontainer", ".claude", ".opencode", ".cursor", ".kilocode", ".clinerules":
 			return true
 		}
 		next := comps[i+1]
@@ -663,8 +667,8 @@ func isSensitive(p string) bool {
 		}
 		if i+1 == len(comps)-1 {
 			switch c + "/" + next {
-			case ".vscode/tasks.json", ".vscode/settings.json", ".cargo/config.toml", ".cargo/config", ".claude/settings.json",
-				".claude/settings.local.json", ".codex/config.toml", ".gemini/settings.json":
+			case ".vscode/tasks.json", ".vscode/settings.json", ".cargo/config.toml", ".cargo/config", ".codex/config.toml",
+				".gemini/settings.json", ".github/copilot-instructions.md":
 				return true
 			}
 		}
