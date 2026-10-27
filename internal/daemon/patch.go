@@ -451,15 +451,17 @@ func checkRelPath(p string) error {
 // gitLike reports whether a path component is, or on some file system resolves to, .git: any case, trailing dots and
 // spaces (NTFS), code points HFS+ ignores when it compares names, and the NTFS short name GIT~1.
 func gitLike(c string) bool {
-	c = strings.Map(func(r rune) rune {
-		switch {
-		case r == 0x200b, r >= 0x200c && r <= 0x200f, r >= 0x202a && r <= 0x202e, r >= 0x206a && r <= 0x206f, r == 0xfeff:
-			return -1
-		}
-		return r
-	}, c)
-	c = strings.TrimRight(c, ". ")
+	c = strings.TrimRight(strings.Map(hfsIgnored, c), ". ")
 	return strings.EqualFold(c, ".git") || strings.EqualFold(c, "git~1")
+}
+
+// hfsIgnored drops, for strings.Map, the code points HFS+ ignores when it compares names (and U+200B).
+func hfsIgnored(r rune) rune {
+	switch {
+	case r == 0x200b, r >= 0x200c && r <= 0x200f, r >= 0x202a && r <= 0x202e, r >= 0x206a && r <= 0x206f, r == 0xfeff:
+		return -1
+	}
+	return r
 }
 
 // checkPatch validates every path of a parsed patch against dir and returns the paths it writes (sorted, unique).
@@ -633,37 +635,50 @@ func summarize(patch []byte) api.DiffSummary {
 	return sum
 }
 
+// apfsFold maps what APFS's case folding turns into ASCII letters and strings.ToLower leaves alone: long s (U+017F),
+// sharp s (U+00DF; ToLower maps U+1E9E to it) and the Latin ligatures U+FB00..U+FB06. ToLower maps the Kelvin sign.
+var apfsFold = strings.NewReplacer("\u017f", "s", "\u00df", "ss", "\ufb00", "ff", "\ufb01", "fi", "\ufb02", "fl",
+	"\ufb03", "ffi", "\ufb04", "ffl", "\ufb05", "st", "\ufb06", "st")
+
 // isSensitive reports whether a path steers the next run or host automation: git's own trust inputs (.gitignore,
 // .gitattributes, .gitmodules), tkbox.yaml, files tools run on the host (.husky/, .github/workflows/,
 // .github/actions/, .circleci/, .devcontainer/, .gitlab-ci.yml, .envrc, .pre-commit-config.yaml, lefthook.yml,
-// .vscode/tasks.json, .cargo/config.toml, .yarnrc.yml), and credential files (.npmrc, .netrc, *.pem, *.key, …: the
-// ones a workspace never copies into a box). Case-insensitive, at any depth.
+// .vscode/tasks.json, .cargo/config.toml, .yarnrc.yml), coding agents' config and instructions (.claude/,
+// .opencode/, .cursor/, .kilocode/, .clinerules/, CLAUDE.md, CLAUDE.local.md, AGENTS.md, GEMINI.md, .mcp.json,
+// opencode.json, opencode.jsonc, .cursorrules, .windsurfrules, .clinerules, .goosehints,
+// .github/copilot-instructions.md, .codex/config.toml, .gemini/settings.json, .vscode/settings.json), and credential
+// files (.npmrc, .netrc, *.pem, *.key, …: the ones a workspace never copies into a box). At any depth, with the
+// case folding of a case-insensitive APFS checkout (a Lima mount of a Mac dir), and without the code points a
+// case-insensitive HFS+ checkout ignores. A path that is one of those dirs (a symlink in its place) is sensitive too.
 func isSensitive(p string) bool {
-	if image.IsCredentialPath(p) {
+	lower := apfsFold.Replace(strings.ToLower(strings.Map(hfsIgnored, p)))
+	if image.IsCredentialPath(lower) {
 		return true
 	}
-	lower := strings.ToLower(p)
 	switch path.Base(lower) {
 	case ".gitignore", ".gitattributes", ".gitmodules", "tkbox.yaml", "tkbox.yml", ".envrc", ".pre-commit-config.yaml",
 		".pre-commit-config.yml", ".gitlab-ci.yml", ".gitlab-ci.yaml", ".yarnrc.yml", ".yarnrc.yaml", ".yarnrc",
-		"lefthook.yml", "lefthook.yaml", ".lefthook.yml", ".lefthook.yaml", "lefthook-local.yml", "lefthook-local.yaml":
+		"lefthook.yml", "lefthook.yaml", ".lefthook.yml", ".lefthook.yaml", "lefthook-local.yml", "lefthook-local.yaml",
+		"claude.md", "claude.local.md", "agents.md", "gemini.md", ".mcp.json", "opencode.json", "opencode.jsonc",
+		".cursorrules", ".windsurfrules", ".clinerules", ".goosehints",
+		".husky", ".circleci", ".devcontainer", ".claude", ".opencode", ".cursor", ".kilocode", ".vscode", ".cargo", ".codex",
+		".gemini", ".github":
 		return true
 	}
 	comps := strings.Split(lower, "/")
 	for i, c := range comps[:len(comps)-1] {
 		switch c {
-		case ".husky", ".circleci", ".devcontainer":
+		case ".husky", ".circleci", ".devcontainer", ".claude", ".opencode", ".cursor", ".kilocode", ".clinerules":
 			return true
 		}
 		next := comps[i+1]
-		if c == ".github" && i+1 < len(comps)-1 && (next == "workflows" || next == "actions") {
+		if c == ".github" && (next == "workflows" || next == "actions") {
 			return true
 		}
 		if i+1 == len(comps)-1 {
-			if c == ".vscode" && next == "tasks.json" {
-				return true
-			}
-			if c == ".cargo" && (next == "config.toml" || next == "config") {
+			switch c + "/" + next {
+			case ".vscode/tasks.json", ".vscode/settings.json", ".cargo/config.toml", ".cargo/config", ".codex/config.toml",
+				".gemini/settings.json", ".github/copilot-instructions.md":
 				return true
 			}
 		}
