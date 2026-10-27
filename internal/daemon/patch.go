@@ -633,6 +633,11 @@ func summarize(patch []byte) api.DiffSummary {
 	return sum
 }
 
+// apfsFold maps what APFS's case folding turns into ASCII letters and strings.ToLower leaves alone: long s (U+017F),
+// sharp s (U+00DF; ToLower maps U+1E9E to it) and the Latin ligatures U+FB00..U+FB06. ToLower maps the Kelvin sign.
+var apfsFold = strings.NewReplacer("\u017f", "s", "\u00df", "ss", "\ufb00", "ff", "\ufb01", "fi", "\ufb02", "fl",
+	"\ufb03", "ffi", "\ufb04", "ffl", "\ufb05", "st", "\ufb06", "st")
+
 // isSensitive reports whether a path steers the next run or host automation: git's own trust inputs (.gitignore,
 // .gitattributes, .gitmodules), tkbox.yaml, files tools run on the host (.husky/, .github/workflows/,
 // .github/actions/, .circleci/, .devcontainer/, .gitlab-ci.yml, .envrc, .pre-commit-config.yaml, lefthook.yml,
@@ -640,19 +645,22 @@ func summarize(patch []byte) api.DiffSummary {
 // .opencode/, .cursor/, .kilocode/, .clinerules/, CLAUDE.md, CLAUDE.local.md, AGENTS.md, GEMINI.md, .mcp.json,
 // opencode.json, opencode.jsonc, .cursorrules, .windsurfrules, .clinerules, .goosehints,
 // .github/copilot-instructions.md, .codex/config.toml, .gemini/settings.json, .vscode/settings.json), and credential
-// files (.npmrc, .netrc, *.pem, *.key, …: the ones a workspace never copies into a box). Case-insensitive, at any
-// depth.
+// files (.npmrc, .netrc, *.pem, *.key, …: the ones a workspace never copies into a box). At any depth, and with the
+// case folding of a case-insensitive APFS checkout (a Lima mount of a Mac dir). A path that is one of those dirs (a
+// symlink in its place) is sensitive too.
 func isSensitive(p string) bool {
-	if image.IsCredentialPath(p) {
+	lower := apfsFold.Replace(strings.ToLower(p))
+	if image.IsCredentialPath(lower) {
 		return true
 	}
-	lower := strings.ToLower(p)
 	switch path.Base(lower) {
 	case ".gitignore", ".gitattributes", ".gitmodules", "tkbox.yaml", "tkbox.yml", ".envrc", ".pre-commit-config.yaml",
 		".pre-commit-config.yml", ".gitlab-ci.yml", ".gitlab-ci.yaml", ".yarnrc.yml", ".yarnrc.yaml", ".yarnrc",
 		"lefthook.yml", "lefthook.yaml", ".lefthook.yml", ".lefthook.yaml", "lefthook-local.yml", "lefthook-local.yaml",
 		"claude.md", "claude.local.md", "agents.md", "gemini.md", ".mcp.json", "opencode.json", "opencode.jsonc",
-		".cursorrules", ".windsurfrules", ".clinerules", ".goosehints":
+		".cursorrules", ".windsurfrules", ".clinerules", ".goosehints",
+		".husky", ".circleci", ".devcontainer", ".claude", ".opencode", ".cursor", ".kilocode", ".vscode", ".cargo", ".codex",
+		".gemini", ".github":
 		return true
 	}
 	comps := strings.Split(lower, "/")
@@ -662,7 +670,7 @@ func isSensitive(p string) bool {
 			return true
 		}
 		next := comps[i+1]
-		if c == ".github" && i+1 < len(comps)-1 && (next == "workflows" || next == "actions") {
+		if c == ".github" && (next == "workflows" || next == "actions") {
 			return true
 		}
 		if i+1 == len(comps)-1 {

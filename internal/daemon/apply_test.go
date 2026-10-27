@@ -171,8 +171,9 @@ func TestApply(t *testing.T) {
 }
 
 // The config and instruction files coding agents read when they next run on the host, and anything under their
-// config dirs (.claude/, .opencode/, .cursor/, .kilocode/), need --allow-sensitive, in any directory and any case.
-// The host's global git excludes (which often list .claude/settings.local.json) are kept out.
+// config dirs (.claude/, .opencode/, .cursor/, .kilocode/), need --allow-sensitive, in any directory and any case
+// (as a case-insensitive APFS checkout folds it: U+017F is s), and so does a symlink in a sensitive dir's place. The host's
+// global git excludes (which often list .claude/settings.local.json) are kept out.
 func TestApplyAgentConfigNeedsAllowSensitive(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -182,16 +183,20 @@ func TestApplyAgentConfigNeedsAllowSensitive(t *testing.T) {
 	gitInit(t, ws)
 	ctx := context.Background()
 	n := 0
-	box := func(p string) string {
+	newFile := func(p string) string {
+		return "diff --git a/" + p + " b/" + p + "\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/" + p +
+			"\n@@ -0,0 +1 @@\n+steer\n"
+	}
+	boxIn := func(ws, patch string) string {
 		t.Helper()
 		n++
 		name := fmt.Sprintf("b%d", n)
-		e.guest.Patch = "diff --git a/" + p + " b/" + p + "\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/" + p +
-			"\n@@ -0,0 +1 @@\n+steer\n"
+		e.guest.Patch = patch
 		e.create(api.CreateBoxRequest{Name: name, Workspace: ws})
 		e.d.Stop(ctx, name, api.StopRequest{})
 		return name
 	}
+	box := func(p string) string { return boxIn(ws, newFile(p)) }
 	for _, f := range []string{".claude/settings.json", ".claude/settings.local.json", ".mcp.json", "CLAUDE.md", "AGENTS.md",
 		".codex/config.toml", ".gemini/settings.json", ".vscode/settings.json", ".vscode/tasks.json",
 		".claude/commands/review.md", ".claude/hooks/pre.sh", ".claude/skills/x/SKILL.md", ".opencode/plugin/p.ts",
@@ -221,7 +226,39 @@ func TestApplyAgentConfigNeedsAllowSensitive(t *testing.T) {
 			t.Fatalf("an unrelated file %s: %+v %v", p, res, err)
 		}
 	}
+	// a symlink in a sensitive dir's place, plus a file where it points: the link is the sensitive path
+	links := t.TempDir()
+	gitInit(t, links)
+	for i, c := range []struct{ link, file string }{
+		{".claude", "settings.json"}, {"web/.claude", "settings.json"}, {".opencode", "plugin/p.ts"}, {".cursor", "rules/r.mdc"},
+		{".kilocode", "rules/r.md"}, {".husky", "pre-commit"}, {".vscode", "tasks.json"}, {".github/workflows", "ci.yml"},
+		{"svc/.github", "workflows/ci.yml"},
+	} {
+		cfg := fmt.Sprintf("cfg%d", i)
+		name := boxIn(links, "diff --git a/"+c.link+" b/"+c.link+"\nnew file mode 120000\nindex 0000000..1111111\n--- /dev/null\n+++ b/"+
+			c.link+"\n@@ -0,0 +1 @@\n+"+strings.Repeat("../", strings.Count(c.link, "/"))+cfg+"\n\\ No newline at end of file\n"+
+			newFile(cfg+"/"+c.file))
+		if _, err := e.d.Apply(ctx, name, api.ApplyRequest{}); errCode(err) != api.CodeBadRequest ||
+			!strings.Contains(err.Error(), "steer the next run or host automation: "+c.link) {
+			t.Errorf("link %s without --allow-sensitive: %v", c.link, err)
+		}
+		for _, p := range []string{c.link, cfg} {
+			if _, err := os.Lstat(filepath.Join(links, p)); !os.IsNotExist(err) {
+				t.Fatalf("%s written although refused", p)
+			}
+		}
+		res, err := e.d.Apply(ctx, name, api.ApplyRequest{AllowSensitive: true})
+		if err != nil || !slices.Equal(res.Sensitive, []string{c.link}) || readFile(t, filepath.Join(links, c.link, c.file)) != "steer\n" {
+			t.Errorf("link %s with --allow-sensitive: %+v %v", c.link, res, err)
+		}
+	}
 	for p, want := range map[string]bool{
+		".claude": true, "a/.cursor": true, ".github": true, ".github/workflows": true, ".github/actions": true,
+		".vscode": true, "x/.cargo": true, ".codex": true, ".gemini": true, ".husky": true, ".devcontainer": true,
+		".claude-old": false, "claude": false, ".github/x": false,
+		"AGENT\u017f.md": true, ".cur\u017for/rules/r.mdc": true, ".hu\u017fky/pre-commit": true, ".mcp.j\u017fon": true,
+		".github/copilot-in\ufb06ructions.md": true, ".cargo/con\ufb01g.toml": true, ".pre-commit-con\ufb01g.yaml": true,
+		".\u00dfh/config": true, ".\u1e9eh/config": true, "deploy/id_r\u017fa": true,
 		"Web/.Claude/Settings.JSON": true, "pkg/Agents.MD": true, "a/b/.MCP.json": true, ".CODEX/config.TOML": true,
 		".claude/settings.json.bak": true, "a/.OpenCode/Plugin/p.ts": true, ".Cursor/rules/r.mdc": true,
 		"x/.KiloCode/r.md": true, "web/.clinerules/r.md": true, "pkg/Gemini.MD": true, "Claude.Local.MD": true,
