@@ -63,6 +63,7 @@ its trust file and the patch as an artifact. Its signer is a dev signer made in 
 - [README](https://github.com/Cygnux-Labs/tracekit-box#readme): what it stops, the doors, the demo
 - [CLI reference](https://github.com/Cygnux-Labs/tracekit-box/blob/main/docs/cli.md): every command and flag
 - [Config](https://github.com/Cygnux-Labs/tracekit-box/blob/main/docs/config.md): tkbox.yaml, presets, secrets
+- [Integration](https://github.com/Cygnux-Labs/tracekit-box/blob/main/docs/integration.md): the v1 contract a host program drives Box through
 - [Security model](https://github.com/Cygnux-Labs/tracekit-box/blob/main/SECURITY.md): what Box guarantees and what it does not
 - [Limits](https://github.com/Cygnux-Labs/tracekit-box/blob/main/docs/limits.md): every limit and what to do about it
 - [Agent Skill](https://github.com/Cygnux-Labs/tracekit-box/blob/main/skills/tracekit-box/SKILL.md): running a job in Box, step by step

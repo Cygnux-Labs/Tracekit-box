@@ -269,6 +269,7 @@ Install it from a checkout with `pip install ./sdk/python`.
 | [docs/config.md](docs/config.md) | `tkbox.yaml` reference |
 | [docs/limits.md](docs/limits.md) | Every limit, what Box says when you hit it and what to do |
 | [docs/architecture.md](docs/architecture.md) | Trust domains, doors, protocols, disks |
+| [docs/integration.md](docs/integration.md) | The v1 contract a host program drives Box through: operations, errors, what is signed where |
 | [docs/development.md](docs/development.md) | Building, the Lima dev VM, unit and end-to-end tests |
 | [SECURITY.md](SECURITY.md) | Threat model, guarantees, how to report a vulnerability |
 | [examples/](examples) | `tkbox.yaml`, the demo script, a workflow that opens a fix PR |
