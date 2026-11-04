@@ -69,9 +69,28 @@ The signer sees every channel frame from the daemon's identity (its uid), as it 
   key nor the store is in the VM.
 - That an agent run belongs to a box is its `parent_run` link to the box's run, which only a holder of the box run's
   token can make: the daemon, never the agent.
-- **Open question for review:** whether the signer should record a box run's agent runs with their own isolation
-  value, as Tracekit's pull request #601 proposes for its container boxes (`ext.box`), so a verifier can say "proof
-  against the boxed agent" without reading the run tree. That is a Tracekit format question, decided there.
+
+### The box label (decided)
+
+A box's agent runs get their own label in the record, and the signer establishes it; the agent never does.
+
+- **Who may ask for it.** The signer's config names each Box daemon's identity and its engine (Tracekit side, a new
+  setting such as `box_daemons: {"uid:1001": firecracker}`). Only such an identity, on its own authenticated
+  connection, registering a run whose `parent` is one of its own runs (the box's run), may send the box descriptor
+  with `register_run` (Tracekit side, a new RPC field and contract version). A `register_run` from any other identity
+  that carries it is refused.
+- **What the signer writes.** On the child run's `run.registered`, the signer writes `ext.box` itself: the box id, the
+  image digest, the allowlist's names, the engine from its own config (never from the request: `firecracker`, a
+  micro-VM) and `channel: "agent"`. The daemon fills the descriptor from what it created the box with, the same values
+  as the box run's trusted `tkbox.box` observe, so a verifier with both runs can check that they agree.
+- **What the agent can't do.** The channel refuses any `register_run` from the agent that carries a box descriptor or
+  an `ext` field, and the signer refuses `ext` in any request: the label exists only because the daemon asked over its
+  own connection and the signer's config names that daemon.
+- **What verify says.** For a run with this `ext.box`: `PROOF AGAINST THE BOXED AGENT (micro-VM): the signing key was
+  outside its box for this run`, then `Before you run anything the box wrote, review it: code you run on this machine
+  can reach the key.`, and, when a witness cosigned the checkpoint, `anchored by <witness> at <time>`. Never a general
+  "proof against the agent": anything running as the daemon's or the signer's user on the host is outside the claim.
+  These are the lines Tracekit's pull request #601 uses for its Docker boxes, with the engine named.
 
 ## The Claude Code image
 
@@ -91,7 +110,8 @@ copy, and its changes go out only through `apply`.
 | `internal/api` | `agent_channel` in `CreateBoxRequest` and `Box` |
 | `internal/proto` | port 1027; the guest end's boot config |
 | `cmd/tkbox-guest`, `internal/guest` | the socket and the relay |
-| `internal/daemon` | the scoping proxy: method allowlist, run binding, parent rewrite, limits, counts |
-| `internal/tracekit` | a raw frame call for the proxy (protocol 19) |
+| `internal/daemon` | the scoping proxy: method allowlist, run binding, parent rewrite, the box descriptor on the agent's `register_run`, refusing an agent's own descriptor or `ext`, limits, counts |
+| `internal/tracekit` | a raw frame call for the proxy; the box descriptor needs the signer's new contract version, and with an older signer the agent's runs are registered without it (no label; verify then makes no boxed claim) |
+| Tracekit (its own pull request) | the `box_daemons` setting, the `register_run` box descriptor (new RPC contract version), `ext.box` written by the signer on the child run, and the verifiers' lines above, with tests |
 | `examples/` or `images/claude-code/` | the Claude Code image's Dockerfile |
 | Tests | unit tests of every refusal (fake signer); an end-to-end test that runs Tracekit's hook in a box and exports a bundle whose agent run's `parent_run` is the box's run |
