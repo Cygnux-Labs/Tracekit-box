@@ -11,8 +11,9 @@
 Use it when an agent or a CI job must run code with real credentials, reach the network, or change a repository, and
 someone needs to prove afterwards exactly what it did.
 
-Needs: Linux (x86_64 or arm64) with `/dev/kvm`, or a GitHub-hosted `ubuntu-latest` runner; `e2fsprogs` and `git`;
-`tkbox` and its guest agent built from source (`make linux`, see the README's Install); a Tracekit 1.4.2 signer
+Needs: Linux (x86_64 or arm64) with `/dev/kvm`, a GitHub-hosted `ubuntu-latest` runner, or on a Mac a Linux VM with
+nested virtualization (Lima or a colima profile); `e2fsprogs` and `git`;
+`tkbox` and its guest agent built from source (`make linux`, see the README's Install); a Tracekit signer, 1.4.2 or later
 (`pip install tracekit-ai==1.4.2`, then `tracekit init --dev --v2 --no-hooks && tracekit up --wait` for a same-user
 dev signer, which gives dev assurance only).
 

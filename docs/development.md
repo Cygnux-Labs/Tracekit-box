@@ -89,8 +89,9 @@ make linux
 
 ### A dev signer
 
-Box needs a Tracekit 1.4.2 signer. For development, a same-user dev signer is enough (it gives dev assurance only; see
-[SECURITY.md](../SECURITY.md)):
+Box needs a Tracekit signer that serves its protocol (RPC 19): Tracekit 1.4.2 or later. CI tests 1.4.2; 1.5.3 has run
+the whole flow (run, exec, apply, export, verify) on a Mac in the colima VM below. For development, a same-user dev
+signer is enough (it gives dev assurance only; see [SECURITY.md](../SECURITY.md)):
 
 ```sh
 python3 -m venv ~/.venv/tracekit && . ~/.venv/tracekit/bin/activate
@@ -115,9 +116,45 @@ The daemon keeps its state in `~/.local/state/tkbox` (images, boxes, `run/tkbox.
 in `boxes/<id>/console.log` and what happened at its doors in `boxes/<id>/events.ndjson` (`tkbox events <box>` prints
 it).
 
+## The same on a Mac with colima
+
+If you already use colima for Docker, a second colima profile is the same Lima VM with nested virtualization, with the
+same needs: an Apple M3 or newer and macOS 15 or newer. Give Box a profile of its own; your default profile and its
+Docker containers are left as they are. colima mounts your home directory at the same path, so a checkout under it
+(`~/tracekit-box`) is in the VM too.
+
+```sh
+colima start --profile tkbox --vm-type vz --nested-virtualization --cpu 4 --memory 8
+docker context use default                                   # colima makes the new profile Docker's current context
+colima ssh --profile tkbox -- ls -l /dev/kvm                 # must exist
+colima ssh --profile tkbox -- sudo usermod -aG kvm "$USER"
+colima stop --profile tkbox && colima start --profile tkbox  # so new sessions are in the kvm group
+colima ssh --profile tkbox -- sudo apt-get update -q
+colima ssh --profile tkbox -- sudo apt-get install -y -q e2fsprogs git python3-venv
+```
+
+Build on the Mac with Go (`make linux`, the version in go.mod), then run the signer and the daemon in the VM. Each
+`colima ssh` is a new session that starts in the Mac's working directory, and `~` on the command line is the Mac's
+home, so name the VM's home (`/home/$USER.guest`) for the venv, and give the daemon the venv's `tracekit` for
+`tkbox export` with `--tracekit-bin` rather than relying on `PATH`:
+
+```sh
+v=/home/$USER.guest/.venv-tracekit                                              # in the VM's home
+colima ssh --profile tkbox -- python3 -m venv $v
+colima ssh --profile tkbox -- $v/bin/pip install -q tracekit-ai==1.5.3
+colima ssh --profile tkbox -- $v/bin/tracekit up --wait                         # the dev signer
+colima ssh --profile tkbox -- ~/tracekit-box/bin/tkbox-linux-arm64 daemon --tracekit-bin $v/bin/tracekit &
+colima ssh --profile tkbox -- ~/tracekit-box/bin/tkbox-linux-arm64 run --image python:3.12-slim --name t
+```
+
+On an M4 Pro with macOS 26.3, the first `tkbox run` of `python:3.12-slim` took 115 s (pulling the image and building
+its root file system), a later one 6 s; `tkbox export` and `tracekit verify` gave `Integrity: VERIFIED`. The dev
+signer runs as the daemon's user, so bundles read `isolation: same-user`: run the signer as another user for more
+([SECURITY.md](../SECURITY.md)).
+
 ## End-to-end tests
 
-On a Linux host with `/dev/kvm`, `mkfs.ext4` and a running Tracekit 1.4.2 signer (the Lima VM above, or CI):
+On a Linux host with `/dev/kvm`, `mkfs.ext4` and a running Tracekit signer, 1.4.2 or later (the Lima or colima VM above, or CI):
 
 ```sh
 make e2e        # builds, then go test -tags e2e ./e2e/... with TKBOX_BIN=bin/
