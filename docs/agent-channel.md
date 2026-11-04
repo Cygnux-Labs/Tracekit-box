@@ -43,6 +43,10 @@ So each box's channel gets its own signer connection with its own identity, `box
   approval visibility. One box can exhaust only its own limits. **(Tracekit contract)**
 - Its `authorize` entry grants only the channel's methods (below), whatever the config grants the daemon itself.
   **(Tracekit contract)**
+- Parent linking: the signer accepts a parent run's token only from the identity it issued it to, so the channel's
+  identity can't send `parent`. When the daemon opens a box's channel, it names the box's run on its own connection,
+  and the signer makes every run that the per-box identity registers a child of that box run (`parent_run`). No
+  `parent` appears in the agent's request. The per-box identity takes the daemon's tenant. **(Tracekit contract)**
 
 ### The guest end
 
@@ -82,7 +86,9 @@ in the VM beside the hook.
 - In every method: `caller`, `on_behalf`, `amended` and `tool_results` are refused. These are what a gateway or a
   bridge sends for someone else.
 - `approval_get`: only for approval ids this channel's own `approval_request` returned.
-- `observe`: a `tkbox.*` source is refused (Box's own records are Box's), and `trust` is forced to `untrusted`.
+- `observe`: a `tkbox.*` source is refused (Box's own records are Box's). `trust` is left as the hook sent it: the
+  hook marks the person's own prompt `trusted`, and forcing it would hold legitimate calls. What the agent's run says
+  about trust is the agent's account, under its own run and label, never Box's.
 - A byte budget per box covers what goes into the signer's content vault: `model_event` bodies and `complete`
   results. Past it the channel refuses with `quota_exceeded`, and the box's events say so.
 
