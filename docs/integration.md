@@ -19,9 +19,9 @@ program that relies on the record must refuse such a daemon or box.
 - **existing:** HTTP/1.1 with JSON bodies on the daemon's Unix socket, `<state dir>/run/tkbox.sock`, mode 0600. There
   is no TCP listener. The daemon makes the socket's directory mode 0700, including a directory named with
   `tkbox daemon --socket PATH`, so give a socket of your own a directory of its own.
-- **existing:** the daemon reads the caller's uid from the socket's peer credentials on every request. A connection
-  from another uid is accepted, and each of its requests is answered 403 `forbidden`; only the daemon's own uid and
-  root get through. Anything running as that uid can use the whole API: the contract has no finer permissions.
+- **existing:** the daemon reads the caller's uid from the socket's peer credentials once per connection and checks it
+  on every request. A connection from another uid is accepted, and each of its requests is answered 403 `forbidden`;
+  only the daemon's own uid and root get through. Anything running as that uid can use the whole API: the contract has no finer permissions.
 - **existing:** the CLI is the same contract for scripts. `tkbox run`, `tkbox ls`, `tkbox events` and
   `tkbox approvals` take `--json` and print the API's objects. **new:** `--json` on `tkbox stop`, `tkbox apply` and
   `tkbox export`, printing `Box`, `ApplyResult` and `ExportResult`. Until then, a program that needs those results
@@ -81,10 +81,15 @@ block until someone answers.
 - Client → daemon: `stdin`, `stdin_eof`, `signal`.
 - The command is decided before it starts: a refusal is an `error` frame with code `denied` before any output.
 - A command that runs past its timeout is killed and ends with an `exit` frame whose `timed_out` is true, not an error.
-  The `timeout` error code is only the daemon's backstop, when the guest didn't answer by then. A box that reaches its
-  own lifetime is stopped: a command still running ends with `conflict` ("the box stopped while the command ran").
+  The `timeout` error code is only the daemon's backstop, when the guest didn't answer by then.
+- A box that stops (its lifetime ended, `tkbox stop`) sends each running command SIGTERM, then SIGKILL after a grace
+  period, and the command ends with an `exit` frame naming the `signal`. Only when the VM goes first (`stop` with
+  `kill`, a quarantine, a box paused by a hold) does a running command end with `conflict` ("the box stopped while the
+  command ran").
 - A client that goes away ends the command, before or after it started: the stream's last frame is an `error` with
-  code `cancelled`, and the command's `complete` records that the client went away.
+  code `cancelled`. After the command started, its `complete` records that the client went away; before, it records
+  `not run: cancelled before it started`, or nothing when the command was waiting on an approval that was then
+  withdrawn.
 
 ## Errors
 
@@ -105,7 +110,7 @@ block until someone answers.
 | `not_supported` | 501 | Exporting a box that ran unrecorded: there is no run to export. A host without `/dev/kvm` gets no daemon at all: it refuses to start |
 | `cancelled` | — | Exec frames only: the client went away, before or after the command started |
 | `internal` | 500 | A Box bug: report it |
-| `too_large`, `busy`, `not_ready` | 500 | The guest agent's own codes, passed through on any route that reaches it: in an exec's `error` frame, and with HTTP 500 elsewhere, such as a running box's diff (`busy`: the box runs its most commands at once; `not_ready`: the guest isn't ready; `too_large`: a request or result over the guest's limit). The guest's `not_found` (a program the image doesn't have) and `bad_request` pass through the same way, as 404 and 400 |
+| `too_large`, `busy`, `not_ready` | 500 | The guest agent's own codes, passed through on any route that reaches it: in an exec's `error` frame, and with HTTP 500 elsewhere (`busy`: the box runs its most commands at once; `not_ready`: the guest isn't ready; `too_large`: a request or result over the guest's limit), except a running box's diff that is too large, which is `limit` (422). The guest's `not_found` (a program the image doesn't have) and `bad_request` pass through the same way, as 404 and 400 |
 
 ## What is signed where
 
@@ -120,8 +125,8 @@ workspace an MCP client chose, as an untrusted `tkbox.box`). The records:
 
 | Operation | Tracekit record |
 |---|---|
-| Create | `register_run`, then trusted observe `tkbox.box` (`box_id`, `image`, `image_digest`, `allow`, `limits`, the box's env, scrubbed), and the task, if any, as trusted `tkbox.task` |
-| Lifecycle | trusted `tkbox.box` with `event`: `started` (with the image digest), then `stopped` or `failed` with the reason; trusted `tkbox.contained` when the signer holds, quarantines or releases the run |
+| Create | `register_run`, then trusted observe `tkbox.box` with `event: "created"` (`box_id`, `name`, `image` as named, `allow`, `limits`, the secrets' names, `workspace`, `inspect`, the box's env, scrubbed; no image digest yet), and the task, if any, as trusted `tkbox.task` |
+| Lifecycle | trusted `tkbox.box` with `event`: `started` (with `image_digest`, the image the VM booted), then `stopped` or `failed` with the reason; trusted `tkbox.contained` when the signer holds, quarantines or releases the run |
 | Exec | `decide` tool `Bash` with `{command, cwd, env, stdin}` before it starts, then `complete` with the exit status |
 | A connection from the box | `decide` tool `WebFetch` with `{url}`, where `url` is `scheme://host:port` with no path (`https://example.com:443`, `tcp://git.example.com:22`, `http://host:80`). One decision per CONNECT tunnel and per plain-HTTP request, not per request inside a tunnel. A Box approval is trusted `tkbox.approval`; a connection Box refused itself (an address it never connects to, an approval that expired) is untrusted `tkbox.egress` |
 | Secrets | untrusted `tkbox.secret.use` and `tkbox.secret.leak` (name and host, never the value) |
