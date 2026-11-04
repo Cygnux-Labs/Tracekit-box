@@ -126,7 +126,8 @@ the VM with the signer and the daemon, so start none there.
 Start it with `--activate=false` every time: colima otherwise makes the profile Docker's current context on each start.
 With it, `docker context show` prints what it printed before (`colima` if you use colima's default profile). Mount
 only the checkout, writable (`--mount ~/tracekit-box:w`), not your whole home, which colima mounts by default; a box's
-`--workspace` must then be in the checkout or in the VM's own disk.
+`--workspace` must then be in the checkout or in the VM's own disk. Run the steps below from inside `~/tracekit-box`:
+each `colima ssh` starts in the Mac's working directory, and that is the only folder the VM mounts.
 
 ```sh
 colima start --profile tkbox --activate=false --vm-type vz --nested-virtualization --cpu 4 --memory 8 \

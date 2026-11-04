@@ -143,6 +143,6 @@ one. The [architecture](architecture.md#doors) has every door in full.
 The contract is the same wherever the daemon runs:
 
 - **existing:** a Linux host with `/dev/kvm`: Firecracker micro-VMs.
-- **new:** a Mac, through a Linux VM with nested virtualization (colima with the `vz` type on Apple M3 or later and
-  macOS 15 or later); documented with that pull request.
+- **existing:** a Mac, through a Linux VM with nested virtualization (Lima, or a colima profile with the `vz` type, on
+  an Apple M3 or later with macOS 15 or later; [development.md](development.md#the-same-on-a-mac-with-colima)).
 - **new:** a Docker engine for hosts without KVM, weaker than a micro-VM and labelled so, after the Mac.
