@@ -128,6 +128,15 @@ network access and take a few minutes. CI runs them on `ubuntu-latest` after ena
 also runs the GitHub Action from the checkout (`uses: ./action`) with a trivial command
 ([.github/workflows/ci.yml](../.github/workflows/ci.yml)).
 
+## Releasing
+
+A maintainer pushes a `v*` tag (`git tag -s v0.1.0 && git push origin v0.1.0`). The
+[release workflow](../.github/workflows/release.yml) then builds the four Linux binaries from the tag after `make lint`
+and the unit tests, writes `SHA256SUMS`, attests each binary's build provenance and publishes them as the tag's GitHub
+Release. Its build job also runs on every pull request that changes the workflow, the Makefile or the Go module files;
+only the tag's publish job can write, and it runs none of the repository's code: it checks the build's checksums, then
+attests and publishes those files.
+
 ## Commits
 
 Sign off every commit (`git commit -s`). Keep commits small and run `make lint test` before pushing.
