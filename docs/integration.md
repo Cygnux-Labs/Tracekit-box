@@ -42,7 +42,7 @@ page and moves the mark).
 | Stop | `POST /v1/boxes/{box}/stop` | `StopRequest` (`kill`, `reason`) → `Box`; the patch is saved at stop (`diff_saved`, or `diff_error` says why not) | existing |
 | Get the patch | `GET /v1/boxes/{box}/diff`, `GET /v1/boxes/{box}/diff/summary` | → `text/x-diff` (header `X-Tkbox-Diff-Sha256`), `DiffSummary` (`patch_sha256`) | existing |
 | Apply | `POST /v1/boxes/{box}/apply` | `ApplyRequest` (`dir`, `check`, `allow_sensitive`) → `ApplyResult` (`applied`, `denied`, `sensitive`, `ignored`, `sha256`) | existing |
-| Export | `POST /v1/boxes/{box}/export` | `ExportRequest` (`out`) → `ExportResult` (`bundle`, `trust`, `verify`) | existing; **new:** the daemon is told where the `tracekit` command is instead of finding it on `PATH` |
+| Export | `POST /v1/boxes/{box}/export` | `ExportRequest` (`out`) → `ExportResult` (`bundle`, `trust`, `verify`); the daemon runs the `tracekit` CLI it was started with (`tkbox daemon --tracekit-bin PATH`, default `tracekit` on `PATH`) | existing |
 | Remove | `DELETE /v1/boxes/{box}` | → 204 (a running box is stopped first) | existing |
 | Box approvals | `GET /v1/approvals`, `POST /v1/approvals/{id}` | → `[]Approval`; `ApprovalDecision` → `Approval` | existing |
 | Build an image | `POST /v1/images` | `ImageBuildRequest` → `Image` | existing |
