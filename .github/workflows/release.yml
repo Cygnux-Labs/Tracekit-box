@@ -1,9 +1,11 @@
-# Release binaries. On a v* tag: build tkbox and tkbox-guest for linux/amd64 and linux/arm64 from the tag, after the
-# same lint and unit tests as CI, write SHA256SUMS, attest each binary's build provenance (GitHub artifact
-# attestations, verifiable with `gh attestation verify`) and publish them as the tag's GitHub Release.
-# On a pull request that changes this file or the build, only the read-only build job runs, so the workflow is tested
-# before a tag uses it. The job that can write (the release, the attestations) runs on tags only and never runs the
-# repository's code: it checks the build job's checksums, then attests and publishes those exact files.
+# Release binaries. On a v* tag: build tkbox and tkbox-guest for linux/amd64 and linux/arm64 from the tag, with the
+# Go toolchain go.mod pins, after the same lint and unit tests as CI and a govulncheck that fails on any finding; pass
+# their SHA256SUMS to the publish job as a job output (not in the binaries' artifact), and there check the downloaded
+# binaries against it, attest each one's build provenance (GitHub artifact attestations) and publish them as the tag's
+# GitHub Release.
+# On a pull request that changes this file or the build, only the read-only build job runs (with no artifact), so the
+# workflow is tested before a tag uses it. The job that can write runs on tags only, in the `release` environment (a
+# person approves it), and never runs the repository's code.
 name: release
 on:
   push:
@@ -15,28 +17,45 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      sums: ${{ steps.build.outputs.sums }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version-file: go.mod   # its toolchain line
           cache: false   # a release is built without a cache another run could have written
+      - run: go version
       - run: make lint
       - run: go test ./...
+      - name: Known vulnerabilities (fails on any finding)
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
       - name: Build and checksum
+        id: build
         env:
-          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.0.0-dev' }}
         run: |
+          # the tag goes into -ldflags inside the Makefile's quotes: nothing but a version gets that far
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "the tag \"$VERSION\" is not a version (vX.Y.Z or vX.Y.Z-pre)" >&2
+            exit 1
+          fi
           make linux VERSION="$VERSION"
           cd bin
-          sha256sum tkbox-linux-amd64 tkbox-linux-arm64 tkbox-guest-linux-amd64 tkbox-guest-linux-arm64 > SHA256SUMS
-          cat SHA256SUMS
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+          sums=$(sha256sum tkbox-linux-amd64 tkbox-linux-arm64 tkbox-guest-linux-amd64 tkbox-guest-linux-arm64)
+          printf '%s\n' "$sums"
+          { echo 'sums<<SHA256SUMS_END'; printf '%s\n' "$sums"; echo 'SHA256SUMS_END'; } >> "$GITHUB_OUTPUT"
+      - if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries
-          path: bin/
+          path: |
+            bin/tkbox-linux-amd64
+            bin/tkbox-linux-arm64
+            bin/tkbox-guest-linux-amd64
+            bin/tkbox-guest-linux-arm64
           if-no-files-found: error
           retention-days: 7
 
@@ -44,6 +63,7 @@ jobs:
     if: github.ref_type == 'tag'
     needs: build
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write     # the GitHub Release
       id-token: write     # the attestation's signing certificate
@@ -53,8 +73,14 @@ jobs:
         with:
           name: binaries
           path: bin
-      - name: Check the binaries against the build's checksums
-        run: cd bin && sha256sum -c SHA256SUMS
+      - name: Check the binaries against the build job's checksums
+        env:
+          SUMS: ${{ needs.build.outputs.sums }}
+        run: |
+          printf '%s\n' "$SUMS" > SHA256SUMS
+          [ "$(ls bin | sort)" = "$(printf '%s\n' tkbox-guest-linux-amd64 tkbox-guest-linux-arm64 tkbox-linux-amd64 tkbox-linux-arm64)" ]
+          (cd bin && sha256sum -c ../SHA256SUMS)
+          mv SHA256SUMS bin/
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-checksums: bin/SHA256SUMS
@@ -66,8 +92,16 @@ jobs:
           cat > notes.md <<EOF
           Linux binaries of tkbox and its guest agent, built from $TAG by this repository's release workflow.
 
-          Check a download against \`SHA256SUMS\` (\`sha256sum -c --ignore-missing SHA256SUMS\`) and its build provenance
-          with \`gh attestation verify <file> --repo $GITHUB_REPOSITORY\`. Install: the README's Install section.
+          Check a download against \`SHA256SUMS\` (\`sha256sum -c --ignore-missing SHA256SUMS\`), then its build
+          provenance, which must name this workflow, this tag and a GitHub-hosted runner:
+
+          \`\`\`sh
+          gh attestation verify <file> --repo $GITHUB_REPOSITORY \\
+            --signer-workflow $GITHUB_REPOSITORY/.github/workflows/release.yml \\
+            --source-ref refs/tags/$TAG --deny-self-hosted-runners
+          \`\`\`
+
+          Install: the README's Install section.
           EOF
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes-file notes.md \
             bin/tkbox-linux-amd64 bin/tkbox-linux-arm64 bin/tkbox-guest-linux-amd64 bin/tkbox-guest-linux-arm64 \

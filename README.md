@@ -130,8 +130,11 @@ arch=$(uname -m); case "$arch" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; e
 gh release download "$tag" --repo Cygnux-Labs/Tracekit-box \
   -p "tkbox-linux-$arch" -p "tkbox-guest-linux-$arch" -p SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
-gh attestation verify "tkbox-linux-$arch" --repo Cygnux-Labs/Tracekit-box
-gh attestation verify "tkbox-guest-linux-$arch" --repo Cygnux-Labs/Tracekit-box
+for f in "tkbox-linux-$arch" "tkbox-guest-linux-$arch"; do   # made by the release workflow, from this tag
+  gh attestation verify "$f" --repo Cygnux-Labs/Tracekit-box \
+    --signer-workflow Cygnux-Labs/Tracekit-box/.github/workflows/release.yml \
+    --source-ref "refs/tags/$tag" --deny-self-hosted-runners
+done
 sudo install -m 0755 "tkbox-linux-$arch" /usr/local/bin/tkbox
 sudo install -m 0755 "tkbox-guest-linux-$arch" /usr/local/bin/
 ```

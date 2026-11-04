@@ -130,12 +130,15 @@ also runs the GitHub Action from the checkout (`uses: ./action`) with a trivial 
 
 ## Releasing
 
-A maintainer pushes a `v*` tag (`git tag -s v0.1.0 && git push origin v0.1.0`). The
-[release workflow](../.github/workflows/release.yml) then builds the four Linux binaries from the tag after `make lint`
-and the unit tests, writes `SHA256SUMS`, attests each binary's build provenance and publishes them as the tag's GitHub
-Release. Its build job also runs on every pull request that changes the workflow, the Makefile or the Go module files;
-only the tag's publish job can write, and it runs none of the repository's code: it checks the build's checksums, then
-attests and publishes those files.
+A maintainer pushes a `v*` tag (`git tag -s v0.1.0 && git push origin v0.1.0`); a tag that isn't `vX.Y.Z` or
+`vX.Y.Z-pre` stops the build. The [release workflow](../.github/workflows/release.yml) then builds the four Linux
+binaries from the tag with the Go toolchain `go.mod` pins (its `toolchain` line), after `make lint`, the unit tests and
+a `govulncheck` that fails on any finding, and passes their `SHA256SUMS` to the publish job as a job output. The
+publish job runs in the `release` environment, so a person approves it; it runs none of the repository's code: it
+checks the downloaded binaries against those checksums, attests each one's build provenance and publishes them as the
+tag's GitHub Release. The build job also runs on every pull request that changes the workflow, the Makefile or the Go
+module files, with no artifact. Keep the `toolchain` line on the latest patch of the Go release in `go`: patches carry
+the standard library's security fixes.
 
 ## Commits
 
