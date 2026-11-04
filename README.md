@@ -109,8 +109,8 @@ The design, protocols and disks are in [docs/architecture.md](docs/architecture.
   (Apple M3 or newer, macOS 15 or newer), use a Linux VM with nested virtualization: the Lima VM or a colima profile in
   [docs/development.md](docs/development.md).
 - `e2fsprogs` (`mkfs.ext4`) to build disk images, and `git` to snapshot the workspace.
-- A Tracekit signer on the same host that serves Box's protocol (RPC 19): Tracekit 1.4.2 or later. CI tests 1.4.2;
-  1.5.3 has run the whole flow on a Mac. `pip install tracekit-ai==1.4.2`. For a dev setup,
+- A Tracekit signer on the same host that serves Box's protocol (RPC 19): Tracekit 1.4.2 to 1.5.3 tested: CI tests
+  1.4.2, and 1.5.3 has run the whole flow on a Mac. `pip install tracekit-ai==1.4.2`. For a dev setup,
   `tracekit init --dev --v2 --no-hooks && tracekit up --wait` starts a same-user signer.
 - Outbound HTTPS from the host to your image registry (Docker Hub or GHCR). On its first start the daemon also
   downloads Firecracker v1.17.0 (from GitHub) and guest kernel 6.1.155 (from the Firecracker project's S3 bucket),

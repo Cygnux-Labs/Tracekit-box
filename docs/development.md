@@ -89,8 +89,8 @@ make linux
 
 ### A dev signer
 
-Box needs a Tracekit signer that serves its protocol (RPC 19): Tracekit 1.4.2 or later. CI tests 1.4.2; 1.5.3 has run
-the whole flow (run, exec, apply, export, verify) on a Mac in the colima VM below. For development, a same-user dev
+Box needs a Tracekit signer that serves its protocol (RPC 19); Tracekit 1.4.2 to 1.5.3 are tested: CI tests 1.4.2,
+and 1.5.3 has run the whole flow (run, exec, apply, export, verify) on a Mac in the colima VM below. For development, a same-user dev
 signer is enough (it gives dev assurance only; see [SECURITY.md](../SECURITY.md)):
 
 ```sh
@@ -120,15 +120,20 @@ it).
 
 If you already use colima for Docker, a second colima profile is the same Lima VM with nested virtualization, with the
 same needs: an Apple M3 or newer and macOS 15 or newer. Give Box a profile of its own; your default profile and its
-Docker containers are left as they are. colima mounts your home directory at the same path, so a checkout under it
-(`~/tracekit-box`) is in the VM too.
+Docker containers are left as they are. The profile runs a Docker engine of its own; containers you start there share
+the VM with the signer and the daemon, so start none there.
+
+Start it with `--activate=false` every time: colima otherwise makes the profile Docker's current context on each start.
+With it, `docker context show` prints what it printed before (`colima` if you use colima's default profile). Mount
+only the checkout, writable (`--mount ~/tracekit-box:w`), not your whole home, which colima mounts by default; a box's
+`--workspace` must then be in the checkout or in the VM's own disk.
 
 ```sh
-colima start --profile tkbox --vm-type vz --nested-virtualization --cpu 4 --memory 8
-docker context use default                                   # colima makes the new profile Docker's current context
+colima start --profile tkbox --activate=false --vm-type vz --nested-virtualization --cpu 4 --memory 8 \
+  --mount ~/tracekit-box:w
 colima ssh --profile tkbox -- ls -l /dev/kvm                 # must exist
 colima ssh --profile tkbox -- sudo usermod -aG kvm "$USER"
-colima stop --profile tkbox && colima start --profile tkbox  # so new sessions are in the kvm group
+colima stop --profile tkbox && colima start --profile tkbox --activate=false   # so new sessions are in the kvm group
 colima ssh --profile tkbox -- sudo apt-get update -q
 colima ssh --profile tkbox -- sudo apt-get install -y -q e2fsprogs git python3-venv
 ```
@@ -140,21 +145,27 @@ home, so name the VM's home (`/home/$USER.guest`) for the venv, and give the dae
 
 ```sh
 v=/home/$USER.guest/.venv-tracekit                                              # in the VM's home
+tkbox=~/tracekit-box/bin/tkbox-linux-arm64                                       # the mounted checkout's build
 colima ssh --profile tkbox -- python3 -m venv $v
 colima ssh --profile tkbox -- $v/bin/pip install -q tracekit-ai==1.5.3
 colima ssh --profile tkbox -- $v/bin/tracekit up --wait                         # the dev signer
-colima ssh --profile tkbox -- ~/tracekit-box/bin/tkbox-linux-arm64 daemon --tracekit-bin $v/bin/tracekit &
-colima ssh --profile tkbox -- ~/tracekit-box/bin/tkbox-linux-arm64 run --image python:3.12-slim --name t
+colima ssh --profile tkbox -- $tkbox daemon --tracekit-bin $v/bin/tracekit &
+until colima ssh --profile tkbox -- $tkbox ls >/dev/null 2>&1; do sleep 1; done  # the first start downloads Firecracker and the kernel
+colima ssh --profile tkbox -- $tkbox run --image python:3.12-slim --name t
 ```
 
 On an M4 Pro with macOS 26.3, the first `tkbox run` of `python:3.12-slim` took 115 s (pulling the image and building
-its root file system), a later one 6 s; `tkbox export` and `tracekit verify` gave `Integrity: VERIFIED`. The dev
-signer runs as the daemon's user, so bundles read `isolation: same-user`: run the signer as another user for more
-([SECURITY.md](../SECURITY.md)).
+its root file system), a later one 6 s; `tkbox export` and `tracekit verify` gave `Integrity: VERIFIED`.
+
+What this setup protects, honestly: the boxed agent, inside its micro-VM, can reach neither the signer nor the colima
+VM. It doesn't separate the signer from you. Your Mac account controls the colima VM (`colima ssh`, its passwordless
+sudo, the VM's disk under `~/.colima`), so running the signer as another user inside the VM adds nothing here: bundles
+read `isolation: same-user`, and that is the truth on a Mac. On a Linux host, a signer of its own user does add a
+boundary ([SECURITY.md](../SECURITY.md)).
 
 ## End-to-end tests
 
-On a Linux host with `/dev/kvm`, `mkfs.ext4` and a running Tracekit signer, 1.4.2 or later (the Lima or colima VM above, or CI):
+On a Linux host with `/dev/kvm`, `mkfs.ext4` and a running Tracekit signer (1.4.2 to 1.5.3 tested; the Lima or colima VM above, or CI):
 
 ```sh
 make e2e        # builds, then go test -tags e2e ./e2e/... with TKBOX_BIN=bin/
