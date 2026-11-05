@@ -4,7 +4,13 @@
     "TRACEKIT_SIGNER": "/run/tkbox/signer.sock",
     "PATH": "/opt/tracekit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     "LD_PRELOAD": "",
-    "LD_LIBRARY_PATH": ""
+    "LD_LIBRARY_PATH": "",
+    "LD_AUDIT": "",
+    "GCONV_PATH": "",
+    "LOCPATH": "",
+    "NLSPATH": "",
+    "TRACEKIT_RUNTIME_DIR": "/home/agent/.tracekit/run",
+    "TRACEKIT_APPROVAL_WAIT": "0"
   },
   "hooks": {
     "PreToolUse": [

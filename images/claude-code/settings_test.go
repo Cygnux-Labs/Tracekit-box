@@ -30,8 +30,13 @@ func TestHooksRunWhatTheImageInstalled(t *testing.T) {
 	if err := json.Unmarshal(data, &s); err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]string{"TRACEKIT_SIGNER": "/run/tkbox/signer.sock", "LD_PRELOAD": "", "LD_LIBRARY_PATH": "",
-		"PATH": "/opt/tracekit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+	// what the hooks, sh and the dynamic loader read from the environment: a project's or the user's settings could
+	// otherwise load code into them (LD_*, GCONV_PATH), point them at other files (LOCPATH, NLSPATH), move the hook's
+	// state (TRACEKIT_RUNTIME_DIR) or make it wait (TRACEKIT_APPROVAL_WAIT)
+	want := map[string]string{"TRACEKIT_SIGNER": "/run/tkbox/signer.sock",
+		"PATH":       "/opt/tracekit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"LD_PRELOAD": "", "LD_LIBRARY_PATH": "", "LD_AUDIT": "", "GCONV_PATH": "", "LOCPATH": "", "NLSPATH": "",
+		"TRACEKIT_RUNTIME_DIR": "/home/agent/.tracekit/run", "TRACEKIT_APPROVAL_WAIT": "0"}
 	for k, v := range want {
 		if got, ok := s.Env[k]; !ok || got != v {
 			t.Errorf("managed env %s = %q, want %q", k, got, v)

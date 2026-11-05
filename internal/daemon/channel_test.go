@@ -111,3 +111,68 @@ func TestKillIsNotHeldByChannelRunCloses(t *testing.T) {
 		t.Fatalf("--kill: the VM is still %s 5 s later, waiting on the channel's close_run calls (3 runs x up to 300 s; up to 256 runs)", e.machine(0).State)
 	}
 }
+
+// A kill used to wait CloseReplyWait (2 s) when any agent frame, such as an approval_wait long poll, was with the
+// signer. Only a register_run in flight is waited for now: the VM goes down at once.
+func TestKillIsNotHeldByALongPoll(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.tk.RPCVersion = 21
+	var mu sync.Mutex
+	var peers []net.Conn
+	e.tk.ChannelDial = func() (net.Conn, error) {
+		a, z := net.Pipe()
+		mu.Lock()
+		peers = append(peers, z)
+		mu.Unlock()
+		go func() {
+			r := bufio.NewReader(z)
+			for {
+				line, err := r.ReadBytes('\n')
+				if err != nil {
+					return
+				}
+				var m map[string]any
+				_ = json.Unmarshal(line, &m)
+				if m["method"] != "register_run" {
+					continue // approval_wait: the person hasn't answered
+				}
+				if _, err := z.Write([]byte(`{"run_id":"child-1","run_token":"tok"}` + "\n")); err != nil {
+					return
+				}
+			}
+		}()
+		return a, nil
+	}
+	defer func() {
+		mu.Lock()
+		for _, p := range peers {
+			p.Close()
+		}
+		mu.Unlock()
+	}()
+	e.create(api.CreateBoxRequest{Name: "k", Image: "x", AgentChannel: true})
+	c, err := e.machine(0).GuestDial(context.Background(), proto.PortAgentChannel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	r := bufio.NewReader(c)
+	fmt.Fprint(c, `{"method":"register_run","request_id":"r","agent":{"name":"claude-code"}}`+"\n")
+	if _, err := r.ReadBytes('\n'); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprint(c, `{"method":"approval_wait","request_id":"w","run_id":"child-1","run_token":"tok","approval_id":"a1"}`+"\n")
+	time.Sleep(100 * time.Millisecond) // the long poll is with the signer
+	start := time.Now()
+	go e.d.Stop(context.Background(), "k", api.StopRequest{Kill: true})
+	select {
+	case <-e.machine(0).Done():
+		took := time.Since(start)
+		t.Logf("--kill with a long poll in flight: the VM was killed %v after the stop began", took.Round(10*time.Millisecond))
+		if took > time.Second {
+			t.Errorf("a kill waited %v on a signer reply (approval_wait)", took.Round(10*time.Millisecond))
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("VM not killed in 10 s")
+	}
+}

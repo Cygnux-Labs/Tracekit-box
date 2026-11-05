@@ -2,8 +2,10 @@ package agentchannel
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"runtime"
@@ -196,7 +198,7 @@ func TestRegisterRunIsForwardedVerbatim(t *testing.T) {
 
 // Box's own runs are named tkbox (or the operator's --agent): an agent run may not take a name that reads as Box's.
 func TestReservedAgentNamesAreRefused(t *testing.T) {
-	for _, name := range []string{"tkbox", "TKBOX", " tkbox-agent", `tkbox`} {
+	for _, name := range []string{"tkbox", "TKBOX", " tkbox-agent", `\u0074kbox`, "\u200btkbox", "\ufefftkbox", "\uff54\uff4b\uff42\uff4f\uff58", "tkb\u043ex", "\u00adtkbox"} {
 		_, err := Decode([]byte(`{"method":"register_run","request_id":"r","agent":{"name":"` + name + `"}}`))
 		if r, ok := err.(*refusal); !ok || r.kind != RefusedField {
 			t.Errorf("agent name %q: %v", name, err)
@@ -212,10 +214,14 @@ func decodeCostFrame(unit string) []byte {
 }
 
 // The strict check used to build the whole value: 35–50 MiB allocated and 12–20 MiB live for one 1 MiB frame, with up
-// to 16 such frames per box. It now keeps each open object's names and the top-level fields only.
+// to 16 such frames per box. Wide frames still cost 9–34 MiB (a map of names per object, every top-level field kept).
+// It now keeps the names of the open objects in a list reused per depth, and the top-level fields the rules read.
 func TestDecodeCost(t *testing.T) {
+	frames := wideShapes()
 	for _, unit := range []string{"[],", "{},", "0,", `{"a":1},`, `"s",`} {
-		frame := decodeCostFrame(unit)
+		frames["["+unit+" ...]"] = decodeCostFrame(unit)
+	}
+	for unit, frame := range frames {
 		runtime.GC()
 		var before, after runtime.MemStats
 		runtime.ReadMemStats(&before)
@@ -247,11 +253,130 @@ func BenchmarkDecode1MiB(b *testing.B) {
 	}
 }
 
-// The proxy's idle timeout used to be 300 s, past the signer's own 30 s, so a guest idle between the two sent its next
-// frame into a signer connection the signer had already dropped.
-func TestIdleTimeoutIsUnderTheSigners(t *testing.T) {
-	const signerIdle = 30 * time.Second // Tracekit's signer drops a connection idle this long
-	if IdleTimeout >= signerIdle {
-		t.Fatalf("IdleTimeout %s, want under the signer's %s", IdleTimeout, signerIdle)
+// The proxy forwards a frame only once it has all of it, so the signer's connection is silent for the guest's idle
+// time plus the frame's own read time; the signer drops a connection silent for 30 s (its read timeout is per recv).
+func TestSignerConnectionSilenceIsUnderTheSigners(t *testing.T) {
+	const signerIdle = 30 * time.Second
+	if IdleTimeout+FrameStartTimeout >= signerIdle {
+		t.Errorf("the signer connection can be silent %s (IdleTimeout %s + FrameStartTimeout %s), past the signer's %s",
+			IdleTimeout+FrameStartTimeout, IdleTimeout, FrameStartTimeout, signerIdle)
+	}
+}
+
+// fill repeats unit(i) after prefix until the frame is about MaxFrame, then closes it.
+func fill(prefix string, unit func(i int) string, suffix string) []byte {
+	var b strings.Builder
+	b.WriteString(prefix)
+	for i := 0; ; i++ {
+		u := unit(i)
+		if b.Len()+len(u)+len(suffix)+1 > MaxFrame {
+			break
+		}
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(u)
+	}
+	b.WriteString(suffix)
+	return []byte(b.String())
+}
+
+// wideShapes are frames of about 1 MiB that are wide rather than deep: many names in one object, or many objects.
+func wideShapes() map[string][]byte {
+	key := func(i int) string { return fmt.Sprintf(`"%x":0`, i) }
+	skey := func(i int) string { return fmt.Sprintf(`"%x":""`, i) }
+	esc := func(i int) string {
+		var b strings.Builder
+		for _, c := range fmt.Sprintf("%x", i) {
+			fmt.Fprintf(&b, `\u%04x`, c)
+		}
+		return `"` + b.String() + `":0`
+	}
+	return map[string][]byte{
+		"top-level keys (Frame.raw, kept)":      fill(`{"method":"status",`, key, `}`),
+		"top-level string keys (raw+str, kept)": fill(`{"method":"status",`, skey, `}`),
+		"one wide nested object (name map)":     fill(`{"method":"status","x":{`, key, `}}`),
+		"escaped names in a nested object":      fill(`{"method":"status","x":{`, esc, `}}`),
+		"many 17-name objects": fill(`{"method":"status","x":[`, func(int) string {
+			return `{"a":0,"b":0,"c":0,"d":0,"e":0,"f":0,"g":0,"h":0,"i":0,"j":0,"k":0,"l":0,"m":0,"n":0,"o":0,"p":0,"q":0}`
+		}, `]}`),
+		"escaped strings in an array": fill(`{"method":"status","x":[`, func(int) string { return `"A"` }, `]}`),
+		"128-deep chains":             fill(`{"method":"status","x":[`, func(int) string { return strings.Repeat("[", 127) + strings.Repeat("]", 127) }, `]}`),
+		"baseline: [0,0,...]":         fill(`{"method":"status","x":[`, func(int) string { return "0" }, `]}`),
+	}
+}
+
+// CloseRuns with more runs than closeRunsAtOnce and a context that ends while closes are in flight: the loop appends
+// the runs it never started to failures without the lock while the in-flight closes append theirs under it.
+func TestCloseRunsCountsEveryRunItCouldNotClose(t *testing.T) {
+	s := New(func(ctx context.Context) (net.Conn, error) {
+		a, b := net.Pipe()
+		go func() { _, _ = bufio.NewReader(b).ReadBytes('\n'); <-ctx.Done(); b.Close() }() // never answers
+		return a, nil
+	}, "box-run", "")
+	for i := 0; i < 64; i++ {
+		s.runs[fmt.Sprintf("r%02d", i)] = runEntry{token: "t"}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if errs := s.CloseRuns(ctx); len(errs) != 64 {
+		t.Fatalf("%d failures for 64 runs that never closed", len(errs))
+	}
+}
+
+// L7: the rebuilt register_run is one strict object of method, request_id and agent only, the agent's bytes as sent,
+// never longer than the frame they came in.
+func FuzzRegisterFrame(f *testing.F) {
+	for _, s := range []string{
+		`{"method":"register_run","request_id":"r","agent":{"name":"x"}}`,
+		`{"agent":{"name":"x","box":{"id":"b"}},"method":"register_run","request_id":"r","run_id":"y"}`,
+		`{"method":"register_run","request_id":"r\",\"parent\":\"x","agent":"a\",\"box\":{}"}`,
+		`{"method":"register_run","request_id":1e5,"agent":[{"a":1}],"x":{"parent":1}}`,
+		`{ "method" : "register_run" , "agent" : { "name" : "x" } }`,
+	} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		in := []byte(s)
+		fr, err := Decode(in)
+		if err != nil || fr.Str("method") != "register_run" {
+			return
+		}
+		out := registerFrame(fr)
+		if len(out) > len(in) {
+			t.Fatalf("rebuilt %d bytes from %d: %q", len(out), len(in), out)
+		}
+		g, err := parseFrame(out, frameFields)
+		all, rerr := strictReference(out) // every name the rebuilt frame has
+		if err != nil || rerr != nil {
+			t.Fatalf("rebuilt frame %q is not strict JSON: %v %v", out, err, rerr)
+		}
+		for k := range all {
+			if k != "method" && k != "request_id" && k != "agent" {
+				t.Fatalf("rebuilt frame %q carries %q", out, k)
+			}
+		}
+		if g.Str("method") != "register_run" || !bytes.Equal(g.Raw("agent"), fr.Raw("agent")) || !bytes.Equal(g.Raw("request_id"), fr.Raw("request_id")) {
+			t.Fatalf("rebuilt %q from %q", out, in)
+		}
+	})
+}
+
+// The box's own run carries the operator's --agent name (tkbox by default): an agent run may not take it.
+func TestTheBoxsAgentNameIsRefused(t *testing.T) {
+	s := New(nil, "box-run", "")
+	s.BoxAgent = "nightly-review"
+	for _, name := range []string{"nightly-review", "Nightly-Review", " nightly-review "} {
+		f, err := Decode([]byte(`{"method":"register_run","request_id":"r","agent":{"name":"` + name + `"}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r := s.check("register_run", f, nil); r == nil || r.kind != RefusedField {
+			t.Errorf("agent name %q: %+v", name, r)
+		}
+	}
+	f, _ := Decode([]byte(`{"method":"register_run","request_id":"r","agent":{"name":"claude-code"}}`))
+	if r := s.check("register_run", f, nil); r != nil {
+		t.Fatal(r)
 	}
 }

@@ -61,7 +61,7 @@ func TestRefusalsAreReportedFoldedAndWithoutTheFrame(t *testing.T) {
 		{Kind: RefusedField, Method: "register_run", Reason: "register_run field parent is not passed"},
 		{Kind: RefusedApproval, Method: "approval_get", Reason: "approval is not owned by this box"},
 		{Kind: RefusedFrame, Reason: "not one strict JSON object"},
-		{Kind: RefusedRate, Method: "status", Reason: fmt.Sprintf("over %d frames a second", RatePerSecond)},
+		{Kind: RefusedRate, Reason: fmt.Sprintf("over %d frames a second", RatePerSecond)}, // read no further: no method
 		{Kind: RefusedMethod, Reason: "method not allowed", Folded: 1},
 		{Kind: RefusedField, Folded: 1}, // at Close
 	}

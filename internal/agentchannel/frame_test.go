@@ -36,12 +36,14 @@ func TestDecodeDepth129(t *testing.T) {
 }
 
 func TestDecodePreservesNumberAndObserveTrust(t *testing.T) {
-	m, err := Decode([]byte(`{"method":"observe","source":"agent.prompt","trust":"trusted","n":9007199254740993}`))
+	in := `{"method":"observe","source":"agent.prompt","trust":"trusted","n":9007199254740993}`
+	line, m, err := ReadFrame(bufio.NewReader(strings.NewReader(in + "\n")))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(m.Raw("n")) != "9007199254740993" || m.Str("trust") != "trusted" {
-		t.Fatalf("decoded %#v", m)
+	// forwarded as sent, so the number is not rounded and trust is the hook's; only the fields the rules read are kept
+	if string(line) != in || m.Str("source") != "agent.prompt" || m.Has("trust") || m.Has("n") {
+		t.Fatalf("read %q, kept %#v", line, m)
 	}
 }
 
@@ -121,7 +123,14 @@ func strictReference(data []byte) (map[string]any, error) {
 func sameAsReference(t *testing.T, data []byte) {
 	t.Helper()
 	ref, rerr := strictReference(data)
-	f, err := parseFrame(data)
+	keep := frameFields // every name encoding/json read, so all of them are compared
+	if rerr == nil {
+		keep = map[string]bool{}
+		for k := range ref {
+			keep[k] = true
+		}
+	}
+	f, err := parseFrame(data, keep)
 	if (rerr == nil) != (err == nil) {
 		t.Fatalf("%q: encoding/json says %v, the scanner %v", data, rerr, err)
 	}
@@ -143,8 +152,8 @@ func sameAsReference(t *testing.T, data []byte) {
 func TestScannerMatchesEncodingJSON(t *testing.T) {
 	for _, s := range []string{
 		`{}`, ` {"a":1} `, `{"a":1}x`, `{"a":1,}`, `{"a" 1}`, `{"a":01}`, `{"a":-0.5e+10}`, `{"a":1.}`, `{"a":-}`,
-		`{"a":tru}`, `{"a":[1,]}`, `{"a":[,1]}`, `[]`, `"x"`, ``, `{"a":"é","b":"😀"}`,
-		`{"a":"\ud800","\ud800":1,"\udc00":2}`, `{"a":1,"a":2}`, `{"a":"\x"}`, `{"a":"\u12"}`, "{\"a\":\"\t\"}",
+		`{"a":tru}`, `{"a":[1,]}`, `{"a":[,1]}`, `[]`, `"x"`, ``, `{"a":"\u00e9","b":"\ud83d\ude00"}`,
+		`{"a":"\ud800","\ud800":1,"\udc00":2}`, `{"\u0061":1,"a":2}`, `{"a":"\x"}`, `{"a":"\u12"}`, "{\"a\":\"\t\"}",
 		`{"a":{"b":1,"b":2}}`, `{"a":[{"b":1},{"b":1}]}`, `{"a":"\ud83dA"}`, `{"a":"\ud83d"}`, `{"a":null,"b":true,"c":false}`,
 		`{"a":1}{}`, `{"a":"x"`, `{"a":1e5,"b":1E-5,"c":0}`, `{"method":"status","x":` + strings.Repeat("[", 128) + strings.Repeat("]", 128) + `}`,
 		`{"a":` + strings.Repeat("[", 129) + strings.Repeat("]", 129) + `}`, `{"a":"` + strings.Repeat("\\u0041", 40) + `"}`,
@@ -181,7 +190,7 @@ func FuzzAgentFields(f *testing.F) {
 	for _, s := range []string{`{"method":"status"}`, `{"method":"register_run","run_id":"discard"}`, `{"method":"decide","caller":"x"}`, `{"method":"observe","source":"tkbox.test"}`} {
 		f.Add(s)
 	}
-	for _, s := range []string{`{"a":"\ud800","𐀀":[1,{"b":null}]}`, `{"caller":1,"x":-1.5e3}`} {
+	for _, s := range []string{`{"a":"\ud800","\ud800\udc00":[1,{"b":null}]}`, `{"\u0063aller":1,"x":-1.5e3}`} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, s string) {
@@ -195,7 +204,7 @@ func FuzzAgentFields(f *testing.F) {
 // fieldsOf is the frame's fields, for tests that call check and record directly.
 func fieldsOf(t testing.TB, frame string) *Frame {
 	t.Helper()
-	f, err := parseFrame([]byte(frame))
+	f, err := parseFrame([]byte(frame), frameFields)
 	if err != nil {
 		t.Fatal(err)
 	}

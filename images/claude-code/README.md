@@ -24,8 +24,9 @@ Tracekit `tracekit-ai==1.5.3` supplies the hook client. The managed hook entries
 registered Claude Code hook events, the `*` matcher for tool events, event-specific timeouts,
 isolated Python module invocation and Tracekit's fail-closed shell wrappers. The signer path is fixed in the settings environment.
 `allowManagedHooksOnly` prevents user and project hooks. The hooks call `/opt/tracekit/bin/python3` and `/bin/grep` by
-path, and the managed `env` pins `PATH` and empties `LD_PRELOAD` and `LD_LIBRARY_PATH`, so a project's or the user's
-settings can't swap what they run (`go test ./images/claude-code` checks it).
+path, and the managed `env` pins `PATH`, `TRACEKIT_RUNTIME_DIR` and `TRACEKIT_APPROVAL_WAIT` and empties `LD_PRELOAD`,
+`LD_LIBRARY_PATH`, `LD_AUDIT`, `GCONV_PATH`, `LOCPATH` and `NLSPATH`, so a project's or the user's settings can't swap
+what they run (`go test ./images/claude-code` checks it).
 
 What the image installs is pinned: Claude Code and its platform binaries by `package-lock.json` (`npm ci` checks each
 package's integrity hash), and the hook client and its dependencies by `requirements.txt` (`pip install

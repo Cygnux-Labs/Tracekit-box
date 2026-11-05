@@ -46,6 +46,7 @@ fuzz:
 	$(GO) test -run='^$$' -fuzz='^FuzzClientReplies$$' -fuzztime=$(FUZZTIME) ./internal/agentrpc
 	$(GO) test -run='^$$' -fuzz='^FuzzReadAgentFrame$$' -fuzztime=$(FUZZTIME) ./internal/agentchannel
 	$(GO) test -run='^$$' -fuzz='^FuzzAgentFields$$' -fuzztime=$(FUZZTIME) ./internal/agentchannel
+	$(GO) test -run='^$$' -fuzz='^FuzzRegisterFrame$$' -fuzztime=$(FUZZTIME) ./internal/agentchannel
 	$(GO) test -run='^$$' -fuzz='^FuzzShellQuote$$' -fuzztime=$(FUZZTIME) ./internal/tracekit
 	$(GO) test -run='^$$' -fuzz='^FuzzDebugfsQuote$$' -fuzztime=$(FUZZTIME) ./internal/image
 	$(GO) test -run='^$$' -fuzz='^FuzzFixups$$' -fuzztime=$(FUZZTIME) ./internal/image

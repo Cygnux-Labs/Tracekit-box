@@ -414,8 +414,8 @@ func TestCloseOrderListenerThenConnections(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Close(orderedListener{Listener: l, events: &events})
-	// the guest goes first; a signer connection is closed by its own handler once its reply is in (none runs here)
-	if len(events) != 2 || events[0] != "listener" || events[1] != "connection" {
+	// the guest goes first, then its signer connection: only a register_run with the signer gets time for its reply
+	if len(events) != 3 || events[0] != "listener" || events[1] != "connection" || events[2] != "connection" {
 		t.Fatalf("close sequence %v", events)
 	}
 }

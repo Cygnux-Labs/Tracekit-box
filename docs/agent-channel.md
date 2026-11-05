@@ -66,14 +66,15 @@ So each box's channel gets its own signer connection with its own identity, `box
 ### The daemon: the scoping proxy
 
 The required limits are: 16 open connections per box; 1 MiB maximum frame; 10 seconds for the first byte through
-newline; 25 seconds idle between frames (under the signer's 30, so the proxy, not the signer, ends an idle
-connection and the agent's client reconnects); 330 seconds for a signer reply; 10 seconds for guest writes; JSON
+newline; 15 seconds idle between frames (the signer connection is silent for the idle time plus the frame's 10
+seconds at most, under the signer's 30, so the proxy, not the signer, ends an idle connection and the agent's client
+reconnects); 330 seconds for a signer reply; 10 seconds for guest writes; JSON
 nesting depth 128; 50 frames/second with burst 200, where each new connection costs a frame (it makes the signer set
 up a connection of its own); 256 runs over the box's lifetime; 64 MiB across every forwarded frame but `hello` and
 `status`, whatever its method, since any of them can reach the signer's content vault; and 1,048,576 forwarded frames
 over the box's lifetime (`hello` and `status` included: about 20 times a long coding session, almost six hours of
 nonstop sending at the rate limit). Rate and byte limits are per box and are accounted under one shared lock. Across
-the daemon's boxes, the strict checks run at most one per CPU at once.
+the daemon's boxes, the strict checks run on at most half the CPUs at once.
 
 **Which box.** The daemon serves 1027 on a per-box Firecracker vsock listener path, `<box dir>/vsock.sock_1027`, so a
 connection's box is the listener it arrived on, never anything a frame says. Connections per box are capped. When a
@@ -88,7 +89,9 @@ stop begins, the listener and its connections are closed with the egress.
 - A frame that passes is forwarded as the received bytes, verbatim, so nothing is rounded, except `register_run`,
   which the daemon builds fresh from the agent's own `request_id` and `agent` bytes (below), never longer than the
   frame they came in.
-- Rate limits answer `quota_exceeded` with `retry_after_ms`, as the signer does. A frame is never held back.
+- Rate limits answer `quota_exceeded` with `retry_after_ms`, as the signer does. A frame is never held back. A frame
+  over the rate is passed over unread: neither kept nor checked. The lifetime frame cap answers `quota_exceeded`
+  without `retry_after_ms`: waiting frees nothing.
 - Every refusal is also a `channel.refused` event of the box: its kind (`frame`, `method`, `field`, `run`,
   `approval`, `rate`, `run_cap`, `byte_budget`, `frame_cap`, `connections`, `signer`), the method when it is a plain
   name, and the channel's own reason, never the frame's content. A box gets at most one such event per kind a second;
@@ -105,8 +108,10 @@ in the VM beside the hook.
 **Fields, not only methods.** Methods pass by an allowlist; fields are refused by deny lists.
 - `register_run`: the daemon builds the request itself from only the agent's `request_id` and `agent`. It refuses a
   request that carries `parent`, `principal`, `principal_token`, `caller`, `source`, `tenant`, `analyzes`,
-  `replay_of`, `investigation`, `ext` or `box`, and drops `run_id`: the signer names the run. An agent name that
-  starts with `tkbox` (any case) is refused: Box's own runs carry it.
+  `replay_of`, `investigation`, `ext` or `box`, and drops `run_id`: the signer names the run. An agent name may
+  hold only ASCII letters, digits, `.`, `_`, space and `-` (no lookalike of a reserved name passes), and one that
+  starts with `tkbox` (any case) or is the box run's own (the operator's `--agent`) is refused: Box's own runs carry
+  those.
 - In every method: `caller`, `on_behalf`, `amended` and `tool_results` are refused. These are what a gateway or a
   bridge sends for someone else.
 - `approval_get`: exempt from the run-id check because its schema has no `run_id`; only for approval ids this
@@ -123,8 +128,9 @@ in the VM beside the hook.
   box run itself is never in it.
 - Every other frame must name a run in that table; the signer checks the run token as well.
 - Total runs per box are capped, not only open ones.
-- At stop, the channel closes its guest connections first and gives signer replies already on their way 2 seconds (a
-  `register_run` the signer has written then reaches the run table). Once the VM is down (a kill waits for no
+- At stop, the channel closes its guest connections and their signer connections at once, except one whose
+  `register_run` is with the signer: its reply gets 2 seconds, so the run it registers reaches the run table. A long
+  poll (`approval_wait`) holds up no stop. Once the VM is down (a kill waits for no
   signer), every run the channel opened is closed, eight at a time, within 30 seconds. The box's own run stays open
   for `tkbox apply`, as a plain box's does, and closes at export, `rm` or daemon shutdown: after its channel's runs.
 - A successful agent `close_run` marks the run closed. It remains counted against the lifetime cap and is not closed
@@ -191,8 +197,10 @@ An image, built from [images/claude-code/Dockerfile](../images/claude-code/Docke
 - Claude Code runs as a non-root user, with `IS_SANDBOX=1` set as well.
 - Root-owned managed settings (`/etc/claude-code/managed-settings.json`) hold Tracekit's v2 hooks, with
   `TRACEKIT_SIGNER=/run/tkbox/signer.sock` pinned in their `env` and `allowManagedHooksOnly: true`. The hooks run
-  `/opt/tracekit/bin/python3` and `/bin/grep` by path, and the managed `env` pins `PATH` and empties `LD_PRELOAD` and
-  `LD_LIBRARY_PATH`, so a project's or the user's settings can't put a stub in their place.
+  `/opt/tracekit/bin/python3` and `/bin/grep` by path, and the managed `env` pins `PATH`, `TRACEKIT_RUNTIME_DIR` and
+  `TRACEKIT_APPROVAL_WAIT` and empties `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `GCONV_PATH`, `LOCPATH` and
+  `NLSPATH`, so a project's or the user's settings can't put a stub in their place, load code into them or move the
+  hook's state.
 - The model key is a Box secret bound to the header the Anthropic API reads, not the default `Authorization`:
   `--secret ANTHROPIC_API_KEY=env:ANTHROPIC_API_KEY@api.anthropic.com#X-Api-Key`. The VM sees only its placeholder.
 - Its egress is `--allow claude-code,anthropic`. The `anthropic` preset makes `api.anthropic.com` a model host, so
