@@ -16,6 +16,7 @@ import (
 // signer, whose connection is then silent past its 30 s; the next frame that passes goes into a connection the signer
 // has dropped, and the agent gets no answer.
 func TestAQuietSignerConnectionIsReplaced(t *testing.T) {
+	t.Parallel()
 	const signerIdle = 30 * time.Second
 	s := New(func(context.Context) (net.Conn, error) {
 		a, b := net.Pipe()

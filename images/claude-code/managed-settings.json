@@ -1,5 +1,6 @@
 {
   "allowManagedHooksOnly": true,
+  "disableAllHooks": false,
   "env": {
     "TRACEKIT_SIGNER": "/run/tkbox/signer.sock",
     "PATH": "/opt/tracekit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -12,7 +13,10 @@
     "TRACEKIT_RUNTIME_DIR": "/home/agent/.tracekit/run",
     "TRACEKIT_APPROVAL_WAIT": "0",
     "CLAUDE_CODE_SHELL_PREFIX": "",
-    "CLAUDE_CODE_SHELL": "/bin/bash"
+    "CLAUDE_CODE_SHELL": "/bin/bash",
+    "BASH_ENV": "",
+    "ENV": "",
+    "CLAUDE_CODE_SIMPLE": ""
   },
   "hooks": {
     "PreToolUse": [

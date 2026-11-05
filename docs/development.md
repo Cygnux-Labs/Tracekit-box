@@ -54,6 +54,9 @@ one target at a time (`make fuzz FUZZTIME=10m` for longer). Every target runs ev
 fails naming them; a failing input is saved under that package's `testdata/fuzz/<target>/`, so commit it with the fix.
 The `fuzz` workflow runs `make -k fuzz` nightly and on demand, and uploads any new failing inputs as an artifact.
 
+`go test -tags image ./images/claude-code` builds the Claude Code image on a Docker engine and runs its Claude Code,
+with no API key, in a hostile project against a fake signer ([its README](../images/claude-code/README.md)).
+
 `make runs` verifies every signed run in [runs/](../runs/README.md) with the Tracekit 1.4.2 CLI
 (`pip install tracekit-ai==1.4.2`) and rewrites the table in its README from the verified records. The `runs` workflow
 checks the same on each pull request that touches `runs/`, and fails on a run that does not verify or a table that is

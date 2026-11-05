@@ -180,8 +180,8 @@ func TestKillIsNotHeldByALongPoll(t *testing.T) {
 
 // Tracekit's Claude Code hook registers as claude-code, and the GitHub Action names a Claude Code box's run
 // --agent claude-code: a rule refusing agent runs the box run's name refused every register_run the hook sent, so every
-// tool call was blocked. What tells the box run's records from the agent's is signer-written (the agent run's
-// parent_run and copied ext.box label, the box run's none), not the self-asserted name.
+// tool call was blocked. What tells the box run's records from the agent's is signer-written: the agent run's
+// parent_run, which a box run never has (both carry ext.box), not the self-asserted name.
 func TestTheHooksRegisterRunPassesInAClaudeCodeBox(t *testing.T) {
 	e := newTestEnv(t, nil)
 	e.tk.RPCVersion = 21

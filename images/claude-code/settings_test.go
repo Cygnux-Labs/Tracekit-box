@@ -11,8 +11,9 @@ import (
 )
 
 type settings struct {
-	Env   map[string]string `json:"env"`
-	Hooks map[string][]struct {
+	DisableAllHooks *bool             `json:"disableAllHooks"`
+	Env             map[string]string `json:"env"`
+	Hooks           map[string][]struct {
 		Hooks []struct {
 			Command string `json:"command"`
 		} `json:"hooks"`
@@ -34,16 +35,20 @@ func TestHooksRunWhatTheImageInstalled(t *testing.T) {
 	// otherwise load code into them (LD_*, GCONV_PATH), point them at other files (LOCPATH, NLSPATH), move the hook's
 	// state (TRACEKIT_RUNTIME_DIR) or make it wait (TRACEKIT_APPROVAL_WAIT); and what Claude Code runs every hook and
 	// command through (CLAUDE_CODE_SHELL_PREFIX: empty is none; CLAUDE_CODE_SHELL: the image's bash, so no stub is picked
-	// up from SHELL either)
+	// up from SHELL either), what bash reads before every hook (BASH_ENV, ENV) and bare mode, in which no settings or
+	// policy hook fires (CLAUDE_CODE_SIMPLE)
 	want := map[string]string{"TRACEKIT_SIGNER": "/run/tkbox/signer.sock",
 		"PATH":       "/opt/tracekit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 		"LD_PRELOAD": "", "LD_LIBRARY_PATH": "", "LD_AUDIT": "", "GCONV_PATH": "", "LOCPATH": "", "NLSPATH": "",
 		"TRACEKIT_RUNTIME_DIR": "/home/agent/.tracekit/run", "TRACEKIT_APPROVAL_WAIT": "0",
-		"CLAUDE_CODE_SHELL_PREFIX": "", "CLAUDE_CODE_SHELL": "/bin/bash"}
+		"CLAUDE_CODE_SHELL_PREFIX": "", "CLAUDE_CODE_SHELL": "/bin/bash", "BASH_ENV": "", "ENV": "", "CLAUDE_CODE_SIMPLE": ""}
 	for k, v := range want {
 		if got, ok := s.Env[k]; !ok || got != v {
-			t.Errorf("managed env %s = %q, want %q", k, got, v)
+			t.Errorf("managed env %s = %q (set: %v), want %q", k, got, ok, v)
 		}
+	}
+	if s.DisableAllHooks == nil || *s.DisableAllHooks { // managed settings come last: a project's true can't turn hooks off
+		t.Error("managed settings must set disableAllHooks: false")
 	}
 	bare := regexp.MustCompile(`(^|[^/\w])(python3?|grep)\b`)
 	commands := map[string]string{}

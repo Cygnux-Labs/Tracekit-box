@@ -124,7 +124,7 @@ in the VM beside the hook.
   hold only ASCII letters, digits, `.`, `_`, space and `-` (no lookalike of a reserved name passes), and one that
   starts with `tkbox` (any case) is refused. An agent run may share the box run's name (Tracekit's Claude Code hook
   registers as `claude-code`, the name the GitHub Action gives a Claude Code box): what tells them apart is
-  signer-written, the agent run's `parent_run` and copied `ext.box` label, never the name.
+  signer-written: the agent run's `parent_run`, which a box run never has (both carry `ext.box`), never the name.
 - In every method: `caller`, `on_behalf`, `amended` and `tool_results` are refused. These are what a gateway or a
   bridge sends for someone else.
 - `approval_get`: exempt from the run-id check because its schema has no `run_id`; only for approval ids this
@@ -214,11 +214,13 @@ An image, built from [images/claude-code/Dockerfile](../images/claude-code/Docke
 - Root-owned managed settings (`/etc/claude-code/managed-settings.json`) hold Tracekit's v2 hooks, with
   `TRACEKIT_SIGNER=/run/tkbox/signer.sock` pinned in their `env` and `allowManagedHooksOnly: true`. The hooks run
   `/opt/tracekit/bin/python3` and `/bin/grep` by path, and the managed `env` pins `PATH`, `TRACEKIT_RUNTIME_DIR` and
-  `TRACEKIT_APPROVAL_WAIT` and empties `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `GCONV_PATH`, `LOCPATH` and
-  `NLSPATH`, sets `CLAUDE_CODE_SHELL_PREFIX` to none and `CLAUDE_CODE_SHELL` to the image's `/bin/bash`, so a
-  project's or the user's settings (which come before managed settings in Claude Code's order) can't put a stub in
-  their place, wrap them in a prefix, load code into them or move the
-  hook's state.
+  `TRACEKIT_APPROVAL_WAIT`, empties `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `GCONV_PATH`, `LOCPATH`, `NLSPATH`,
+  `BASH_ENV`, `ENV` and `CLAUDE_CODE_SIMPLE`, sets `CLAUDE_CODE_SHELL_PREFIX` to none and `CLAUDE_CODE_SHELL` to the
+  image's `/bin/bash`, and sets `disableAllHooks` false, so a project's or the user's settings (which come before
+  managed settings in Claude Code's order) can't put a stub in their place, wrap them in a prefix, load code into them,
+  turn them off or move the hook's state. `go test -tags image ./images/claude-code` runs the image's own Claude Code in
+  such a project, with no API key, and checks that the managed hooks still register and close their run with a fake
+  signer ([README](../images/claude-code/README.md)).
 - The model key is a Box secret bound to the header the Anthropic API reads, not the default `Authorization`:
   `--secret ANTHROPIC_API_KEY=env:ANTHROPIC_API_KEY@api.anthropic.com#X-Api-Key`. The VM sees only its placeholder.
 - Its egress is `--allow claude-code,anthropic`. The `anthropic` preset makes `api.anthropic.com` a model host, so
@@ -229,7 +231,8 @@ An image, built from [images/claude-code/Dockerfile](../images/claude-code/Docke
 Build and run instructions are in [images/claude-code/README.md](../images/claude-code/README.md). The end-to-end test,
 `TestAgentChannel` in [e2e/](../e2e/agent_channel_test.go), runs with `make e2e` on a Linux host with KVM when
 `TKBOX_TRACEKIT21` names a `tracekit` CLI that serves protocol 21: it starts its own signer from it, with `box_daemons`
-naming the test's user ([development.md](development.md#end-to-end-tests)).
+naming the test's user ([development.md](development.md#end-to-end-tests)). It runs Tracekit's hook client directly, not
+Claude Code, so the managed settings are covered by the image test above, not by it.
 
 ## What changes where
 
@@ -242,4 +245,4 @@ naming the test's user ([development.md](development.md#end-to-end-tests)).
 | `internal/daemon` | the per-box listener, the scoping proxy (strict bounded reads, a method allowlist and field deny lists, run table, `register_run` built fresh, byte budget, rate limits, run and connection caps), closing at stop, the `fail_modes` check |
 | `internal/tracekit` | a per-box channel connection with its own identity, once Tracekit offers it; with an older signer there is no channel |
 | `images/claude-code/` | the Claude Code image's Dockerfile |
-| Tests | unit tests of every refusal (fake signer), including two boxes that can't touch each other's runs or quotas; an end-to-end test that runs Tracekit's hook in a box and exports a bundle whose agent run carries the box's label |
+| Tests | unit tests of every refusal (fake signer), including two boxes that can't touch each other's runs or quotas; an end-to-end test that runs Tracekit's hook in a box and exports a bundle whose agent run carries the box's label; an image test that runs the image's Claude Code in a hostile project against a fake signer |

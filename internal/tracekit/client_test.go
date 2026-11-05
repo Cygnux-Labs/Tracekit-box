@@ -553,3 +553,28 @@ func TestChannelOpensAsTheBoxIdentity(t *testing.T) {
 		})
 	}
 }
+
+// Channel read hello and channel_open's answers under its own connectTimeout whatever its context said, so a stop that
+// began while a box's signer link was being opened waited for it. It now ends when its context does.
+func TestChannelEndsWithItsContext(t *testing.T) {
+	f := newFakeSigner(t)
+	standard := f.handle
+	f.handle = func(conn int, req map[string]any) any {
+		if req["method"] == "channel_open" {
+			time.Sleep(3 * time.Second) // a signer that does not answer within connectTimeout
+			return map[string]any{"identity": "box:1000/tkb-1"}
+		}
+		return standard(conn, req)
+	}
+	c := dialFake(t, f, 5*time.Second)
+	run := newFakeRun(t, c)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := c.Channel(ctx, run); err == nil {
+		t.Fatal("a channel opened after its context ended")
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("Channel returned %v after its context ended at 100ms", took.Round(time.Millisecond))
+	}
+}

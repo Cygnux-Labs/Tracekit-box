@@ -212,7 +212,15 @@ func (c *client) Channel(ctx context.Context, r Run) (net.Conn, error) {
 	if err != nil {
 		return nil, &Unavailable{Err: err}
 	}
-	fail := func(err error) (net.Conn, error) { _ = nc.Close(); return nil, err }
+	stop := context.AfterFunc(ctx, func() { _ = nc.Close() }) // ctx ends the handshake, not only the dial
+	fail := func(err error) (net.Conn, error) {
+		stop()
+		_ = nc.Close()
+		if ctx.Err() != nil {
+			err = &Unavailable{Err: ctx.Err()}
+		}
+		return nil, err
+	}
 	_ = nc.SetDeadline(time.Now().Add(connectTimeout))
 	br := bufio.NewReader(nc)
 	if _, err = io.WriteString(nc, `{"method":"hello"}`+"\n"); err != nil {
@@ -239,6 +247,9 @@ func (c *client) Channel(ctx context.Context, r Run) (net.Conn, error) {
 	// the box's identity as the contract's IDENTITY gives it: "scheme:subject", here box:<daemon uid>/<box id>
 	if id, _ := m["identity"].(string); !strings.HasPrefix(id, "box:") {
 		return fail(badAnswer("channel_open"))
+	}
+	if !stop() { // ctx ended as the handshake finished: nc is closed
+		return fail(ctx.Err())
 	}
 	_ = nc.SetDeadline(time.Time{})
 	return &prefixedConn{Conn: nc, r: br}, nil

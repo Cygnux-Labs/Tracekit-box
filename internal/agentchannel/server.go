@@ -83,7 +83,8 @@ type Server struct {
 	OnRefusal    func(Refusal)
 
 	now          func() time.Time
-	stop         chan struct{} // closed by Close: a paced read stops waiting
+	ctx          context.Context // ended by Close: a dial or a paced read stops waiting
+	cancel       context.CancelFunc
 	refused      map[string]*refusalWindow
 	mu           sync.Mutex
 	connections  map[*activeConn]struct{}
@@ -102,10 +103,12 @@ type Server struct {
 }
 
 func New(dial Dial, runID, token string) *Server {
-	return &Server{Dial: dial, BoxRun: runID, BoxToken: token, FrameTimeout: FrameStartTimeout,
+	s := &Server{Dial: dial, BoxRun: runID, BoxToken: token, FrameTimeout: FrameStartTimeout,
 		connections: map[*activeConn]struct{}{}, runs: map[string]runEntry{}, approvals: map[string]bool{}, frames: RateBurst, last: time.Now(), limitsSeen: map[string]bool{},
 		now: time.Now, refused: map[string]*refusalWindow{}, ReadRate: DefaultReadRate, ReadBurst: DefaultReadBurst,
-		stop: make(chan struct{})}
+	}
+	s.ctx, s.cancel = context.WithCancel(context.Background())
+	return s
 }
 
 func (s *Server) Serve(l net.Listener) error {
@@ -154,8 +157,7 @@ func (s *Server) handle(active *activeConn) {
 			kind: RefusedRate, reason: fmt.Sprintf("over %d frames a second", RatePerSecond)})
 		return
 	}
-	ctx := context.Background()
-	signer, err := s.Dial(ctx)
+	signer, err := s.Dial(s.ctx)
 	if err != nil {
 		s.refuse(guest, &refusal{code: "unavailable", msg: "signer channel unavailable", kind: RefusedSigner,
 			reason: "the signer channel could not be opened: " + err.Error()})
@@ -218,8 +220,9 @@ func (s *Server) handle(active *activeConn) {
 			s.refuse(guest, r)
 			continue
 		}
+		reserved = method == "register_run"             // check took a place for it: every way out from here gives it back
 		if time.Since(lastSigner) >= SignerQuietLimit { // the signer may have dropped the quiet link: a fresh one
-			fresh, err := s.Dial(ctx)
+			fresh, err := s.Dial(s.ctx)
 			if err != nil {
 				s.refuse(guest, &refusal{code: "unavailable", msg: "signer channel unavailable", kind: RefusedSigner,
 					reason: "the signer channel could not be opened again: " + err.Error(), method: method})
@@ -236,7 +239,6 @@ func (s *Server) handle(active *activeConn) {
 			}
 		}
 		if method == "register_run" {
-			reserved = true
 			frame = registerFrame(obj) // never longer than the frame it came in (FuzzRegisterFrame)
 			s.mu.Lock()
 			closing := s.closed
@@ -375,7 +377,7 @@ func (c pacedConn) Read(b []byte) (int, error) {
 		t := time.NewTimer(wait + time.Millisecond)
 		select {
 		case <-t.C:
-		case <-c.s.stop:
+		case <-c.s.ctx.Done():
 			t.Stop()
 			return 0, net.ErrClosed
 		}
@@ -529,9 +531,7 @@ func (s *Server) Close(l net.Listener) {
 		}
 	}
 	s.mu.Lock()
-	if !s.closed {
-		close(s.stop)
-	}
+	s.cancel()
 	s.closed = true
 	s.mu.Unlock()
 	if l != nil {

@@ -23,11 +23,29 @@ Tracekit `tracekit-ai==1.5.3` supplies the hook client. The managed hook entries
 `tracekit/install.py` (`_install_hooks_at`, using `tracekit.integrations.claude_code`): all nine
 registered Claude Code hook events, the `*` matcher for tool events, event-specific timeouts,
 isolated Python module invocation and Tracekit's fail-closed shell wrappers. The signer path is fixed in the settings environment.
-`allowManagedHooksOnly` prevents user and project hooks. The hooks call `/opt/tracekit/bin/python3` and `/bin/grep` by
-path, and the managed `env` pins `PATH`, `TRACEKIT_RUNTIME_DIR` and `TRACEKIT_APPROVAL_WAIT` and empties `LD_PRELOAD`,
-`LD_LIBRARY_PATH`, `LD_AUDIT`, `GCONV_PATH`, `LOCPATH` and `NLSPATH`, sets `CLAUDE_CODE_SHELL_PREFIX` to none and
-`CLAUDE_CODE_SHELL` to `/bin/bash`, so a project's or the user's settings can't swap
-what they run (`go test ./images/claude-code` checks it).
+`allowManagedHooksOnly` prevents user and project hooks, and `disableAllHooks` is set false. The hooks call
+`/opt/tracekit/bin/python3` and `/bin/grep` by path, and the managed `env` pins `PATH`, `TRACEKIT_RUNTIME_DIR` and
+`TRACEKIT_APPROVAL_WAIT`, empties `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `GCONV_PATH`, `LOCPATH`, `NLSPATH`,
+`BASH_ENV`, `ENV` and `CLAUDE_CODE_SIMPLE`, sets `CLAUDE_CODE_SHELL_PREFIX` to none and `CLAUDE_CODE_SHELL` to
+`/bin/bash`, so a project's or the user's settings (which come before managed settings in Claude Code's order) can't
+swap what they run. With Claude Code 2.1.307 the two shell pins are the ones that matter: without them a project's
+prefix runs in place of the hooks. A project's `BASH_ENV`, `ENV`, `CLAUDE_CODE_SIMPLE` or `disableAllHooks: true`
+didn't stop the managed hooks even unpinned; those pins keep it so if a later version reads them.
+
+`go test ./images/claude-code` checks the file. `go test -tags image ./images/claude-code` checks what Claude Code does
+with it: it builds the image and runs the image's own `claude`, with no API key and no network, in a project whose
+settings set all of the above to stubs and add their own `TRACEKIT_SIGNER`, runtime dir and SessionStart hook, against a
+fake signer on `/run/tkbox/signer.sock`. It passes when the managed hooks registered their run with that signer and
+closed it, kept their state in the pinned runtime dir, and nothing of the project's ran. Claude Code runs its session
+hooks, then stops at "Not logged in", so the test makes no model call and no tool hook runs. It needs a Docker engine
+(`DOCKER_CONTEXT` picks it) and network for the build:
+
+```sh
+DOCKER_CONTEXT=colima-tkbox go test -tags image ./images/claude-code
+```
+
+The end-to-end test (`e2e/`) runs Tracekit's hook client in a box directly, not Claude Code, so it doesn't cover the
+managed settings.
 
 What the image installs is pinned: Claude Code and its platform binaries by `package-lock.json` (`npm ci` checks each
 package's integrity hash), and the hook client and its dependencies by `requirements.txt` (`pip install
