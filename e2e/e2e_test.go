@@ -78,6 +78,12 @@ func setup(t *testing.T, daemonArgs ...string) *env {
 	run(t, e.work, "git", "add", ".")
 	run(t, e.work, "git", "-c", "user.email=e2e@example.com", "-c", "user.name=e2e", "commit", "-q", "-m", "init")
 
+	// $TKBOX_FIRECRACKER and $TKBOX_KERNEL name local copies of the pinned assets, for a host whose downloads fail
+	for flag, env := range map[string]string{"--firecracker": "TKBOX_FIRECRACKER", "--kernel": "TKBOX_KERNEL"} {
+		if p := os.Getenv(env); p != "" {
+			daemonArgs = append(daemonArgs, flag, p)
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	d := exec.CommandContext(ctx, filepath.Join(bin, "tkbox"), append([]string{"daemon", "--state-dir", e.state,
 		"--approval-timeout", "5s", "--egress-allow-private", "127.0.0.1/32", "--upstream-ca", caFile}, daemonArgs...)...)
