@@ -27,6 +27,7 @@ const (
 	SourceSecretLeak = "tkbox.secret.leak" // {name, host, reason}
 	SourceModelCall  = "tkbox.model.call"  // {host, path, status, bytes}
 	SourceEgress     = "tkbox.egress"      // {host, port, decision, reason} for refusals Box made itself
+	SourceChannel    = "tkbox.channel"     // {refusal, method, reason, folded}: frames the agent channel refused
 	SourceApproval   = "tkbox.approval"    // trusted: a Box approval {approval_id, target, decision, approver}
 	SourceContained  = "tkbox.contained"   // {state, incident_id}
 )

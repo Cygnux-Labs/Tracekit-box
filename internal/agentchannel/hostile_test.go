@@ -71,7 +71,7 @@ func TestRunCapCountsRegistrationsInFlight(t *testing.T) {
 	}
 	passed := 0
 	for i := 0; i < MaxConnections; i++ {
-		if s.check("register_run", map[string]any{"method": "register_run"}, nil) == nil {
+		if s.check("register_run", fieldsOf(t, `{"method":"register_run"}`), nil) == nil {
 			passed++
 		}
 	}

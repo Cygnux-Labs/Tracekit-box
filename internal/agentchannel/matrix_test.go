@@ -54,6 +54,18 @@ func channelHarness(t *testing.T, f *matrixSigner) (*Server, net.Conn, *bufio.Re
 	a, b := net.Pipe()
 	done := make(chan struct{})
 	go func() { s.handle(&activeConn{guest: a}); close(done) }()
+	// the connection's own rate token is taken before a test sets the bucket
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+		s.mu.Lock()
+		taken := s.frames < RateBurst
+		s.mu.Unlock()
+		if taken {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the connection took no rate token")
+		}
+	}
 	return s, b, bufio.NewReader(b), done
 }
 
@@ -213,7 +225,7 @@ func TestSignerRunReuseAndClosedRunNotClosedAgain(t *testing.T) {
 	if err := s.record("register_run", []byte(`{"run_id":"owned","run_token":"t2"}`), nil); err == nil {
 		t.Fatal("signer run id reuse accepted")
 	}
-	if err := s.record("close_run", []byte(`{"ok":true}`), map[string]any{"run_id": "owned"}); err != nil {
+	if err := s.record("close_run", []byte(`{"ok":true}`), fieldsOf(t, `{"run_id":"owned"}`)); err != nil {
 		t.Fatal(err)
 	}
 	called := false
@@ -257,7 +269,7 @@ func TestRunCapCountsClosedRuns(t *testing.T) {
 	for i := 0; i < MaxRuns; i++ {
 		s.runs[fmt.Sprintf("r%d", i)] = runEntry{closed: true}
 	}
-	err := s.check("register_run", map[string]any{}, nil)
+	err := s.check("register_run", fieldsOf(t, `{}`), nil)
 	var refused *refusal
 	if !errors.As(err, &refused) || refused.code != "quota_exceeded" || refused.kind != RefusedRunCap {
 		t.Fatalf("cap error %v", err)
@@ -302,7 +314,7 @@ func TestByteBudgetChargesEachFullContentFrame(t *testing.T) {
 	for _, method := range []string{"model_event", "complete", "observe"} {
 		frame := []byte(`{"method":"` + method + `","run_id":"owned","body":"b","result":"r","value":"v"}`)
 		s.bytes = 0
-		if err := s.check(method, map[string]any{"run_id": "owned"}, frame); err != nil {
+		if err := s.check(method, fieldsOf(t, `{"run_id":"owned"}`), frame); err != nil {
 			t.Fatalf("%s: %v", method, err)
 		}
 		if s.bytes != int64(len(frame)) {
@@ -402,7 +414,8 @@ func TestCloseOrderListenerThenConnections(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Close(orderedListener{Listener: l, events: &events})
-	if len(events) != 3 || events[0] != "listener" || events[1] != "connection" || events[2] != "connection" {
+	// the guest goes first; a signer connection is closed by its own handler once its reply is in (none runs here)
+	if len(events) != 2 || events[0] != "listener" || events[1] != "connection" {
 		t.Fatalf("close sequence %v", events)
 	}
 }
@@ -479,8 +492,8 @@ func TestSignerReplyDeadlineAndCloseWakeApprovalWait(t *testing.T) {
 	go func() { s.Close(l); close(closed) }()
 	select {
 	case <-closed:
-	case <-time.After(time.Second):
-		t.Fatal("Close waited on signer reply")
+	case <-time.After(CloseReplyWait + time.Second):
+		t.Fatalf("Close waited on a long poll's signer reply past CloseReplyWait (%s)", CloseReplyWait)
 	}
 	close(quit)
 	_ = c.Close()
@@ -516,8 +529,8 @@ func TestTwoBoxesIsolateRunsApprovalsBudgetsAndRate(t *testing.T) {
 	for _, tc := range []struct {
 		s      *Server
 		method string
-		obj    map[string]any
-	}{{a, "decide", map[string]any{"run_id": "b-run"}}, {b, "approval_get", map[string]any{"approval_id": "a-approval"}}} {
+		obj    *Frame
+	}{{a, "decide", fieldsOf(t, `{"run_id":"b-run"}`)}, {b, "approval_get", fieldsOf(t, `{"approval_id":"a-approval"}`)}} {
 		if err := tc.s.check(tc.method, tc.obj, nil); err == nil {
 			t.Fatalf("cross-box check passed: %s %v", tc.method, tc.obj)
 		}

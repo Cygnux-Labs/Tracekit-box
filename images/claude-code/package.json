@@ -1,0 +1,7 @@
+{
+  "name": "tkbox-claude-code-image",
+  "private": true,
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.307"
+  }
+}

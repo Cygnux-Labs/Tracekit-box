@@ -1,7 +1,10 @@
 {
   "allowManagedHooksOnly": true,
   "env": {
-    "TRACEKIT_SIGNER": "/run/tkbox/signer.sock"
+    "TRACEKIT_SIGNER": "/run/tkbox/signer.sock",
+    "PATH": "/opt/tracekit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "LD_PRELOAD": "",
+    "LD_LIBRARY_PATH": ""
   },
   "hooks": {
     "PreToolUse": [
@@ -10,7 +13,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/bin/sh -c 'python3 -I -m tracekit.integrations.claude_code PreToolUse; s=$?; [ $s = 0 ] || [ $s = 2 ] && exit $s; grep -Eq '\"'\"'\"fail_mode\"[[:space:]]*:[[:space:]]*\"open\"'\"'\"' /etc/tracekit/client.json 2>/dev/null && { echo '\"'\"'tracekit: the hook could not run; call NOT recorded (fail_mode open)'\"'\"' >&2; exit 1; }; echo '\"'\"'tracekit: the hook could not run; call blocked (fail-closed)'\"'\"' >&2; exit 2'",
+            "command": "/bin/sh -c '/opt/tracekit/bin/python3 -I -m tracekit.integrations.claude_code PreToolUse; s=$?; [ $s = 0 ] || [ $s = 2 ] && exit $s; /bin/grep -Eq '\"'\"'\"fail_mode\"[[:space:]]*:[[:space:]]*\"open\"'\"'\"' /etc/tracekit/client.json 2>/dev/null && { echo '\"'\"'tracekit: the hook could not run; call NOT recorded (fail_mode open)'\"'\"' >&2; exit 1; }; echo '\"'\"'tracekit: the hook could not run; call blocked (fail-closed)'\"'\"' >&2; exit 2'",
             "timeout": 600
           }
         ]
@@ -22,7 +25,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/bin/sh -c 'python3 -I -m tracekit.integrations.claude_code PostToolUse; s=$?; [ $s = 0 ] && exit 0; [ $s = 1 ] || [ $s = 2 ] || echo '\"'\"'tracekit: the hook could not run; event not recorded'\"'\"' >&2; exit 1'",
+            "command": "/bin/sh -c '/opt/tracekit/bin/python3 -I -m tracekit.integrations.claude_code PostToolUse; s=$?; [ $s = 0 ] && exit 0; [ $s = 1 ] || [ $s = 2 ] || echo '\"'\"'tracekit: the hook could not run; event not recorded'\"'\"' >&2; exit 1'",
             "timeout": 30
           }
         ]
@@ -34,7 +37,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/bin/sh -c 'python3 -I -m tracekit.integrations.claude_code PostToolUseFailure; s=$?; [ $s = 0 ] && exit 0; [ $s = 1 ] || [ $s = 2 ] || echo '\"'\"'tracekit: the hook could not run; event not recorded'\"'\"' >&2; exit 1'",
+            "command": "/bin/sh -c '/opt/tracekit/bin/python3 -I -m tracekit.integrations.claude_code PostToolUseFailure; s=$?; [ $s = 0 ] && exit 0; [ $s = 1 ] || [ $s = 2 ] || echo '\"'\"'tracekit: the hook could not run; event not recorded'\"'\"' >&2; exit 1'",
             "timeout": 30
           }
         ]
@@ -45,7 +48,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/bin/sh -c 'python3 -I -m tracekit.integrations.claude_code UserPromptSubmit; s=$?; [ $s = 0 ] && exit 0; [ $s = 1 ] || [ $s = 2 ] || echo '\"'\"'tracekit: the hook could not run; event not recorded'\"'\"' >&2; exit 1'",
+            "command": "/bin/sh -c '/opt/tracekit/bin/python3 -I -m tracekit.integrations.claude_code UserPromptSubmit; s=$?; [ $s = 0 ] && exit 0; [ $s = 1 ] || [ $s = 2 ] || echo '\"'\"'tracekit: the hook could not run; event not recorded'\"'\"' >&2; exit 1'",
             "timeout": 30
           }
         ]
@@ -56,7 +59,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/bin/sh -c 'python3 -I -m tracekit.integrations.claude_code Stop; s=$?; [ $s = 0 ] && exit 0; [ $s = 1 ] || [ $s = 2 ] || echo '\"'\"'tracekit: the hook could not run; event not recorded'\"'\"' >&2; exit 1'",
+            "command": "/bin/sh -c '/opt/tracekit/bin/python3 -I -m tracekit.integrations.claude_code Stop; s=$?; [ $s = 0 ] && exit 0; [ $s = 1 ] || [ $s = 2 ] || echo '\"'\"'tracekit: the hook could not run; event not recorded'\"'\"' >&2; exit 1'",
             "timeout": 30
           }
         ]
@@ -67,7 +70,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/bin/sh -c 'python3 -I -m tracekit.integrations.claude_code SubagentStart; s=$?; [ $s = 0 ] && exit 0; [ $s = 1 ] || [ $s = 2 ] || echo '\"'\"'tracekit: the hook could not run; event not recorded'\"'\"' >&2; exit 1'",
+            "command": "/bin/sh -c '/opt/tracekit/bin/python3 -I -m tracekit.integrations.claude_code SubagentStart; s=$?; [ $s = 0 ] && exit 0; [ $s = 1 ] || [ $s = 2 ] || echo '\"'\"'tracekit: the hook could not run; event not recorded'\"'\"' >&2; exit 1'",
             "timeout": 30
           }
         ]
@@ -78,7 +81,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/bin/sh -c 'python3 -I -m tracekit.integrations.claude_code SubagentStop; s=$?; [ $s = 0 ] && exit 0; [ $s = 1 ] || [ $s = 2 ] || echo '\"'\"'tracekit: the hook could not run; event not recorded'\"'\"' >&2; exit 1'",
+            "command": "/bin/sh -c '/opt/tracekit/bin/python3 -I -m tracekit.integrations.claude_code SubagentStop; s=$?; [ $s = 0 ] && exit 0; [ $s = 1 ] || [ $s = 2 ] || echo '\"'\"'tracekit: the hook could not run; event not recorded'\"'\"' >&2; exit 1'",
             "timeout": 30
           }
         ]
@@ -89,7 +92,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/bin/sh -c 'python3 -I -m tracekit.integrations.claude_code SessionStart; s=$?; [ $s = 0 ] && exit 0; [ $s = 1 ] || [ $s = 2 ] || echo '\"'\"'tracekit: the hook could not run; event not recorded'\"'\"' >&2; exit 1'",
+            "command": "/bin/sh -c '/opt/tracekit/bin/python3 -I -m tracekit.integrations.claude_code SessionStart; s=$?; [ $s = 0 ] && exit 0; [ $s = 1 ] || [ $s = 2 ] || echo '\"'\"'tracekit: the hook could not run; event not recorded'\"'\"' >&2; exit 1'",
             "timeout": 30
           }
         ]
@@ -100,7 +103,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/bin/sh -c 'python3 -I -m tracekit.integrations.claude_code SessionEnd; s=$?; [ $s = 0 ] && exit 0; [ $s = 1 ] || [ $s = 2 ] || echo '\"'\"'tracekit: the hook could not run; event not recorded'\"'\"' >&2; exit 1'",
+            "command": "/bin/sh -c '/opt/tracekit/bin/python3 -I -m tracekit.integrations.claude_code SessionEnd; s=$?; [ $s = 0 ] && exit 0; [ $s = 1 ] || [ $s = 2 ] || echo '\"'\"'tracekit: the hook could not run; event not recorded'\"'\"' >&2; exit 1'",
             "timeout": 15
           }
         ]

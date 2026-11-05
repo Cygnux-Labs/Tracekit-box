@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -177,18 +179,27 @@ func (c *client) newRun(ctx context.Context, agent Agent, box *BoxLabel) (Run, e
 	if id == "" || token == "" {
 		return nil, badAnswer("register_run")
 	}
+	r := &run{c: c, id: id, token: token, turn: make(chan struct{}, 1)}
 	if box != nil {
 		fm, _ := m["fail_modes"].(map[string]any)
+		var refused error
 		if len(fm) == 0 {
-			return nil, badAnswer("register_run fail_modes")
+			refused = badAnswer("register_run fail_modes")
 		}
-		for mode, v := range fm {
-			if v != "closed" {
-				return nil, fmt.Errorf("agent channel requires closed fail mode %s", mode)
+		for _, mode := range slices.Sorted(maps.Keys(fm)) {
+			if fm[mode] != "closed" {
+				refused = fmt.Errorf("agent channel requires closed fail mode %s", mode)
+				break
 			}
 		}
+		if refused != nil { // the signer registered the run: close it, so none is left open with its token gone
+			if err := r.Close(ctx, "box run refused: "+refused.Error()); err != nil {
+				return nil, fmt.Errorf("%w (and closing the refused run failed: %v)", refused, err)
+			}
+			return nil, refused
+		}
 	}
-	return &run{c: c, id: id, token: token, turn: make(chan struct{}, 1)}, nil
+	return r, nil
 }
 
 func (c *client) Channel(ctx context.Context, r Run) (net.Conn, error) {

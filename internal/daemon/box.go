@@ -48,7 +48,7 @@ type box struct {
 	listeners     []net.Listener
 	run           tracekit.Run
 	runClosed     bool   // close_run accepted
-	runClosedBy   string // "export", "failed", "quarantine", "shutdown", "rm", "agent channel stop"
+	runClosedBy   string // "export", "failed", "quarantine", "shutdown", "rm"
 	runLost       bool   // a previous daemon left the run open and its token died with it
 	closeReason   string // why the box stopped: the run's close reason
 	calls         callTracker
@@ -528,9 +528,10 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 		ch.OnLimit = func(reason string) {
 			b.event(api.EventBoxLimit, "agent_channel", "agent channel limit reached: "+reason, nil)
 		}
-		ch.OnRefusal = func(r agentchannel.Refusal) {
+		ch.OnRefusal = func(r agentchannel.Refusal) { // already one per kind a second (agentchannel folds the rest)
 			summary, data := refusalEvent(r)
 			b.event(api.EventChannelRefused, "agent_channel", summary, data)
+			b.observe(tracekit.SourceChannel, untrustedObs, data)
 		}
 		b.mu.Lock()
 		b.channel, b.channelL = ch, cl
@@ -1122,20 +1123,10 @@ func (b *box) teardown(ctx context.Context, reason, detail string, kill, failed 
 	b.stopOnce.Do(func() { close(b.stopCh) })
 	b.closeChannel()
 	b.mu.Lock()
-	ch := b.channel
-	b.mu.Unlock()
-	if ch != nil {
-		cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		for _, err := range ch.CloseRuns(cctx) {
-			b.event(api.EventSignerProblem, "agent_channel", "could not close an agent channel run: "+err.Error(), nil)
-		}
-		cancel()
-	}
-	b.mu.Lock()
 	if b.timer != nil {
 		b.timer.Stop()
 	}
-	m, g, proxy, ls, run := b.machine, b.guest, b.proxy, b.listeners, b.run
+	ch, m, g, proxy, ls, run := b.channel, b.machine, b.guest, b.proxy, b.listeners, b.run
 	b.listeners = nil
 	b.mu.Unlock()
 	b.d.expireApprovals(b.id, reason)
@@ -1164,6 +1155,14 @@ func (b *box) teardown(ctx context.Context, reason, detail string, kill, failed 
 				m.Kill()
 			}
 		}
+	}
+	// the agent's runs close once the VM is down (a kill waits for no signer), each before the box run closes
+	if ch != nil {
+		cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		for _, err := range ch.CloseRuns(cctx) {
+			b.event(api.EventSignerProblem, "agent_channel", "could not close an agent channel run: "+err.Error(), nil)
+		}
+		cancel()
 	}
 	if proxy != nil {
 		proxy.Close()
@@ -1216,17 +1215,11 @@ func (b *box) teardown(ctx context.Context, reason, detail string, kill, failed 
 			b.closeReason = reason + "; " + lostReason
 		}
 		b.mu.Unlock()
-		b.mu.Lock()
-		channelEnabled := b.info.AgentChannel
-		b.mu.Unlock()
-		if failed || lostReason != "" || channelEnabled { // a channel stop closes its parent after all child runs have closed
+		if failed || lostReason != "" { // nothing (recordable) left to apply: close now; a stopped box keeps its run open for apply (see closeRun)
 			cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			by := "failed"
 			if !failed {
 				by = "records lost"
-				if lostReason == "" && channelEnabled {
-					by = "agent channel stop"
-				}
 			}
 			if err := b.closeRun(cctx, by); err != nil {
 				b.event(api.EventSignerProblem, "lifecycle", "could not close the Tracekit run: "+err.Error(), nil)

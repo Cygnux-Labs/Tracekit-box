@@ -4,11 +4,11 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"slices"
 	"strings"
@@ -38,6 +38,7 @@ const (
 	RefusedRate        = "rate"        // over RatePerSecond frames a second
 	RefusedRunCap      = "run_cap"     // MaxRuns reached
 	RefusedByteBudget  = "byte_budget" // ByteBudget spent
+	RefusedFrameCap    = "frame_cap"   // MaxForwardedFrames forwarded
 	RefusedConnections = "connections" // MaxConnections open
 	RefusedSigner      = "signer"      // the box's signer channel could not be opened for the connection
 )
@@ -88,6 +89,7 @@ type Server struct {
 	frames       float64
 	last         time.Time
 	bytes        int64
+	forwarded    int64
 	limitsSeen   map[string]bool
 	closed       bool
 	done         sync.WaitGroup
@@ -139,6 +141,12 @@ func (s *Server) handle(active *activeConn) {
 			s.releaseReservation()
 		}
 	}()
+	// a connection costs a frame of the rate limit: each one makes the signer set up a connection of its own
+	if ok, retry := s.takeToken(); !ok {
+		s.refuse(guest, &refusal{code: "quota_exceeded", msg: "agent channel rate limit exceeded", retryMS: retry,
+			kind: RefusedRate, reason: fmt.Sprintf("over %d frames a second", RatePerSecond)})
+		return
+	}
 	ctx := context.Background()
 	signer, err := s.Dial(ctx)
 	if err != nil {
@@ -164,7 +172,10 @@ func (s *Server) handle(active *activeConn) {
 		}
 		_ = guest.SetReadDeadline(time.Now().Add(s.FrameTimeout))
 		frame, obj, err := ReadFramePrefix(gr, first)
-		method, _ := obj["method"].(string)
+		method := ""
+		if obj != nil {
+			method = obj.Str("method")
+		}
 		if ok, retry := s.takeToken(); !ok {
 			s.refuse(guest, &refusal{code: "quota_exceeded", msg: "agent channel rate limit exceeded", retryMS: retry,
 				kind: RefusedRate, reason: fmt.Sprintf("over %d frames a second", RatePerSecond), method: method})
@@ -190,7 +201,7 @@ func (s *Server) handle(active *activeConn) {
 			return
 		}
 		if r := s.check(method, obj, frame); r != nil {
-			if r.kind == RefusedRunCap || r.kind == RefusedByteBudget {
+			if r.kind == RefusedRunCap || r.kind == RefusedByteBudget || r.kind == RefusedFrameCap {
 				s.limit(r.msg, r.kind)
 			}
 			r.method = method
@@ -199,16 +210,13 @@ func (s *Server) handle(active *activeConn) {
 		}
 		if method == "register_run" {
 			reserved = true
-		}
-		if method == "register_run" {
-			clean := map[string]any{"method": "register_run"}
-			if v, ok := obj["request_id"]; ok {
-				clean["request_id"] = v
+			if frame = registerFrame(obj); len(frame) > MaxFrame { // never longer than the frame it came in
+				s.releaseReservation()
+				reserved = false
+				s.refuse(guest, &refusal{code: "forbidden", msg: "register_run too long", kind: RefusedFrame,
+					reason: "a register_run over 1 MiB", method: method})
+				continue
 			}
-			if v, ok := obj["agent"]; ok {
-				clean["agent"] = v
-			}
-			frame, _ = json.Marshal(clean)
 		}
 		_ = signer.SetDeadline(time.Now().Add(SignerReplyTimeout))
 		if _, err = signer.Write(append(frame, '\n')); err != nil {
@@ -324,51 +332,50 @@ func (s *Server) takeToken() (bool, int64) {
 	return true, 0
 }
 
-// check refuses a decoded frame the box's channel must not pass on (nil: pass it).
-func (s *Server) check(method string, m map[string]any, frame []byte) *refusal {
+// check refuses a decoded frame the box's channel must not pass on (nil: pass it), and charges a passed frame to the
+// box's limits: every forwarded frame counts towards MaxForwardedFrames, and every one but hello and status (whose
+// answers record nothing) towards ByteBudget, as each may reach the signer's content vault.
+func (s *Server) check(method string, f *Frame, frame []byte) *refusal {
 	forbidden := func(kind, msg string) *refusal { return &refusal{code: "forbidden", msg: msg, kind: kind, reason: msg} }
 	if method == "register_run" {
 		for _, k := range []string{"parent", "principal", "principal_token", "caller", "source", "tenant", "analyzes", "replay_of", "investigation", "ext", "box"} {
-			if _, ok := m[k]; ok {
+			if f.Has(k) {
 				return forbidden(RefusedField, "forbidden register_run field "+k)
 			}
 		}
-		s.mu.Lock()
-		defer s.mu.Unlock()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch method {
+	case "register_run", "hello", "status":
+	case "approval_get":
+		if !s.approvals[f.Str("approval_id")] {
+			return forbidden(RefusedApproval, "approval is not owned by this box")
+		}
+	default:
+		if e, ok := s.runs[f.Str("run_id")]; !ok || e.closed {
+			return forbidden(RefusedRun, "run is not owned by this box")
+		}
+	}
+	if s.forwarded >= MaxForwardedFrames {
+		return &refusal{code: "quota_exceeded", msg: "agent channel frame limit reached", retryMS: 1000,
+			kind: RefusedFrameCap, reason: fmt.Sprintf("%d frames forwarded", MaxForwardedFrames)}
+	}
+	charged := method != "hello" && method != "status"
+	if size := int64(len(frame)); charged && s.bytes+size > ByteBudget {
+		return &refusal{code: "quota_exceeded", msg: "agent channel byte budget exceeded", retryMS: 1000,
+			kind: RefusedByteBudget, reason: fmt.Sprintf("%d MiB of frames sent", ByteBudget>>20)}
+	}
+	if method == "register_run" {
 		if len(s.runs)+s.reservations >= MaxRuns {
 			return &refusal{code: "quota_exceeded", msg: "run limit reached", retryMS: 1000, kind: RefusedRunCap,
 				reason: fmt.Sprintf("%d runs registered", MaxRuns)}
 		}
 		s.reservations++
-		return nil
 	}
-	if method == "hello" || method == "status" {
-		return nil
-	}
-	if method == "approval_get" {
-		id, _ := m["approval_id"].(string)
-		s.mu.Lock()
-		owned := s.approvals[id]
-		s.mu.Unlock()
-		if !owned {
-			return forbidden(RefusedApproval, "approval is not owned by this box")
-		}
-		return nil
-	}
-	rid, _ := m["run_id"].(string)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	e, ok := s.runs[rid]
-	if !ok || e.closed {
-		return forbidden(RefusedRun, "run is not owned by this box")
-	}
-	if method == "model_event" || method == "complete" || method == "observe" {
-		size := int64(len(frame))
-		if s.bytes+size > ByteBudget {
-			return &refusal{code: "quota_exceeded", msg: "agent channel byte budget exceeded", retryMS: 1000,
-				kind: RefusedByteBudget, reason: fmt.Sprintf("%d MiB of content sent", ByteBudget>>20)}
-		}
-		s.bytes += size
+	s.forwarded++
+	if charged {
+		s.bytes += int64(len(frame))
 	}
 	return nil
 }
@@ -380,7 +387,7 @@ func (s *Server) releaseReservation() {
 	}
 	s.mu.Unlock()
 }
-func (s *Server) record(method string, ans []byte, req map[string]any) error {
+func (s *Server) record(method string, ans []byte, req *Frame) error {
 	var m map[string]any
 	if json.Unmarshal(ans, &m) != nil {
 		if method == "register_run" {
@@ -415,7 +422,7 @@ func (s *Server) record(method string, ans []byte, req map[string]any) error {
 	}
 	if method == "close_run" {
 		if _, failed := result["error"]; !failed {
-			id, _ := req["run_id"].(string)
+			id := req.Str("run_id")
 			if e, ok := s.runs[id]; ok {
 				e.closed = true
 				s.runs[id] = e
@@ -425,8 +432,9 @@ func (s *Server) record(method string, ans []byte, req map[string]any) error {
 	return nil
 }
 
-// Close stops acceptance and closes all active guest streams before callers close the box run, then reports the
-// refusals still folded (OnRefusal).
+// Close stops acceptance and closes every guest stream, then gives signer replies already on their way CloseReplyWait
+// to arrive (a run the signer registered then reaches the run table, for CloseRuns) before it closes the signer
+// connections. Then it reports the refusals still folded (OnRefusal).
 func (s *Server) Close(l net.Listener) {
 	s.mu.Lock()
 	s.closed = true
@@ -437,69 +445,101 @@ func (s *Server) Close(l net.Listener) {
 	s.mu.Lock()
 	for c := range s.connections {
 		_ = c.guest.Close()
-		if c.signer != nil {
-			_ = c.signer.Close()
-		}
 	}
 	s.mu.Unlock()
-	s.done.Wait()
+	handled := make(chan struct{})
+	go func() { s.done.Wait(); close(handled) }()
+	select {
+	case <-handled:
+	case <-time.After(CloseReplyWait):
+		s.mu.Lock()
+		for c := range s.connections {
+			if c.signer != nil {
+				_ = c.signer.Close()
+			}
+		}
+		s.mu.Unlock()
+		<-handled
+	}
 	s.flushRefusals()
 }
 
+// CloseRuns closes the channel's open runs, closeRunsAtOnce at a time; each close ends with ctx.
 func (s *Server) CloseRuns(ctx context.Context) []error {
 	s.mu.Lock()
-	entries := make(map[string]runEntry, len(s.runs))
-	ids := make([]string, 0, len(s.runs))
+	open := map[string]string{}
 	for id, e := range s.runs {
 		if !e.closed {
-			entries[id] = e
-			ids = append(ids, id)
+			open[id] = e.token
 		}
 	}
 	s.mu.Unlock()
-	slices.Sort(ids)
+	var mu sync.Mutex
 	var failures []error
-	for _, id := range ids {
-		e := entries[id]
-		c, err := s.Dial(ctx)
-		if err != nil {
-			failures = append(failures, fmt.Errorf("close channel run %s: %w", id, err))
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, closeRunsAtOnce)
+	for _, id := range slices.Sorted(maps.Keys(open)) {
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			failures = append(failures, fmt.Errorf("close channel run %s: %w", id, ctx.Err()))
 			continue
 		}
-		var rid [16]byte
-		if _, err := rand.Read(rid[:]); err != nil {
-			c.Close()
-			failures = append(failures, err)
-			continue
-		}
-		req, _ := json.Marshal(map[string]any{"method": "close_run", "request_id": hex.EncodeToString(rid[:]), "run_id": id, "run_token": e.token})
-		c.SetDeadline(time.Now().Add(IdleTimeout))
-		if _, err := c.Write(append(req, '\n')); err != nil {
-			failures = append(failures, fmt.Errorf("close channel run %s: %w", id, err))
-			c.Close()
-			continue
-		}
-		r := bufio.NewReader(c)
-		ans, err := readSignerFrame(r)
-		if err != nil {
-			failures = append(failures, fmt.Errorf("close channel run %s: %w", id, err))
-		} else {
-			var reply map[string]any
-			if json.Unmarshal(ans, &reply) != nil {
-				failures = append(failures, fmt.Errorf("close channel run %s: invalid signer reply", id))
-			} else if refusal, ok := reply["error"]; ok {
-				failures = append(failures, fmt.Errorf("close channel run %s: signer refused: %v", id, refusal))
-			} else {
-				s.mu.Lock()
-				e := s.runs[id]
-				e.closed = true
-				s.runs[id] = e
-				s.mu.Unlock()
+		wg.Add(1)
+		go func(id, token string) {
+			defer wg.Done()
+			defer func() { <-slots }()
+			if err := s.closeRun(ctx, id, token); err != nil {
+				mu.Lock()
+				failures = append(failures, fmt.Errorf("close channel run %s: %w", id, err))
+				mu.Unlock()
 			}
-		}
-		c.Close()
+		}(id, open[id])
 	}
+	wg.Wait()
+	slices.SortFunc(failures, func(a, b error) int { return strings.Compare(a.Error(), b.Error()) })
 	return failures
+}
+
+// closeRun closes one of the channel's runs on a signer connection of its own, which ends when ctx does.
+func (s *Server) closeRun(ctx context.Context, id, token string) error {
+	c, err := s.Dial(ctx)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	defer context.AfterFunc(ctx, func() { _ = c.Close() })()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(SignerReplyTimeout)
+	}
+	_ = c.SetDeadline(deadline)
+	req, _ := json.Marshal(map[string]any{"method": "close_run", "request_id": rand.Text(), "run_id": id, "run_token": token})
+	ans, err := func() ([]byte, error) {
+		if _, err := c.Write(append(req, '\n')); err != nil {
+			return nil, err
+		}
+		return readSignerFrame(bufio.NewReader(c))
+	}()
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
+	var reply map[string]any
+	if json.Unmarshal(ans, &reply) != nil {
+		return errors.New("invalid signer reply")
+	}
+	if refusal, ok := reply["error"]; ok {
+		return fmt.Errorf("signer refused: %v", refusal)
+	}
+	s.mu.Lock()
+	e := s.runs[id]
+	e.closed = true
+	s.runs[id] = e
+	s.mu.Unlock()
+	return nil
 }
 
 func writeError(w io.Writer, code, msg string, retry int64) {

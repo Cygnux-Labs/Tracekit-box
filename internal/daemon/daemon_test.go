@@ -126,6 +126,22 @@ func TestAgentChannelRefusalsAreBoxEvents(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Fatalf("channel.refused events\n%q\nwant\n%q", got, want)
 	}
+	// and the box run records them, as egress refusals are: the same folded refusals, without the frames
+	var signed []string
+	for _, r := range e.run(0).Records {
+		if r.Method == "observe" && r.Source == tracekit.SourceChannel {
+			b, _ := json.Marshal(r.Value)
+			signed = append(signed, string(b))
+		}
+	}
+	wantSigned := []string{
+		`{"method":"approval_decide","reason":"method not allowed","refusal":"method"}`,
+		`{"method":"close_run","reason":"run is not owned by this box","refusal":"run"}`,
+		`{"folded":2,"refusal":"method"}`,
+	}
+	if !slices.Equal(signed, wantSigned) {
+		t.Fatalf("tkbox.channel observes\n%q\nwant\n%q", signed, wantSigned)
+	}
 }
 
 type stopOrderLog struct {
@@ -240,9 +256,16 @@ func TestStopOrderListenerConnectionsChannelRunBoxRun(t *testing.T) {
 	}
 	b.teardown(context.Background(), "test stop", "", false, false)
 	_ = c.Close()
-	want := []string{"listener", "guest_connection", "signer_connection", "channel_run", "box_run"}
+	// a stopped box keeps its run open for apply; rm, export or shutdown closes it, after the channel's runs
+	want := []string{"listener", "guest_connection", "signer_connection", "channel_run"}
 	if got := order.got(); !slices.Equal(got, want) {
 		t.Fatalf("stop order %v, want %v", got, want)
+	}
+	if err := b.closeRun(context.Background(), "rm"); err != nil {
+		t.Fatal(err)
+	}
+	if got := order.got(); !slices.Equal(got, append(want, "box_run")) {
+		t.Fatalf("stop order %v, want %v then box_run", got, want)
 	}
 }
 
