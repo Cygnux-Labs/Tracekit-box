@@ -13,6 +13,8 @@ import (
 // (a shell prefix and a shell that are stubs, a PATH of stubs, BASH_ENV and ENV, bare mode, disableAllHooks, its own
 // TRACEKIT_SIGNER and runtime dir, a hook of its own), still runs the managed hooks: SessionStart registers the hook's
 // run with the signer on the pinned socket and keeps its state in the pinned runtime dir, and SessionEnd closes it.
+// A control run first takes the pins out of the managed settings and expects the project's shell prefix to run in the
+// hooks' place, so a Claude Code that stopped reading the project file would fail here rather than pass.
 // It runs with no API key and no network, so it makes no model call: Claude Code fires SessionStart, then stops at "Not
 // logged in". It builds the image, so it needs docker (DOCKER_CONTEXT names the engine) and network for the build:
 //
@@ -38,7 +40,8 @@ func TestClaudeCodeRunsTheManagedHooksInAHostileProject(t *testing.T) {
 	out := docker("start", "-a", id)
 	t.Logf("%s", out)
 	for _, want := range []*regexp.Regexp{
-		regexp.MustCompile(`check: claude said: Not logged in`), // it never reached the model
+		regexp.MustCompile(`control: unpinned, /tmp/stub-ran exists`), // the project file is read
+		regexp.MustCompile(`check: claude said: Not logged in`),       // it never reached the model
 		regexp.MustCompile(`check: signer saw, in order: .*register_run .*close_run`),
 		regexp.MustCompile(`check: the pinned runtime dir was made`),
 		regexp.MustCompile(`check: /tmp/stub-ran absent`),

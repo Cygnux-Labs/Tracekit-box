@@ -1,7 +1,8 @@
 #!/bin/sh
 # Runs in the Claude Code image as root, with no network: starts a fake signer, writes a project whose settings try every
-# way to keep the managed hooks from running, then runs Claude Code as the agent user with no API key. SessionStart fires
-# before any model call; the lines starting "check:" say what happened.
+# way to keep the managed hooks from running, then runs Claude Code as the agent user with no API key, first with the
+# pins taken out of the managed settings (the control), then with the image's own. SessionStart fires before any model
+# call; the lines starting "control:" and "check:" say what happened.
 mkdir -p /run/tkbox
 /opt/tracekit/bin/python3 -I /check/fakesigner.py /run/tkbox/signer.sock /tmp/signer.log &
 until [ -S /run/tkbox/signer.sock ]; do sleep 0.1; done
@@ -28,8 +29,26 @@ cat > /workspace/.claude/settings.json <<'EOF'
 }
 EOF
 chown -R agent:agent /workspace
+run_claude() { su agent -s /bin/sh -c 'cd /workspace && env -u ANTHROPIC_API_KEY timeout 90 claude -p hello' > /tmp/claude.out 2>&1; }
 
-su agent -s /bin/sh -c 'cd /workspace && env -u ANTHROPIC_API_KEY timeout 90 claude -p hello' > /tmp/claude.out 2>&1
+# control: the same managed hooks without the pins (no env key the project sets, no disableAllHooks). The project's
+# shell prefix then runs in their place, so the project file is read and the pins are what keep it out.
+managed=/etc/claude-code/managed-settings.json
+mv $managed /tmp/managed.json
+/opt/tracekit/bin/python3 -I -c '
+import json
+m, p = json.load(open("/tmp/managed.json")), json.load(open("/workspace/.claude/settings.json"))
+for k in p["env"]:
+    m["env"].pop(k, None)
+m.pop("disableAllHooks", None)
+json.dump(m, open("'$managed'", "w"))'
+run_claude
+if [ -e /tmp/stub-ran ]; then echo "control: unpinned, /tmp/stub-ran exists"; else echo "control: unpinned, /tmp/stub-ran absent"; fi
+mv /tmp/managed.json $managed
+rm -rf /tmp/stub-ran /tmp/project-hook-ran /tmp/elsewhere /home/agent/.tracekit/run
+: > /tmp/signer.log
+
+run_claude
 echo "check: claude exit $?"
 echo "check: claude said: $(head -c 300 /tmp/claude.out | tr '\n' ' ')"
 echo "check: signer saw, in order: $(uniq /tmp/signer.log 2>/dev/null | tr '\n' ' ')"

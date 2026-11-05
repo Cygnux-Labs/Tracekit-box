@@ -45,8 +45,6 @@ func keepQuiet(t *testing.T, addr string) (net.Conn, *bufio.Reader) {
 // A register_run that found its link quiet, when the signer could not be reached again: check() had reserved a place
 // for it, but the handler marked it reserved only after the re-dial, so the failed re-dial's return never gave the
 // place back. Each signer restart during a quiet link cost the box one of its MaxRuns for good.
-// place for it (s.reservations++), but the handler marks it reserved only after the re-dial, so the failed re-dial's
-// return never gives the place back: each one costs the box one of its MaxRuns for good.
 func TestAFailedRedialReleasesItsRunReservation(t *testing.T) {
 	t.Parallel()
 	var dials atomic.Int32
@@ -92,8 +90,6 @@ func TestAFailedRedialReleasesItsRunReservation(t *testing.T) {
 // 20 boxes at once, each with a quiet link that a register_run (or a status) replaces while Close runs at a jittered
 // moment and the signer answers at a jittered pace: every run the signer registered is closed by CloseRuns, Close
 // waits no longer than CloseReplyWait plus a dial, and -race stays quiet.
-// jittered moment and the signer answers at a jittered pace. Every run the signer registered must be closed by
-// CloseRuns, Close must not wait past CloseReplyWait plus a dial, and -race must stay quiet.
 func TestRedialRacesCloseAndCloseRuns(t *testing.T) {
 	t.Parallel()
 	const boxes = 20
@@ -174,8 +170,6 @@ func TestRedialRacesCloseAndCloseRuns(t *testing.T) {
 // The re-dial ran on context.Background, so a stop that began while a quiet link was being replaced waited for the
 // dial (up to connectTimeout for the dial and again for hello + channel_open), and teardown calls Close before it
 // kills the VM. Dials now end when Close begins.
-// for the dial (Tracekit.Channel: up to connectTimeout for the dial and again for hello + channel_open), and
-// teardown calls Close before it kills the VM.
 func TestCloseDoesNotWaitForARedial(t *testing.T) {
 	t.Parallel()
 	var dials atomic.Int32

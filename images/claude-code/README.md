@@ -35,7 +35,9 @@ didn't stop the managed hooks even unpinned; those pins keep it so if a later ve
 `go test ./images/claude-code` checks the file. `go test -tags image ./images/claude-code` checks what Claude Code does
 with it: it builds the image and runs the image's own `claude`, with no API key and no network, in a project whose
 settings set all of the above to stubs and add their own `TRACEKIT_SIGNER`, runtime dir and SessionStart hook, against a
-fake signer on `/run/tkbox/signer.sock`. It passes when the managed hooks registered their run with that signer and
+fake signer on `/run/tkbox/signer.sock`. It first runs a control with the pins taken out of the managed settings,
+which must let the project's shell prefix run in the hooks' place: so the project file is read, and the pins are what
+keep it out. With the image's settings it passes when the managed hooks registered their run with that signer and
 closed it, kept their state in the pinned runtime dir, and nothing of the project's ran. Claude Code runs its session
 hooks, then stops at "Not logged in", so the test makes no model call and no tool hook runs. It needs a Docker engine
 (`DOCKER_CONTEXT` picks it) and network for the build:

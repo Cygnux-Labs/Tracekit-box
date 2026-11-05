@@ -13,8 +13,6 @@ import (
 // Refused frames keep a guest connection alive (each is guest activity) but never reach the signer, whose connection was
 // then silent past its 30 s: the next frame that passed went into a connection the signer had dropped, and the agent got
 // no answer. A signer connection quiet for SignerQuietLimit is now replaced before a frame goes out.
-// signer, whose connection is then silent past its 30 s; the next frame that passes goes into a connection the signer
-// has dropped, and the agent gets no answer.
 func TestAQuietSignerConnectionIsReplaced(t *testing.T) {
 	t.Parallel()
 	const signerIdle = 30 * time.Second
