@@ -125,7 +125,7 @@ runs:
       run: |
         command -v mkfs.ext4 >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q e2fsprogs; }
 
-    - uses: actions/setup-python@v5
+    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
       with:
         python-version: "3.12"
 
@@ -139,7 +139,7 @@ runs:
           tracekit up --wait
         fi
 
-    - uses: actions/setup-go@v5
+    - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
       if: inputs.tkbox-version == 'source'
       with:
         go-version-file: ${{ github.action_path }}/../go.mod
@@ -387,7 +387,7 @@ runs:
       run: echo "name=${TKB_NAME:-tracekit-box-$GITHUB_JOB-$GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
 
     # uploaded even when verification fails, so the failing bundle can be inspected
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       if: always() && inputs.upload-bundle == 'true' && steps.export.outputs.bundle != ''
       with:
         name: ${{ steps.artifact.outputs.name }}
@@ -398,7 +398,7 @@ runs:
         if-no-files-found: error
 
     # on failure: the daemon's log and each box's events and console, for finding out why
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       if: failure()
       with:
         name: ${{ steps.artifact.outputs.name || format('tracekit-box-{0}-{1}', github.job, github.run_attempt) }}-logs
