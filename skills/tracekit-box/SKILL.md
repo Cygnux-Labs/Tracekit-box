@@ -11,7 +11,7 @@ description: >
 # Run a job in Tracekit Box
 
 1. **Check the host.** `test -r /dev/kvm -a -w /dev/kvm` must succeed (Linux with KVM). `tkbox version` and
-   `tracekit --version` (1.4.2) must work. If the signer isn't running:
+   `tracekit --version` (1.4.2 to 1.5.3 tested) must work. If the signer isn't running:
    `tracekit init --dev --v2 --no-hooks && tracekit up --wait`. If `tkbox ls` fails, no daemon is answering: start
    `tkbox daemon` in the background and wait until `tkbox ls` works.
 2. **Create the box with the least it needs.** Name the image, only the hosts or presets the job needs (`--allow`),

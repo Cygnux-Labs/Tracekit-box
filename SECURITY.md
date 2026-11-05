@@ -33,7 +33,7 @@ Three trust domains:
 |---|---|---|
 | Host | Trusted | `tkbox daemon`, the egress proxy, the image builder, the secrets you pass in, your checkout |
 | Guest (the micro-VM) | Untrusted | The agent, everything it runs, and `tkbox-guest` itself. Assume the agent is hostile: prompt-injected, or following instructions from a file it read |
-| Signer | Trusted, separate from the agent | The Tracekit 1.4.2 signer and its signing key, on the same host as the daemon (Box reaches it only over a Unix socket) |
+| Signer | Trusted, separate from the agent | A Tracekit signer (1.4.2 to 1.5.3 tested) and its signing key, on the same host as the daemon (Box reaches it only over a Unix socket) |
 
 The attacker controls everything inside the VM, including its kernel's view of the world and every byte the guest
 agent sends. The attacker does not control the host, the signer or the person approving on the host.
