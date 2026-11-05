@@ -81,7 +81,7 @@ func Dial(ctx context.Context, opts Options) (Client, error) {
 		return nil, err
 	}
 	c := &client{t: &transport{where: d.path, timeout: timeout}, source: d.source, stream: newID(),
-		bin: opts.TracekitBin}
+		bin: opts.TracekitBin, config: opts.Config}
 	c.t.put(c0)
 	// status.rpc_version is the signer's highest protocol; hello's range already holds ours
 	if _, err := c.Status(ctx); err != nil {
@@ -96,6 +96,7 @@ type client struct {
 	source signerSource
 	stream string // this client's event stream (one per process in the SDK)
 	bin    string
+	config string // Options.Config
 }
 
 func (c *client) Where() string { return c.t.where }

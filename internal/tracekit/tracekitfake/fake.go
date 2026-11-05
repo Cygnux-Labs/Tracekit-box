@@ -33,12 +33,20 @@ type Client struct {
 	// ApprovalState is what WaitApproval returns (default "approved").
 	ApprovalState string
 	Exported      []string
+	// RPCVersion is what Status reports (default 19).
+	RPCVersion int
+	// ChannelDial is what Channel returns (default an error: no channel).
+	ChannelDial func() (net.Conn, error)
 }
 
 func (c *Client) Where() string { return "fake" }
 
 func (c *Client) Status(ctx context.Context) (tracekit.Status, error) {
-	return tracekit.Status{RPCVersion: 19, SignerName: "fake", SignerVersion: "1.4.2", Identity: "uid:0",
+	v := c.RPCVersion
+	if v == 0 {
+		v = 19
+	}
+	return tracekit.Status{RPCVersion: v, SignerName: "fake", SignerVersion: "1.4.2", Identity: "uid:0",
 		Where: "fake"}, c.StatusErr
 }
 
@@ -57,6 +65,9 @@ func (c *Client) NewBoxRun(ctx context.Context, agent tracekit.Agent, box tracek
 	return c.NewRun(ctx, agent)
 }
 func (c *Client) Channel(context.Context, tracekit.Run) (net.Conn, error) {
+	if c.ChannelDial != nil {
+		return c.ChannelDial()
+	}
 	return nil, errors.New("fake channel unavailable")
 }
 

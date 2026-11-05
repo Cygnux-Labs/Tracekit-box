@@ -19,7 +19,8 @@ import (
 //	tracekit verify <bundleOut> --trust <trustOut> --json
 //
 // with TRACEKIT_SIGNER set to our socket (export nudges the signer through it for a checkpoint). The CLI reads the
-// signer's store itself: the same-user dev signer's by default, the system signer's through its signer.yaml. A run is
+// signer's store itself: through Options.Config when given, else the system signer's signer.yaml when that is the
+// signer, else the same-user dev signer's store. A run is
 // final a few seconds after close_run; until then verify says "VERIFIED TO HEAD n (open)", so export and verify are
 // retried until it says VERIFIED, for up to exportWait.
 
@@ -40,7 +41,9 @@ func (c *client) Export(ctx context.Context, runID, bundleOut, trustOut string) 
 		bin = "tracekit"
 	}
 	var cfg []string
-	if c.source == sourceSystem {
+	if c.config != "" {
+		cfg = []string{"--config", c.config}
+	} else if c.source == sourceSystem {
 		if _, err := os.Stat(systemSignerYAML); err == nil {
 			cfg = []string{"--config", systemSignerYAML}
 		}

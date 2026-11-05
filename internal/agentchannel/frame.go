@@ -78,7 +78,7 @@ func ReadFramePrefix(r *bufio.Reader, first byte) ([]byte, map[string]any, error
 	}
 	m, err := Decode(line)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: %v", ErrInvalidFrame, err)
+		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidFrame, err)
 	}
 	return line, m, nil
 }
@@ -102,30 +102,36 @@ func Decode(data []byte) (map[string]any, error) {
 		return nil, errors.New("frame must be a JSON object")
 	}
 	method, ok := m["method"].(string)
+	refuse := func(kind, msg, reason string) (map[string]any, error) {
+		return nil, &refusal{code: "forbidden", msg: msg, kind: kind, reason: reason, method: method}
+	}
 	if !ok || !methods[method] {
-		return nil, fmt.Errorf("method %q is not allowed", method)
+		return refuse(RefusedMethod, fmt.Sprintf("method %q is not allowed", method), "method not allowed")
 	}
-	if denied(m, "caller", "on_behalf", "amended", "tool_results", "ext") {
-		return nil, errors.New("forbidden field")
+	if k := denied(m, "caller", "on_behalf", "amended", "tool_results", "ext"); k != "" {
+		return refuse(RefusedField, "forbidden field", "field "+k+" is not passed")
 	}
-	if method == "register_run" && denied(m, "parent", "principal", "principal_token", "source", "tenant", "analyzes", "replay_of", "investigation") {
-		return nil, errors.New("forbidden register_run field")
+	if method == "register_run" {
+		if k := denied(m, "parent", "principal", "principal_token", "source", "tenant", "analyzes", "replay_of", "investigation"); k != "" {
+			return refuse(RefusedField, "forbidden register_run field", "register_run field "+k+" is not passed")
+		}
 	}
 	if method == "observe" {
 		if s, _ := m["source"].(string); len(s) >= 6 && s[:6] == "tkbox." {
-			return nil, errors.New("tkbox observe source is reserved")
+			return refuse(RefusedField, "tkbox observe source is reserved", "observe source tkbox.* is Box's own")
 		}
 	}
 	return m, nil
 }
 
-func denied(m map[string]any, keys ...string) bool {
+// denied is the first of keys that m holds, or "".
+func denied(m map[string]any, keys ...string) string {
 	for _, k := range keys {
 		if _, ok := m[k]; ok {
-			return true
+			return k
 		}
 	}
-	return false
+	return ""
 }
 
 func value(d *json.Decoder, depth int) (any, error) {

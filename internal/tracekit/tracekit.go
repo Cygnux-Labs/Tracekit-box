@@ -86,6 +86,10 @@ type Options struct {
 	Signer      string
 	Timeout     time.Duration // per call (default 30s); long polls add their own wait
 	TracekitBin string        // the `tracekit` CLI used by Export (default "tracekit" in PATH)
+	// Config is the signer's signer.yaml, which Export passes to the CLI as --config so it reads that signer's store.
+	// "": the system signer's /etc/tracekit/signer.yaml when the system signer is the one, else the CLI's default (the
+	// dev signer's store).
+	Config string
 }
 
 // Status is the signer's status answer.

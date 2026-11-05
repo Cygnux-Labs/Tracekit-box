@@ -78,8 +78,8 @@ func (s *signer) cli(t *testing.T, args ...string) (string, error) {
 	return string(out), err
 }
 
-// exportVerified exports a run with the signer's config (tkbox export knows only the dev and the system signer) and
-// verifies it, until the run is final (integrity VERIFIED, not VERIFIED TO HEAD n (open)); -> verify's output.
+// exportVerified exports a run with the signer's config (tkbox export exports only a box's own run) and verifies it,
+// until the run is final (integrity VERIFIED, not VERIFIED TO HEAD n (open)); -> verify's output.
 func (s *signer) exportVerified(t *testing.T, runID, bundle, trust string) string {
 	t.Helper()
 	var last string
@@ -206,6 +206,40 @@ func (e *env) frames(t *testing.T, box string, frames ...map[string]any) []answe
 	return answers
 }
 
+// refusals counts a stopped box's channel.refused refusals per kind (each event's own and those folded into it) and
+// lists the methods the events name; any other agent channel, limit or signer problem event fails the test.
+func (e *env) refusals(t *testing.T, box string) (map[string]int, []string) {
+	t.Helper()
+	out, _, _ := e.tk(t, "events", box, "--json")
+	n, methods := map[string]int{}, []string(nil)
+	for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
+		var ev struct {
+			Kind, Door, Summary string
+			Data                struct {
+				Refusal, Method, Reason string
+				Folded                  int
+			}
+		}
+		if json.Unmarshal([]byte(l), &ev) != nil {
+			continue
+		}
+		switch {
+		case ev.Kind == "channel.refused":
+			if ev.Data.Reason != "" {
+				n[ev.Data.Refusal]++
+			}
+			n[ev.Data.Refusal] += ev.Data.Folded
+			if ev.Data.Method != "" {
+				methods = append(methods, ev.Data.Method)
+			}
+		case ev.Kind == "signer.problem" || ev.Kind == "box.limit" || ev.Door == "agent_channel":
+			t.Errorf("%s event: %s %s: %s", box, ev.Kind, ev.Door, ev.Summary)
+		}
+	}
+	t.Logf("%s: refusals by kind %v, methods named %v", box, n, methods)
+	return n, methods
+}
+
 // refusedByBox: the answer is the scoping proxy's refusal (its own words, which the signer never uses).
 func refusedByBox(t *testing.T, what string, a answer, words string) {
 	t.Helper()
@@ -225,7 +259,7 @@ func rid() string {
 func TestAgentChannel(t *testing.T) {
 	needKVM(t)
 	s := signer21(t)
-	e := setup(t, "--signer", s.sock, "--tracekit-bin", s.bin)
+	e := setup(t, "--signer", s.sock, "--tracekit-bin", s.bin, "--tracekit-config", s.cfg)
 	newBox := func(t *testing.T, name string, allow ...string) (b struct {
 		ID          string   `json:"id"`
 		RunID       string   `json:"run_id"`
@@ -332,6 +366,9 @@ func TestAgentChannel(t *testing.T) {
 		if _, _, code := e.tk(t, "stop", "ch2"); code != 0 {
 			t.Fatal("stop ch2")
 		}
+		if n, methods := e.refusals(t, "ch2"); n["run"] != 2 || len(n) != 1 || !slices.Contains(methods, "decide") {
+			t.Errorf("ch2's events: %v %v, want its two refusals of ch1's run", n, methods)
+		}
 	})
 
 	// ch1's run is untouched by all of that: the call completes
@@ -341,25 +378,31 @@ func TestAgentChannel(t *testing.T) {
 	if _, _, code := e.tk(t, "stop", "ch1"); code != 0 {
 		t.Fatal("stop ch1")
 	}
-	out, _, _ = e.tk(t, "events", "ch1", "--json")
-	for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
-		var ev struct{ Kind, Door, Summary string }
-		if json.Unmarshal([]byte(l), &ev) == nil && (ev.Kind == "signer.problem" || ev.Kind == "box.limit" || ev.Door == "agent_channel") {
-			t.Errorf("ch1 event: %s %s: %s", ev.Kind, ev.Door, ev.Summary)
-		}
+	// the refusals are the box's events, not only the agent's errors: the method, the parent and the two frames naming
+	// the box run (the transcript tailer's tailer_heartbeat is a method refusal too)
+	if n, methods := e.refusals(t, "ch1"); n["method"] < 1 || n["field"] != 1 || n["run"] != 2 ||
+		!slices.Contains(methods, "register_run") || !slices.Contains(methods, "close_run") {
+		t.Errorf("ch1's events: %v %v, want its refusals of approval_decide, parent and the box run", n, methods)
 	}
 
+	// the box run as a person exports it (tkbox export, through the daemon's --tracekit-config), the agent run with
+	// the signer's own export
 	dir := t.TempDir()
-	trust := filepath.Join(dir, "trust.json")
-	if out, err := s.cli(t, "signer", "trust", "--config", s.cfg, "-o", trust); err != nil {
-		t.Fatalf("signer trust: %v\n%s", err, out)
-	}
 	agentBundle, boxBundle := filepath.Join(dir, "agent.tkb"), filepath.Join(dir, "box.tkb")
-	for _, x := range []struct{ name, run, bundle, line string }{
-		{"agent run", agentRun.RunID, agentBundle, "This run's records are the agent's own account of its calls"},
-		{"box run", b1.RunID, boxBundle, "This run's records are the box's doors"},
+	if _, _, code := e.tk(t, "export", "ch1", "-o", boxBundle); code != 0 {
+		t.Fatal("tkbox export ch1")
+	}
+	trust := strings.TrimSuffix(boxBundle, ".tkb") + ".trust.json"
+	boxOut, err := s.cli(t, "verify", boxBundle, "--trust", trust)
+	if err != nil {
+		t.Fatalf("verify the box run: %v\n%s", err, boxOut)
+	}
+	agentOut := s.exportVerified(t, agentRun.RunID, agentBundle, trust)
+	for _, x := range []struct{ name, run, out, line string }{
+		{"agent run", agentRun.RunID, agentOut, "This run's records are the agent's own account of its calls"},
+		{"box run", b1.RunID, boxOut, "This run's records are the box's doors"},
 	} {
-		out := s.exportVerified(t, x.run, x.bundle, trust)
+		out := x.out
 		t.Logf("tracekit verify (%s %s):\n%s", x.name, x.run, out)
 		for _, want := range []string{"PROOF AGAINST THE BOXED AGENT (micro-VM): the signing key was outside its box for this run.", x.line} {
 			if !strings.Contains(out, want) {

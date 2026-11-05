@@ -259,7 +259,7 @@ func TestRunCapCountsClosedRuns(t *testing.T) {
 	}
 	err := s.check("register_run", map[string]any{}, nil)
 	var refused *refusal
-	if !errors.As(err, &refused) || refused.code != "quota_exceeded" || refused.kind != runLimit {
+	if !errors.As(err, &refused) || refused.code != "quota_exceeded" || refused.kind != RefusedRunCap {
 		t.Fatalf("cap error %v", err)
 	}
 }

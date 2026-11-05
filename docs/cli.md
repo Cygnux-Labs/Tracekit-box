@@ -41,7 +41,8 @@ pass --socket``.
 
 ```
 tkbox daemon [--state-dir DIR] [--signer SOCKET] [--unrecorded] [--max-boxes N] [--approval-timeout DUR]
-             [--egress-block CIDR]... [--tracekit-bin PATH] [--firecracker FILE] [--kernel FILE] [--guest-dir DIR]
+             [--egress-block CIDR]... [--tracekit-bin PATH] [--tracekit-config FILE] [--firecracker FILE] [--kernel FILE]
+             [--guest-dir DIR]
 ```
 
 | Flag | Default | Meaning |
@@ -53,6 +54,7 @@ tkbox daemon [--state-dir DIR] [--signer SOCKET] [--unrecorded] [--max-boxes N] 
 | `--approval-timeout` | `2m` | How long a connection to a host off the allowlist waits for `tkbox approve` (1s to 4m) |
 | `--egress-block` | none | Repeatable or comma-separated. A range (`203.0.113.0/24`) or a bare address (`203.0.113.7`, taken as a single address) that boxes never connect to, on top of the built-in private and metadata ranges and this host's own interface addresses; a connection there is refused with `it resolves to an address of this host or one the operator blocked, which Box never connects to`. An IPv6 range that spans the IPv4-mapped range `::ffff:0:0/96` blocks the IPv4 addresses it covers there too, since Box connects to `::ffff:a.b.c.d` as `a.b.c.d`: `--egress-block ::/0` blocks every IPv4 address as well as every IPv6 one. To block only IPv6, list the ranges you mean (`2000::/3`). On a cloud VM (EC2, GCE, Azure, GitHub-hosted runners) the host's public IP is NAT'd and on no interface, so Box can't see it and does not block it unless you pass it here (`--egress-block 203.0.113.7`); otherwise a box allowed to reach that IP could reach services the host listens on. A bad value exits 2: `--egress-block "x": want a CIDR like 203.0.113.7/32 or an address` |
 | `--tracekit-bin` | `tracekit` on `PATH` | The `tracekit` CLI that `tkbox export` runs |
+| `--tracekit-config` | the system signer's `/etc/tracekit/signer.yaml` when it is the signer, else the dev signer's store | The signer's `signer.yaml`, which `tkbox export` passes to `tracekit` as `--config`: needed for a signer started with `tracekit signer serve --config`, such as one with `box_daemons` for `--agent-channel` |
 | `--firecracker` | the pinned Firecracker v1.17.0, downloaded and checked by SHA-256 | A local `firecracker` binary instead |
 | `--kernel` | the pinned guest kernel 6.1.155, downloaded and checked by SHA-256 | A local `vmlinux` instead |
 | `--guest-dir` | the directory of the `tkbox` binary | Where `tkbox-guest-linux-<arch>` is |

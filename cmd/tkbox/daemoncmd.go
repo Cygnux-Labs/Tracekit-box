@@ -30,6 +30,7 @@ func cmdDaemon(args []string, env *cliEnv) error {
 	signer := fs.String("signer", "", "Tracekit signer socket (default: $TRACEKIT_SIGNER, /etc/tracekit/client.json, or the dev signer)")
 	unrecorded := fs.Bool("unrecorded", false, "run boxes that record NOTHING in Tracekit (no signer needed; boxes can't be exported)")
 	tracekitBin := fs.String("tracekit-bin", "", "the tracekit CLI used by export (default: tracekit in PATH)")
+	tracekitConfig := fs.String("tracekit-config", "", "the signer's signer.yaml, which export passes to the tracekit CLI (default: the system signer's, else the dev signer's store)")
 	fcBin := fs.String("firecracker", "", "firecracker binary (default: the pinned release, downloaded and verified)")
 	kernel := fs.String("kernel", "", "guest kernel vmlinux (default: the pinned kernel, downloaded and verified)")
 	guestDir := fs.String("guest-dir", "", "dir holding tkbox-guest-linux-<arch> (default: next to this binary)")
@@ -111,7 +112,7 @@ func cmdDaemon(args []string, env *cliEnv) error {
 			return fmt.Errorf("the daemon needs a Tracekit signer: %v\nstart one with `tracekit up`, or pass --unrecorded to run boxes that record nothing", err)
 		}
 		dctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		tk, err = tracekit.Dial(dctx, tracekit.Options{Signer: *signer, TracekitBin: *tracekitBin})
+		tk, err = tracekit.Dial(dctx, tracekit.Options{Signer: *signer, TracekitBin: *tracekitBin, Config: *tracekitConfig})
 		cancel()
 		if err != nil {
 			return noSigner(err)

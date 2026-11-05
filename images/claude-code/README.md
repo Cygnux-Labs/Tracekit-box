@@ -14,6 +14,10 @@ tkbox run --image <public-registry>/<name>:<tag> --agent-channel --secret ANTHRO
 tkbox exec claude -- claude -p '<task>'
 ```
 
+The channel needs a signer whose `signer.yaml` names the daemon's uid in `box_daemons`, so start the daemon with
+that file as `--tracekit-config` (beside `--signer` and `--tracekit-bin`): `tkbox export` reads the box's run from
+that signer's store.
+
 Tracekit `tracekit-ai==1.5.3` supplies the hook client. The managed hook entries in
 `managed-settings.json` follow the v2 Claude Code settings written by Tracekit 1.5.3's
 `tracekit/install.py` (`_install_hooks_at`, using `tracekit.integrations.claude_code`): all nine

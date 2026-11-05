@@ -67,6 +67,67 @@ func TestAgentChannelAllowLabelValidation(t *testing.T) {
 	}
 }
 
+// What the agent channel refuses becomes the box's channel.refused events (kind, method, reason; never the frame),
+// one per kind a second, the rest counted in: a refusal used to leave no trace on the host.
+func TestAgentChannelRefusalsAreBoxEvents(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.tk.RPCVersion = 21
+	e.tk.ChannelDial = func() (net.Conn, error) {
+		a, z := net.Pipe()
+		go io.Copy(io.Discard, z)
+		return a, nil
+	}
+	v := e.create(api.CreateBoxRequest{Name: "refusals", Image: "x", AgentChannel: true})
+	c, err := e.machine(0).GuestDial(context.Background(), proto.PortAgentChannel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := bufio.NewReader(c)
+	const body = "frame-content-never-on-disk"
+	for _, frame := range []string{
+		`{"method":"approval_decide","approval_id":"` + body + `"}`,
+		`{"method":"approval_decide","approval_id":"` + body + `"}`,
+		`{"method":"approval_decide","approval_id":"` + body + `"}`,
+		`{"method":"close_run","run_id":"` + v.RunID + `","run_token":"` + body + `"}`,
+	} {
+		if _, err := c.Write([]byte(frame + "\n")); err != nil {
+			t.Fatal(err)
+		}
+		if line, err := r.ReadBytes('\n'); err != nil || !strings.Contains(string(line), `"forbidden"`) {
+			t.Fatalf("%s: %q %v", frame, line, err)
+		}
+	}
+	c.Close()
+	if _, err := e.d.Stop(context.Background(), "refusals", api.StopRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(e.d.boxDir(v.ID), "events.ndjson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), body) {
+		t.Fatal("events.ndjson holds the refused frame's content")
+	}
+	var got []string
+	for _, ln := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var ev api.Event
+		if err := json.Unmarshal([]byte(ln), &ev); err != nil {
+			t.Fatal(err)
+		}
+		if ev.Kind == api.EventChannelRefused {
+			got = append(got, ev.Door+" "+ev.Summary)
+		}
+	}
+	want := []string{
+		"agent_channel agent channel refused approval_decide (method): method not allowed",
+		"agent_channel agent channel refused close_run (run): run is not owned by this box",
+		"agent_channel agent channel refused 2 more frames (method) since its last event",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("channel.refused events\n%q\nwant\n%q", got, want)
+	}
+}
+
 type stopOrderLog struct {
 	mu      sync.Mutex
 	entries []string

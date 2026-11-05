@@ -82,6 +82,10 @@ stop begins, the listener and its connections are closed with the egress.
 - A frame that passes is forwarded as the received bytes, verbatim, except `register_run`, which the daemon builds
   fresh (below).
 - Rate limits answer `quota_exceeded` with `retry_after_ms`, as the signer does. A frame is never held back.
+- Every refusal is also a `channel.refused` event of the box: its kind (`frame`, `method`, `field`, `run`,
+  `approval`, `rate`, `run_cap`, `byte_budget`, `connections`), the method when it is a plain name, and the
+  channel's own reason, never the frame's content. A box gets at most one such event per kind a second; the refusals
+  in between are counted into the kind's next event (`folded`), and the stop reports what is left.
 
 **Methods.** Only the methods a coding agent's hook and its transcript tailer use pass: `hello` (the client's first
 frame), `register_run`, `decide`, `complete`, `observe`, `model_event`, `state_write`, `approval_request`,

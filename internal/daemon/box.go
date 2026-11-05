@@ -528,6 +528,10 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 		ch.OnLimit = func(reason string) {
 			b.event(api.EventBoxLimit, "agent_channel", "agent channel limit reached: "+reason, nil)
 		}
+		ch.OnRefusal = func(r agentchannel.Refusal) {
+			summary, data := refusalEvent(r)
+			b.event(api.EventChannelRefused, "agent_channel", summary, data)
+		}
 		b.mu.Lock()
 		b.channel, b.channelL = ch, cl
 		b.mu.Unlock()
@@ -901,6 +905,28 @@ func (b *box) stop(ctx context.Context, reason string, kill bool) {
 		b.saveDiff(sctx)
 	}
 	b.teardown(sctx, reason, "", kill, false)
+}
+
+// refusalEvent is a channel.refused event's summary and data: the refusal's kind, method and reason, never the frame.
+func refusalEvent(r agentchannel.Refusal) (string, map[string]any) {
+	data := map[string]any{"refusal": r.Kind}
+	if r.Folded > 0 {
+		data["folded"] = r.Folded
+	}
+	if r.Reason == "" {
+		return fmt.Sprintf("agent channel refused %d more frames (%s) since its last event", r.Folded, r.Kind), data
+	}
+	data["reason"] = r.Reason
+	what := "a frame"
+	if r.Method != "" {
+		data["method"] = r.Method
+		what = r.Method
+	}
+	summary := fmt.Sprintf("agent channel refused %s (%s): %s", what, r.Kind, r.Reason)
+	if r.Folded > 0 {
+		summary += fmt.Sprintf("; %d more since its last event", r.Folded)
+	}
+	return summary, data
 }
 
 func (b *box) closeChannel() {

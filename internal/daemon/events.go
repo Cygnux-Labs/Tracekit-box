@@ -36,7 +36,7 @@ const eventLogHardCapReason = "events log over its hard cap"
 
 // bulkEventKinds are the event kinds a guest can produce at will; they are the first to go when a cap is reached.
 var bulkEventKinds = map[string]bool{api.EventEgressAllowed: true, api.EventEgressDenied: true,
-	api.EventEgressClosed: true, api.EventSignerProblem: true}
+	api.EventEgressClosed: true, api.EventSignerProblem: true, api.EventChannelRefused: true}
 
 // eventLog is a box's events.ndjson (0600, append only). Every line goes through the box's scrubber, so a secret value
 // or placeholder never lands on disk even if a caller slips one into a summary.

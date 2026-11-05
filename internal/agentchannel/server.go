@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -27,14 +28,45 @@ type activeConn struct {
 	signer net.Conn
 }
 
+// Refusal kinds, as a box's channel.refused events name them.
+const (
+	RefusedFrame       = "frame"       // not one strict JSON object, or over MaxFrame
+	RefusedMethod      = "method"      // a method the channel doesn't pass
+	RefusedField       = "field"       // a field the channel doesn't pass
+	RefusedRun         = "run"         // a run this channel did not register, or one it closed
+	RefusedApproval    = "approval"    // an approval this channel did not ask for
+	RefusedRate        = "rate"        // over RatePerSecond frames a second
+	RefusedRunCap      = "run_cap"     // MaxRuns reached
+	RefusedByteBudget  = "byte_budget" // ByteBudget spent
+	RefusedConnections = "connections" // MaxConnections open
+)
+
+// Refusal is one channel.refused event. A box gets at most one event of a kind a second: the refusals in between are
+// counted into the kind's next event (Folded), and Close reports the count left over.
+type Refusal struct {
+	Kind   string // Refused*
+	Method string // the refused frame's method when it is a plain name (a-z, 0-9, _; at most 64 bytes), else ""
+	Reason string // the channel's own words, never the frame's content; "" when the event only reports Folded
+	Folded int    // refusals of this kind since its last event, besides this one
+}
+
+// refusal is a frame the channel answers with an error: msg is what the agent reads (it may quote the agent's own
+// frame); kind, reason and method are what the box's event says.
 type refusal struct {
 	code    string
 	msg     string
 	retryMS int64
-	kind    limitType
+	kind    string
+	reason  string
+	method  string
 }
 
 func (e *refusal) Error() string { return e.msg }
+
+type refusalWindow struct {
+	last   time.Time
+	folded int
+}
 
 // Server scopes one box's guest connections to its dedicated signer channel.
 type Server struct {
@@ -43,7 +75,10 @@ type Server struct {
 	BoxToken     string
 	FrameTimeout time.Duration
 	OnLimit      func(string)
+	OnRefusal    func(Refusal)
 
+	now          func() time.Time
+	refused      map[string]*refusalWindow
 	mu           sync.Mutex
 	connections  map[*activeConn]struct{}
 	runs         map[string]runEntry
@@ -59,7 +94,8 @@ type Server struct {
 
 func New(dial Dial, runID, token string) *Server {
 	return &Server{Dial: dial, BoxRun: runID, BoxToken: token, FrameTimeout: FrameStartTimeout,
-		connections: map[*activeConn]struct{}{}, runs: map[string]runEntry{}, approvals: map[string]bool{}, frames: RateBurst, last: time.Now(), limitsSeen: map[string]bool{}}
+		connections: map[*activeConn]struct{}{}, runs: map[string]runEntry{}, approvals: map[string]bool{}, frames: RateBurst, last: time.Now(), limitsSeen: map[string]bool{},
+		now: time.Now, refused: map[string]*refusalWindow{}}
 }
 
 func (s *Server) Serve(l net.Listener) error {
@@ -70,7 +106,11 @@ func (s *Server) Serve(l net.Listener) error {
 		}
 		s.mu.Lock()
 		if s.closed || len(s.connections) >= MaxConnections {
+			closed := s.closed
 			s.mu.Unlock()
+			if !closed {
+				s.noteRefusal(RefusedConnections, "", fmt.Sprintf("%d connections already open", MaxConnections))
+			}
 			go func() {
 				_ = c.SetWriteDeadline(time.Now().Add(RefusalWriteTimeout))
 				writeError(c, "quota_exceeded", "agent channel connection limit reached", 1000)
@@ -122,32 +162,37 @@ func (s *Server) handle(active *activeConn) {
 		}
 		_ = guest.SetReadDeadline(time.Now().Add(s.FrameTimeout))
 		frame, obj, err := ReadFramePrefix(gr, first)
-		ok, retry := s.takeToken()
-		if !ok {
-			guestWriteError(guest, "quota_exceeded", "agent channel rate limit exceeded", retry)
+		method, _ := obj["method"].(string)
+		if ok, retry := s.takeToken(); !ok {
+			s.refuse(guest, &refusal{code: "quota_exceeded", msg: "agent channel rate limit exceeded", retryMS: retry,
+				kind: RefusedRate, reason: fmt.Sprintf("over %d frames a second", RatePerSecond), method: method})
 			if err != nil {
 				return
 			}
 			continue
 		}
-		if err != nil {
-			if errors.Is(err, ErrInvalidFrame) {
-				guestWriteError(guest, "forbidden", err.Error(), 0)
-				continue
-			}
+		if errors.Is(err, ErrTooLarge) {
+			s.noteRefusal(RefusedFrame, "", "a frame over 1 MiB; connection closed")
 			return
 		}
-		method, _ := obj["method"].(string)
-		if err := s.check(method, obj, frame); err != nil {
-			var r *refusal
-			if errors.As(err, &r) {
-				if r.kind != "" {
-					s.limit(r.msg, r.kind)
-				}
-				guestWriteError(guest, r.code, r.msg, r.retryMS)
-			} else {
-				guestWriteError(guest, "forbidden", err.Error(), 0)
+		if errors.Is(err, ErrInvalidFrame) {
+			r := &refusal{code: "forbidden", msg: err.Error(), kind: RefusedFrame, reason: "not one strict JSON object"}
+			var why *refusal
+			if errors.As(err, &why) {
+				r.kind, r.reason, r.method = why.kind, why.reason, why.method
 			}
+			s.refuse(guest, r)
+			continue
+		}
+		if err != nil {
+			return
+		}
+		if r := s.check(method, obj, frame); r != nil {
+			if r.kind == RefusedRunCap || r.kind == RefusedByteBudget {
+				s.limit(r.msg, r.kind)
+			}
+			r.method = method
+			s.refuse(guest, r)
 			continue
 		}
 		if method == "register_run" {
@@ -188,18 +233,72 @@ func (s *Server) handle(active *activeConn) {
 	}
 }
 
-type limitType string
+// refuse notes r for the box's events, then answers the agent with it.
+func (s *Server) refuse(guest net.Conn, r *refusal) {
+	s.noteRefusal(r.kind, r.method, r.reason)
+	guestWriteError(guest, r.code, r.msg, r.retryMS)
+}
 
-const (
-	runLimit  limitType = "run_cap"
-	byteLimit limitType = "byte_budget"
-)
-
-func (s *Server) limit(reason string, kind limitType) {
+// noteRefusal calls OnRefusal for the first refusal of a kind in a second, folding the rest into the kind's next call.
+func (s *Server) noteRefusal(kind, method, reason string) {
 	s.mu.Lock()
-	key := string(kind)
-	first := !s.limitsSeen[key]
-	s.limitsSeen[key] = true
+	w := s.refused[kind]
+	if w == nil {
+		w = &refusalWindow{}
+		s.refused[kind] = w
+	}
+	now := s.now()
+	if !w.last.IsZero() && now.Sub(w.last) < time.Second {
+		w.folded++
+		s.mu.Unlock()
+		return
+	}
+	ev := Refusal{Kind: kind, Method: plainName(method), Reason: reason, Folded: w.folded}
+	w.last, w.folded = now, 0
+	cb := s.OnRefusal
+	s.mu.Unlock()
+	if cb != nil {
+		cb(ev)
+	}
+}
+
+// flushRefusals reports the refusals folded since each kind's last event.
+func (s *Server) flushRefusals() {
+	s.mu.Lock()
+	var left []Refusal
+	for kind, w := range s.refused {
+		if w.folded > 0 {
+			left = append(left, Refusal{Kind: kind, Folded: w.folded})
+			w.folded = 0
+		}
+	}
+	cb := s.OnRefusal
+	s.mu.Unlock()
+	slices.SortFunc(left, func(a, b Refusal) int { return strings.Compare(a.Kind, b.Kind) })
+	for _, r := range left {
+		if cb != nil {
+			cb(r)
+		}
+	}
+}
+
+// plainName is a method name fit for an event: the agent's own text only when it is a plain identifier.
+func plainName(s string) string {
+	if len(s) > 64 {
+		return ""
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_') {
+			return ""
+		}
+	}
+	return s
+}
+
+func (s *Server) limit(reason, kind string) {
+	s.mu.Lock()
+	first := !s.limitsSeen[kind]
+	s.limitsSeen[kind] = true
 	cb := s.OnLimit
 	s.mu.Unlock()
 	if first && cb != nil {
@@ -223,17 +322,20 @@ func (s *Server) takeToken() (bool, int64) {
 	return true, 0
 }
 
-func (s *Server) check(method string, m map[string]any, frame []byte) error {
+// check refuses a decoded frame the box's channel must not pass on (nil: pass it).
+func (s *Server) check(method string, m map[string]any, frame []byte) *refusal {
+	forbidden := func(kind, msg string) *refusal { return &refusal{code: "forbidden", msg: msg, kind: kind, reason: msg} }
 	if method == "register_run" {
 		for _, k := range []string{"parent", "principal", "principal_token", "caller", "source", "tenant", "analyzes", "replay_of", "investigation", "ext", "box"} {
 			if _, ok := m[k]; ok {
-				return fmt.Errorf("forbidden register_run field %s", k)
+				return forbidden(RefusedField, "forbidden register_run field "+k)
 			}
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if len(s.runs)+s.reservations >= MaxRuns {
-			return &refusal{code: "quota_exceeded", msg: "run limit reached", retryMS: 1000, kind: runLimit}
+			return &refusal{code: "quota_exceeded", msg: "run limit reached", retryMS: 1000, kind: RefusedRunCap,
+				reason: fmt.Sprintf("%d runs registered", MaxRuns)}
 		}
 		s.reservations++
 		return nil
@@ -247,7 +349,7 @@ func (s *Server) check(method string, m map[string]any, frame []byte) error {
 		owned := s.approvals[id]
 		s.mu.Unlock()
 		if !owned {
-			return fmt.Errorf("approval is not owned by this box")
+			return forbidden(RefusedApproval, "approval is not owned by this box")
 		}
 		return nil
 	}
@@ -256,12 +358,13 @@ func (s *Server) check(method string, m map[string]any, frame []byte) error {
 	defer s.mu.Unlock()
 	e, ok := s.runs[rid]
 	if !ok || e.closed {
-		return fmt.Errorf("run is not owned by this box")
+		return forbidden(RefusedRun, "run is not owned by this box")
 	}
 	if method == "model_event" || method == "complete" || method == "observe" {
 		size := int64(len(frame))
 		if s.bytes+size > ByteBudget {
-			return &refusal{code: "quota_exceeded", msg: "agent channel byte budget exceeded", retryMS: 1000, kind: byteLimit}
+			return &refusal{code: "quota_exceeded", msg: "agent channel byte budget exceeded", retryMS: 1000,
+				kind: RefusedByteBudget, reason: fmt.Sprintf("%d MiB of content sent", ByteBudget>>20)}
 		}
 		s.bytes += size
 	}
@@ -320,7 +423,8 @@ func (s *Server) record(method string, ans []byte, req map[string]any) error {
 	return nil
 }
 
-// Close stops acceptance and closes all active guest streams before callers close the box run.
+// Close stops acceptance and closes all active guest streams before callers close the box run, then reports the
+// refusals still folded (OnRefusal).
 func (s *Server) Close(l net.Listener) {
 	s.mu.Lock()
 	s.closed = true
@@ -337,6 +441,7 @@ func (s *Server) Close(l net.Listener) {
 	}
 	s.mu.Unlock()
 	s.done.Wait()
+	s.flushRefusals()
 }
 
 func (s *Server) CloseRuns(ctx context.Context) []error {
