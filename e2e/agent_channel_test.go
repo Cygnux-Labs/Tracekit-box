@@ -280,15 +280,16 @@ func TestAgentChannel(t *testing.T) {
 	}
 	b1 := newBox(t, "ch1", "pypi")
 
-	// agent runs argv in ch1 as the agent, with the hook's environment (and stdin, when there is one)
+	// agent runs argv in ch1 as the agent, with the hook's environment (and stdin, when there is one). The variables
+	// are in the command (`env K=V …`), so the signer decides them: Box refuses a per-command --env such as HOME.
 	agent := func(stdin string, argv ...string) (string, string, int) {
 		t.Helper()
 		args := []string{"exec", "ch1"}
 		if stdin != "" {
 			args = append(args, "-i")
 		}
-		args = append(args, "--env", "HOME=/tmp/agent", "--env", "TRACEKIT_SIGNER=/run/tkbox/signer.sock",
-			"--env", "TRACEKIT_RUNTIME_DIR=/tmp/agent/rt", "--")
+		args = append(args, "--", "env", "HOME=/tmp/agent", "TRACEKIT_SIGNER=/run/tkbox/signer.sock",
+			"TRACEKIT_RUNTIME_DIR=/tmp/agent/rt")
 		return e.tkIn(t, stdin, append(append(args, asAgent...), argv...)...)
 	}
 
