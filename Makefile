@@ -38,24 +38,20 @@ lint:
 	$(GO) vet ./...
 	GOOS=linux $(GO) vet ./...
 
-# every fuzz target for FUZZTIME each, one after another; a failing input is saved under its package's testdata/fuzz
-# (`go test ./...` runs the saved inputs and seeds, so add it there once fixed). FuzzParsePatchVsGit needs git.
+# every fuzz target (package:Target) for FUZZTIME each, one after another: each runs even when one before it fails,
+# and the recipe fails if any did, or does not exist, naming them. A failing input is saved under its package's testdata/fuzz (`go test
+# ./...` runs the saved inputs and seeds, so add it there once fixed). FuzzParsePatchVsGit needs git.
+FUZZ_TARGETS := proto:FuzzReadFrame proto:FuzzChunkWriter agentrpc:FuzzClientReplies agentchannel:FuzzReadAgentFrame \
+	agentchannel:FuzzAgentFields agentchannel:FuzzRegisterFrame tracekit:FuzzShellQuote image:FuzzDebugfsQuote \
+	image:FuzzFixups config:FuzzParse config:FuzzParseSecretFlag daemon:FuzzParsePatch daemon:FuzzParsePatchVsGit \
+	egress:FuzzForward egress:FuzzRedactReader egress:FuzzAddrForms egress:FuzzHostText egress:FuzzClientHello
 fuzz:
-	$(GO) test -run='^$$' -fuzz='^FuzzReadFrame$$' -fuzztime=$(FUZZTIME) ./internal/proto
-	$(GO) test -run='^$$' -fuzz='^FuzzChunkWriter$$' -fuzztime=$(FUZZTIME) ./internal/proto
-	$(GO) test -run='^$$' -fuzz='^FuzzClientReplies$$' -fuzztime=$(FUZZTIME) ./internal/agentrpc
-	$(GO) test -run='^$$' -fuzz='^FuzzShellQuote$$' -fuzztime=$(FUZZTIME) ./internal/tracekit
-	$(GO) test -run='^$$' -fuzz='^FuzzDebugfsQuote$$' -fuzztime=$(FUZZTIME) ./internal/image
-	$(GO) test -run='^$$' -fuzz='^FuzzFixups$$' -fuzztime=$(FUZZTIME) ./internal/image
-	$(GO) test -run='^$$' -fuzz='^FuzzParse$$' -fuzztime=$(FUZZTIME) ./internal/config
-	$(GO) test -run='^$$' -fuzz='^FuzzParseSecretFlag$$' -fuzztime=$(FUZZTIME) ./internal/config
-	$(GO) test -run='^$$' -fuzz='^FuzzParsePatch$$' -fuzztime=$(FUZZTIME) ./internal/daemon
-	$(GO) test -run='^$$' -fuzz='^FuzzParsePatchVsGit$$' -fuzztime=$(FUZZTIME) ./internal/daemon
-	$(GO) test -run='^$$' -fuzz='^FuzzForward$$' -fuzztime=$(FUZZTIME) ./internal/egress
-	$(GO) test -run='^$$' -fuzz='^FuzzRedactReader$$' -fuzztime=$(FUZZTIME) ./internal/egress
-	$(GO) test -run='^$$' -fuzz='^FuzzAddrForms$$' -fuzztime=$(FUZZTIME) ./internal/egress
-	$(GO) test -run='^$$' -fuzz='^FuzzHostText$$' -fuzztime=$(FUZZTIME) ./internal/egress
-	$(GO) test -run='^$$' -fuzz='^FuzzClientHello$$' -fuzztime=$(FUZZTIME) ./internal/egress
+	@failed=; for t in $(FUZZ_TARGETS); do \
+		echo "$(GO) test -run='^$$' -fuzz='^$${t#*:}$$' -fuzztime=$(FUZZTIME) ./internal/$${t%%:*}"; \
+		if ! $(GO) test -list "^$${t#*:}\$$" ./internal/$${t%%:*} | grep -qx "$${t#*:}"; then \
+			echo "no fuzz target $${t#*:} in ./internal/$${t%%:*}"; failed="$$failed $$t"; continue; fi; \
+		$(GO) test -run='^$$' -fuzz="^$${t#*:}\$$" -fuzztime=$(FUZZTIME) ./internal/$${t%%:*} || failed="$$failed $$t"; \
+	done; if [ -n "$$failed" ]; then echo "fuzz failed:$$failed"; exit 1; fi
 
 # Verified Runs: verify every signed run in runs/ (and recipes/, once it exists) with the Tracekit 1.4.2 CLI and rewrite
 # the table in its README.md from the verified records (see runs/README.md). CI runs it with -check.

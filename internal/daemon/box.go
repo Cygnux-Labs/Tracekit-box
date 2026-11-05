@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Cygnux-Labs/tracekit-box/internal/agentchannel"
 	"github.com/Cygnux-Labs/tracekit-box/internal/agentrpc"
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
 	"github.com/Cygnux-Labs/tracekit-box/internal/egress"
@@ -78,6 +79,8 @@ type box struct {
 	pollNow  chan chan struct{} // tests: run one containment check now
 	poke     chan struct{}      // cap 1: a decision named an incident, check containment now
 	bootCfg  proto.BootConfig
+	channel  *agentchannel.Server
+	channelL net.Listener
 }
 
 func newBox(d *Daemon, info api.Box, dir string, cid uint32) *box {
@@ -165,9 +168,26 @@ func (b *box) persist() {
 // Create validates req, boots a box and returns it running. On any failure everything is torn down, the run is
 // closed with the reason, and the box stays listed as failed (its console.log kept for reading).
 func (d *Daemon) Create(ctx context.Context, req api.CreateBoxRequest) (api.Box, error) {
+	if req.AgentChannel {
+		if d.opts.Tracekit == nil {
+			return api.Box{}, errf(api.CodeBadRequest, "install Tracekit 1.6.0 or later and start a signer serving RPC protocol 21", "--agent-channel requires Tracekit 1.6.0 or later (RPC protocol 21)")
+		}
+		st, err := d.opts.Tracekit.Status(ctx)
+		if err != nil {
+			return api.Box{}, asAPIError(err)
+		}
+		if st.RPCVersion < 21 {
+			return api.Box{}, errf(api.CodeBadRequest, "upgrade Tracekit to 1.6.0 or later", "--agent-channel requires Tracekit 1.6.0 or later (RPC protocol 21; signer serves %d)", st.RPCVersion)
+		}
+	}
 	s, e := d.validate(req)
 	if e != nil {
 		return api.Box{}, e
+	}
+	if req.AgentChannel {
+		if err := validateBoxLabelAllow(s.allow); err != nil {
+			return api.Box{}, errf(api.CodeBadRequest, "use at most 256 allow entries, each matching the Tracekit box label pattern and at most 261 characters", "%v", err)
+		}
 	}
 	prefixes, err := hostPrefixes()
 	if err != nil {
@@ -185,7 +205,8 @@ func (d *Daemon) Create(ctx context.Context, req api.CreateBoxRequest) (api.Box,
 			names = append(names, sec.Name)
 		}
 		return api.Box{Name: req.Name, Image: s.req.Image, Allow: s.allow, Secrets: names, Env: s.req.Env,
-			Workspace: s.req.Workspace, Limits: s.limits, Inspect: s.inspect, Unrecorded: d.opts.Unrecorded, Notices: notices}, nil
+			Workspace: s.req.Workspace, Limits: s.limits, Inspect: s.inspect, AgentChannel: req.AgentChannel,
+			Unrecorded: d.opts.Unrecorded, Notices: notices}, nil
 	}
 	d.mu.Lock()
 	if d.closed {
@@ -239,7 +260,8 @@ func (d *Daemon) Create(ctx context.Context, req api.CreateBoxRequest) (api.Box,
 	}
 	info := api.Box{ID: id, Name: name, State: api.StateCreating, Image: s.req.Image, Allow: s.allow, Secrets: names, SecretHeaders: headers,
 		Env: s.req.Env, Workspace: s.req.Workspace, Limits: s.limits, Inspect: s.inspect,
-		Unrecorded: d.opts.Unrecorded, CreatedAt: d.now().UTC(), Notices: notices}
+		AgentChannel: req.AgentChannel,
+		Unrecorded:   d.opts.Unrecorded, CreatedAt: d.now().UTC(), Notices: notices}
 	dir := d.boxDir(id)
 	b := newBox(d, info, dir, cid)
 	bctx, cancel := context.WithCancel(d.ctx)
@@ -343,8 +365,26 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 	b.secrets = s.secrets
 	b.mu.Unlock()
 	b.scrubP.Store(newScrubber(s.secrets))
+	var rootfs image.Rootfs
+	var err error
+	if s.req.AgentChannel {
+		var err error
+		rootfs, err = d.opts.Builder.Rootfs(ctx, s.req.Image, d.opts.Arch)
+		if err != nil {
+			return fmt.Errorf("build the rootfs for %s: %w", s.req.Image, err)
+		}
+		b.mu.Lock()
+		b.info.ImageDigest = rootfs.Digest
+		b.mu.Unlock()
+	}
 	if d.opts.Tracekit != nil {
-		run, err := d.opts.Tracekit.NewRun(ctx, tracekit.Agent{Name: s.agent})
+		var run tracekit.Run
+		var err error
+		if s.req.AgentChannel {
+			run, err = d.opts.Tracekit.NewBoxRun(ctx, tracekit.Agent{Name: s.agent}, tracekit.BoxLabel{ID: b.id, ImageDigest: rootfs.Digest, Allow: s.allow, Channel: "agent"})
+		} else {
+			run, err = d.opts.Tracekit.NewRun(ctx, tracekit.Agent{Name: s.agent})
+		}
 		if err != nil {
 			return fmt.Errorf("register the Tracekit run: %w", err)
 		}
@@ -382,13 +422,15 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 		b.persist()
 	}
 
-	rootfs, err := d.opts.Builder.Rootfs(ctx, s.req.Image, d.opts.Arch)
-	if err != nil {
-		return fmt.Errorf("build the rootfs for %s: %w", s.req.Image, err)
+	if rootfs.Path == "" {
+		rootfs, err = d.opts.Builder.Rootfs(ctx, s.req.Image, d.opts.Arch)
+		if err != nil {
+			return fmt.Errorf("build the rootfs for %s: %w", s.req.Image, err)
+		}
+		b.mu.Lock()
+		b.info.ImageDigest = rootfs.Digest
+		b.mu.Unlock()
 	}
-	b.mu.Lock()
-	b.info.ImageDigest = rootfs.Digest
-	b.mu.Unlock()
 
 	wsSrc := s.req.Workspace
 	if wsSrc == "" {
@@ -428,8 +470,9 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 	}
 	b.bootCfg = proto.BootConfig{
 		Version: proto.Version, BoxID: b.id, Hostname: b.info.Name,
-		Env:         buildEnv(rootfs.Config.Env, s.req.Env, s.secrets),
-		ProxyListen: proto.DefaultProxyListen, CACertPEM: caPEM, CABundlePath: proto.DefaultCABundlePath,
+		AgentChannel: b.info.AgentChannel,
+		Env:          buildEnv(rootfs.Config.Env, s.req.Env, s.secrets),
+		ProxyListen:  proto.DefaultProxyListen, CACertPEM: caPEM, CABundlePath: proto.DefaultCABundlePath,
 		Workspace: &proto.WorkspaceMount{Path: proto.DefaultWorkspacePath, BaseDevice: "/dev/vdb", UpperDevice: "/dev/vdc"},
 		Limits: proto.GuestLimits{ExecTimeoutMS: time.Duration(s.limits.ExecTimeout).Milliseconds(),
 			MaxOutputBytes: proto.DefaultMaxOutputBytes, MaxProcs: proto.DefaultMaxProcs},
@@ -475,6 +518,30 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 			b.event(api.EventBoxFailed, "egress", "egress proxy stopped: "+err.Error(), nil)
 		}
 	}()
+	if s.req.AgentChannel {
+		cl, err := m.Listen(proto.PortAgentChannel)
+		if err != nil {
+			return fmt.Errorf("listen for agent channel: %w", err)
+		}
+		b.addListener(cl)
+		ch := agentchannel.New(func(ctx context.Context) (net.Conn, error) { return d.opts.Tracekit.Channel(ctx, b.run) }, b.run.ID(), "")
+		ch.OnLimit = func(reason string) {
+			b.event(api.EventBoxLimit, "agent_channel", "agent channel limit reached: "+reason, nil)
+		}
+		ch.OnRefusal = func(r agentchannel.Refusal) { // already one per kind a second (agentchannel folds the rest)
+			summary, data := refusalEvent(r)
+			b.event(api.EventChannelRefused, "agent_channel", summary, data)
+			b.observe(tracekit.SourceChannel, untrustedObs, data)
+		}
+		b.mu.Lock()
+		b.channel, b.channelL = ch, cl
+		b.mu.Unlock()
+		go func() {
+			if err := ch.Serve(cl); err != nil && !errors.Is(err, net.ErrClosed) {
+				b.event(api.EventBoxFailed, "agent_channel", "agent channel stopped: "+err.Error(), nil)
+			}
+		}()
+	}
 
 	if err := m.Start(ctx); err != nil {
 		return fmt.Errorf("start the VM: %w", err)
@@ -826,6 +893,7 @@ func (b *box) stop(ctx context.Context, reason string, kill bool) {
 	// egress closes first, before the guest gets its say (ending commands, sending the diff, up to a minute): nothing
 	// leaves a box that is going down, whatever the guest does meanwhile. The diff comes over its own vsock port.
 	b.closeEgress()
+	b.closeChannel()
 	b.persist()
 	sctx := context.WithoutCancel(ctx)
 	switch {
@@ -838,6 +906,39 @@ func (b *box) stop(ctx context.Context, reason string, kill bool) {
 		b.saveDiff(sctx)
 	}
 	b.teardown(sctx, reason, "", kill, false)
+}
+
+// refusalEvent is a channel.refused event's summary and data: the refusal's kind, method and reason, never the frame.
+func refusalEvent(r agentchannel.Refusal) (string, map[string]any) {
+	data := map[string]any{"refusal": r.Kind}
+	if r.Folded > 0 {
+		data["folded"] = r.Folded
+	}
+	if r.Reason == "" {
+		return fmt.Sprintf("agent channel refused %d more frames (%s) since its last event", r.Folded, r.Kind), data
+	}
+	data["reason"] = r.Reason
+	what := "a frame"
+	if r.Method != "" {
+		data["method"] = r.Method
+		what = r.Method
+	}
+	summary := fmt.Sprintf("agent channel refused %s (%s): %s", what, r.Kind, r.Reason)
+	if r.Folded > 0 {
+		summary += fmt.Sprintf("; %d more since its last event", r.Folded)
+	}
+	return summary, data
+}
+
+func (b *box) closeChannel() {
+	b.mu.Lock()
+	ch, l := b.channel, b.channelL
+	b.mu.Unlock()
+	if ch != nil {
+		ch.Close(l)
+	} else if l != nil {
+		_ = l.Close()
+	}
 }
 
 // closeEgress shuts the box's egress door: the vsock egress listener (no new connection) and the proxy (every open
@@ -1020,11 +1121,12 @@ func (b *box) teardown(ctx context.Context, reason, detail string, kill, failed 
 	b.tearingDown = true
 	b.mu.Unlock()
 	b.stopOnce.Do(func() { close(b.stopCh) })
+	b.closeChannel()
 	b.mu.Lock()
 	if b.timer != nil {
 		b.timer.Stop()
 	}
-	m, g, proxy, ls, run := b.machine, b.guest, b.proxy, b.listeners, b.run
+	ch, m, g, proxy, ls, run := b.channel, b.machine, b.guest, b.proxy, b.listeners, b.run
 	b.listeners = nil
 	b.mu.Unlock()
 	b.d.expireApprovals(b.id, reason)
@@ -1053,6 +1155,14 @@ func (b *box) teardown(ctx context.Context, reason, detail string, kill, failed 
 				m.Kill()
 			}
 		}
+	}
+	// the agent's runs close once the VM is down (a kill waits for no signer), each before the box run closes
+	if ch != nil {
+		cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		for _, err := range ch.CloseRuns(cctx) {
+			b.event(api.EventSignerProblem, "agent_channel", "could not close an agent channel run: "+err.Error(), nil)
+		}
+		cancel()
 	}
 	if proxy != nil {
 		proxy.Close()

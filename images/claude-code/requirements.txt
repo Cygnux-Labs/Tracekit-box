@@ -1,0 +1,21 @@
+# The hook client, tracekit-ai 1.5.3, and its dependencies for Debian bookworm's Python 3.11 on arm64 and amd64,
+# as wheels pinned by hash (pip install --require-hashes --only-binary=:all:). To update: pip download the new
+# versions for both platforms (README.md) and replace the hashes.
+cffi==2.1.1 \
+    --hash=sha256:3311ed60d36f83378794e1009ac6258bafbf81f7888b4caa7b35a521e3f95813 \
+    --hash=sha256:34e261f78cb6ceaaa36f42f2613f4380d94d9c759a9c73c769ee6e0247364632
+cryptography==50.0.2 \
+    --hash=sha256:87e9ce85beb6b328ba370cc6e6aea483c92617b4c95b1d33a49297eb662bfb04 \
+    --hash=sha256:9dab55f57c74c3cad24c323bacbbd04be4705ba6eb0d92e920b1fc4837ed5079
+google-re2==1.1.20251105 \
+    --hash=sha256:03156291269f145eccddff63118f2df02d395792f51fc039f09955818943815a \
+    --hash=sha256:18a5610b26742b90cb1d64ead2b16fe0e3bd7e67add03fd3779cd1b85e401661
+pycparser==3.12 \
+    --hash=sha256:a076f3f489b39b43ed13563a1dafe42447445bec2e294154ec5c57fcdda4c85e
+regex==2026.9.29 \
+    --hash=sha256:612b709381c0355b70d89cdb51b7f670591ed5cbbc0e3b5337488019dc667b65 \
+    --hash=sha256:7020ed44df30b3aa492c00ee3b52d0548c1f30c2c6c5bb13ae897680900d3413
+rfc8785==0.1.4 \
+    --hash=sha256:520d690b448ecf0703691c76e1a34a24ddcd4fc5bc41d589cb7c58ec651bcd48
+tracekit-ai==1.5.3 \
+    --hash=sha256:04ff6271d602d392ecb944f17c5736685f87cc4a8461526dca76dabe79993d61

@@ -1,8 +1,15 @@
-# The agent channel: an agent's own hooks inside a box (design, not built)
+# The agent channel: an agent's own hooks inside a box
 
-Status: proposal, revised after its design security review. Nothing here exists yet; the pull requests that build it
-update this page. Points marked **(Tracekit contract)** need a change in Tracekit's signer RPC contract, made in one
-Tracekit pull request with its own contract version; Box's side waits for it.
+Status: implemented. The Linux/KVM end-to-end test (`TestAgentChannel`) passed in the colima VM (nested KVM) on
+2026-11-05 at 6705867, the head after the review fixes.
+The host's per-box vsock listener and scoping proxy, its per-box channel connections and run/approval tables,
+the guest Unix-socket relay, named frame/rate/run/byte limits and Claude Code image are implemented. Tracekit contract v21 is implemented in the reference checkout
+and Box requires Tracekit 1.6.0 or later (RPC protocol 21) when this option is requested; Box's base Tracekit
+requirement remains protocol 19 (Tracekit 1.5.3).
+
+Implementation note: `register_run` is rebuilt from only `request_id` and `agent`; strict JSON and the channel limits
+are enforced by the host proxy. The proxy uses the signer response's top-level `run_id`, `run_token`, and
+`approval_id` fields to maintain its per-box ownership tables.
 
 ## The problem
 
@@ -59,6 +66,28 @@ So each box's channel gets its own signer connection with its own identity, `box
 
 ### The daemon: the scoping proxy
 
+The required limits are: 16 open connections per box; 1 MiB maximum frame; 10 seconds for the first byte through
+newline; 15 seconds idle between frames; a signer link quiet for 25 seconds (under the signer's 30, as frames the
+channel refuses keep a guest connection alive without reaching the signer) replaced before the next frame goes out;
+330 seconds for a signer reply; 10 seconds for guest writes; JSON
+nesting depth 128; 50 frames/second with burst 200, where each new connection costs a frame (it makes the signer set
+up a connection of its own); 256 runs over the box's lifetime; 64 MiB across every forwarded frame but `hello` and
+`status`, whatever its method, since any of them can reach the signer's content vault; and 1,048,576 forwarded frames
+over the box's lifetime (`hello` and `status` included: about 20 times a long coding session, almost six hours of
+nonstop sending at the rate limit). Rate and byte limits are per box and are accounted under one shared lock. Across
+the daemon's boxes, the strict checks run on at most half the CPUs at once.
+
+**Read pace.** A box's connections share one read budget: 1 MiB a second, 8 MiB at once (`Server.ReadRate` and
+`ReadBurst`). Every byte the proxy reads from a guest is reserved from it first, refused frames included, and while
+it is spent a read waits: the bytes stay in vsock and the guest's writer stalls, rather than the daemon reading them
+at the guest's speed. A coding agent's hook and tailer send a few KiB per tool call and model turn, their largest
+frames (a big `Write`'s arguments, a long tool result) stay under 1 MiB, and a box forwards at most 64 MiB in its
+life (the byte budget), which this pace passes in about a minute, so real traffic does not meet it. A box flooding
+its channel with 1 MiB frames costs the daemon about 0.05 of a core this way, against about 4.6 cores unpaced, and
+another box's frames are answered as usual meanwhile (`TestAFloodingBoxIsPaced`). The pace is the box's own: a box
+flooding its own channel can hold its own large frames past the 10 seconds a frame may take to arrive, and that
+connection is closed; other boxes are unaffected.
+
 **Which box.** The daemon serves 1027 on a per-box Firecracker vsock listener path, `<box dir>/vsock.sock_1027`, so a
 connection's box is the listener it arrived on, never anything a frame says. Connections per box are capped. When a
 stop begins, the listener and its connections are closed with the egress.
@@ -66,11 +95,20 @@ stop begins, the listener and its connections are closed with the egress.
 **Reading frames.**
 - Each frame is read through a reader bounded at 1 MiB, the signer's line limit, with a deadline per frame. A partial
   frame never stalls the channel.
-- Each frame is decoded with Tracekit's strict rules: no duplicate keys, valid UTF-8, a depth limit, and numbers kept
-  as `json.Number`, so nothing is rounded.
-- A frame that passes is forwarded as the received bytes, verbatim, except `register_run`, which the daemon builds
-  fresh (below).
-- Rate limits answer `quota_exceeded` with `retry_after_ms`, as the signer does. A frame is never held back.
+- Each frame is checked with Tracekit's strict rules: one JSON object, no duplicate keys at any level, valid UTF-8 and
+  a depth limit. The check reads the frame in place without building its value: it keeps only the names of the
+  objects it is inside, and the top-level fields the rules read.
+- A frame that passes is forwarded as the received bytes, verbatim, so nothing is rounded, except `register_run`,
+  which the daemon builds fresh from the agent's own `request_id` and `agent` bytes (below), never longer than the
+  frame they came in.
+- Rate limits answer `quota_exceeded` with `retry_after_ms`, as the signer does. A frame is never held back. A frame
+  over the rate is passed over unread: neither kept nor checked. The lifetime frame cap answers `quota_exceeded`
+  without `retry_after_ms`: waiting frees nothing.
+- Every refusal is also a `channel.refused` event of the box: its kind (`frame`, `method`, `field`, `run`,
+  `approval`, `rate`, `run_cap`, `byte_budget`, `frame_cap`, `connections`, `signer`), the method when it is a plain
+  name, and the channel's own reason, never the frame's content. A box gets at most one such event per kind a second;
+  the refusals in between are counted into the kind's next event (`folded`), and the stop reports what is left. The
+  same refusals are signed into the box's run as `tkbox.channel` observes, in the bulk lane egress refusals use.
 
 **Methods.** Only the methods a coding agent's hook and its transcript tailer use pass: `hello` (the client's first
 frame), `register_run`, `decide`, `complete`, `observe`, `model_event`, `state_write`, `approval_request`,
@@ -79,25 +117,40 @@ and `status`. Everything else is refused before the signer sees it. That include
 on-behalf, operator, incident, content, PCM and findings call, `delegate_run` and `tailer_heartbeat`; the tailer runs
 in the VM beside the hook.
 
-**Fields, not only methods.**
+**Fields, not only methods.** Methods pass by an allowlist; fields are refused by deny lists.
 - `register_run`: the daemon builds the request itself from only the agent's `request_id` and `agent`. It refuses a
   request that carries `parent`, `principal`, `principal_token`, `caller`, `source`, `tenant`, `analyzes`,
-  `replay_of`, `investigation` or `ext`, and drops `run_id`: the signer names the run.
+  `replay_of`, `investigation`, `ext` or `box`, and drops `run_id`: the signer names the run. An agent name may
+  hold only ASCII letters, digits, `.`, `_`, space and `-` (no lookalike of a reserved name passes), and one that
+  starts with `tkbox` (any case) is refused. An agent run may share the box run's name (Tracekit's Claude Code hook
+  registers as `claude-code`, the name the GitHub Action gives a Claude Code box): what tells them apart is
+  signer-written: the agent run's `parent_run`, which a box run never has (both carry `ext.box`), never the name.
 - In every method: `caller`, `on_behalf`, `amended` and `tool_results` are refused. These are what a gateway or a
   bridge sends for someone else.
-- `approval_get`: only for approval ids this channel's own `approval_request` returned.
-- `observe`: a `tkbox.*` source is refused (Box's own records are Box's). `trust` is left as the hook sent it: the
+- `approval_get`: exempt from the run-id check because its schema has no `run_id`; only for approval ids this
+  channel's own `approval_request` returned.
+- `observe`: a source must be plain ASCII (letters, digits, `.`, `_`, space, `-`, `:` and `/`), and one that starts
+  with `tkbox` in any case is refused (Box's own records are Box's). `trust` is left as the hook sent it: the
   hook marks the person's own prompt `trusted`, and forcing it would hold legitimate calls. What the agent's run says
   about trust is the agent's account, under its own run and label, never Box's.
-- A byte budget per box covers what goes into the signer's content vault: `model_event` bodies and `complete`
-  results. Past it the channel refuses with `quota_exceeded`, and the box's events say so.
+- A byte budget per box covers what can go into the signer's content vault: every forwarded frame but `hello` and
+  `status` (a `decide`'s arguments are kept as a `complete`'s result is). These lifetime limits answer without
+  `retry_after_ms`, as waiting frees nothing (the run cap sends it only while a registration in flight may yet fail
+  and free its place). Past the byte budget, or past the lifetime frame cap, the
+  channel refuses with `quota_exceeded`, and the box's events say so.
 
 **Runs.**
 - The run table is filled from the signer's `register_run` response, under a lock. An entry is never reused, and the
   box run itself is never in it.
 - Every other frame must name a run in that table; the signer checks the run token as well.
 - Total runs per box are capped, not only open ones.
-- At stop, every run the channel opened is closed before the box's own run.
+- At stop, the channel closes its guest connections and their signer connections at once, except one whose
+  `register_run` is with the signer: its reply gets 2 seconds, so the run it registers reaches the run table. A long
+  poll (`approval_wait`) holds up no stop. Once the VM is down (a kill waits for no
+  signer), every run the channel opened is closed, eight at a time, within 30 seconds. The box's own run stays open
+  for `tkbox apply`, as a plain box's does, and closes at export, `rm` or daemon shutdown: after its channel's runs.
+- A successful agent `close_run` marks the run closed. It remains counted against the lifetime cap and is not closed
+  a second time at stop.
 
 ### Fail closed, as far as it can be
 
@@ -154,18 +207,32 @@ engine named.
 
 ## The Claude Code image
 
-An image, built from a Dockerfile in this repository and not published by it:
+An image, built from [images/claude-code/Dockerfile](../images/claude-code/Dockerfile) and not published by this repository:
 
 - Debian, Node and Python, Claude Code pinned to a version at least two weeks old, and Tracekit's hook client.
 - Claude Code runs as a non-root user, with `IS_SANDBOX=1` set as well.
 - Root-owned managed settings (`/etc/claude-code/managed-settings.json`) hold Tracekit's v2 hooks, with
-  `TRACEKIT_SIGNER=/run/tkbox/signer.sock` pinned in their `env` and `allowManagedHooksOnly: true`.
+  `TRACEKIT_SIGNER=/run/tkbox/signer.sock` pinned in their `env` and `allowManagedHooksOnly: true`. The hooks run
+  `/opt/tracekit/bin/python3` and `/bin/grep` by path, and the managed `env` pins `PATH`, `TRACEKIT_RUNTIME_DIR` and
+  `TRACEKIT_APPROVAL_WAIT`, empties `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `GCONV_PATH`, `LOCPATH`, `NLSPATH`,
+  `BASH_ENV`, `ENV` and `CLAUDE_CODE_SIMPLE`, sets `CLAUDE_CODE_SHELL_PREFIX` to none and `CLAUDE_CODE_SHELL` to the
+  image's `/bin/bash`, and sets `disableAllHooks` false, so a project's or the user's settings (which come before
+  managed settings in Claude Code's order) can't put a stub in their place, wrap them in a prefix, load code into them,
+  turn them off or move the hook's state. `go test -tags image ./images/claude-code` runs the image's own Claude Code in
+  such a project, with no API key, and checks that the managed hooks still register and close their run with a fake
+  signer ([README](../images/claude-code/README.md)).
 - The model key is a Box secret bound to the header the Anthropic API reads, not the default `Authorization`:
   `--secret ANTHROPIC_API_KEY=env:ANTHROPIC_API_KEY@api.anthropic.com#X-Api-Key`. The VM sees only its placeholder.
 - Its egress is `--allow claude-code,anthropic`. The `anthropic` preset makes `api.anthropic.com` a model host, so
   Box records each model call (`tkbox.model.call`) on that inspected connection. `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
   keeps Claude Code off other telemetry hosts.
 - The project comes in as the workspace copy, and its changes go out only through `apply`.
+
+Build and run instructions are in [images/claude-code/README.md](../images/claude-code/README.md). The end-to-end test,
+`TestAgentChannel` in [e2e/](../e2e/agent_channel_test.go), runs with `make e2e` on a Linux host with KVM when
+`TKBOX_TRACEKIT21` names a `tracekit` CLI that serves protocol 21: it starts its own signer from it, with `box_daemons`
+naming the test's user ([development.md](development.md#end-to-end-tests)). It runs Tracekit's hook client directly, not
+Claude Code, so the managed settings are covered by the image test above, not by it.
 
 ## What changes where
 
@@ -175,7 +242,7 @@ An image, built from a Dockerfile in this repository and not published by it:
 | `internal/api` | `agent_channel` in `CreateBoxRequest` and `Box` |
 | `internal/proto` | port 1027; the guest end's boot config |
 | `cmd/tkbox-guest`, `internal/guest` | the root-owned socket and the relay |
-| `internal/daemon` | the per-box listener, the scoping proxy (strict bounded reads, method and field allowlists, run table, `register_run` built fresh, byte budget, rate limits, run and connection caps), closing at stop, the `fail_modes` check |
+| `internal/daemon` | the per-box listener, the scoping proxy (strict bounded reads, a method allowlist and field deny lists, run table, `register_run` built fresh, byte budget, rate limits, run and connection caps), closing at stop, the `fail_modes` check |
 | `internal/tracekit` | a per-box channel connection with its own identity, once Tracekit offers it; with an older signer there is no channel |
 | `images/claude-code/` | the Claude Code image's Dockerfile |
-| Tests | unit tests of every refusal (fake signer), including two boxes that can't touch each other's runs or quotas; an end-to-end test that runs Tracekit's hook in a box and exports a bundle whose agent run carries the box's label |
+| Tests | unit tests of every refusal (fake signer), including two boxes that can't touch each other's runs or quotas; an end-to-end test that runs Tracekit's hook in a box and exports a bundle whose agent run carries the box's label; an image test that runs the image's Claude Code in a hostile project against a fake signer |

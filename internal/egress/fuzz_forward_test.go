@@ -96,6 +96,88 @@ func hostHeaderFor(c fwdCase) string {
 	return h
 }
 
+// cutOff reports whether the bytes the upstream got are a request Box cut off. Box writes a request while it reads the
+// answer, and ends the write when the exchange ends (the scripted upstream answered first, or with something not
+// HTTP), so the upstream may hold only the start of the head: past a buffer of it, even part of the request line, which
+// http.ReadRequest calls malformed rather than EOF. Only a complete head is a request the upstream must read.
+func cutOff(up []byte, err error) bool {
+	return err == io.EOF || err == io.ErrUnexpectedEOF || !bytes.Contains(up, []byte("\r\n\r\n"))
+}
+
+// cutWriter passes the first n bytes and then fails, as the upstream link does once Box closes it mid-request.
+type cutWriter struct {
+	w io.Writer
+	n int
+}
+
+func (c *cutWriter) Write(b []byte) (int, error) {
+	if len(b) > c.n {
+		m, _ := c.w.Write(b[:c.n])
+		c.n -= m
+		return m, net.ErrClosed
+	}
+	m, err := c.w.Write(b)
+	c.n -= m
+	return m, err
+}
+
+// FuzzForward failed under load (a fuzz run, once in about 600 replays) on a request line longer than Box's 16 KiB
+// write buffer and an answer that is not HTTP: Box ended the exchange between two writes, so the upstream held 10 KiB
+// of the request line, which the harness took for a malformed request instead of a cut-off one. Here the link fails
+// after 10 KiB every time.
+func TestForwardCutInsideTheRequestLineIsACutOff(t *testing.T) {
+	ca, err := NewCA("fuzz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := New(Config{Decider: nopDecider{}, Sink: nopSink{}, CA: ca, Allow: []string{"api.github.com"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	c := fwdTargets[0]
+	reqBytes := []byte("GET /" + strings.Repeat("%CC", 6000) + " HTTP/1.1\r\nHost: api.github.com\r\n\r\n")
+	br := bufio.NewReader(bytes.NewReader(reqBytes))
+	req, err := http.ReadRequest(br)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upBox, upHost := socketPair(t)
+	defer upBox.Close()
+	defer upHost.Close()
+	var captured bytes.Buffer
+	upDone := make(chan struct{})
+	go func() { // the answer, not HTTP, comes once the request has started, so the order is the same every run
+		defer close(upDone)
+		io.CopyN(&captured, upHost, 10<<10)
+		upHost.Write([]byte("not HTTP\r\n\r\n"))
+		upHost.CloseWrite()
+		io.Copy(&captured, upHost)
+	}()
+	cli := &bufClientConn{}
+	s := &session{p: p, raw: cli, closers: []io.Closer{upBox}}
+	s.watch = newIdleWatch(time.Minute, func() {})
+	s.client = &meteredConn{Conn: cli, w: s.watch}
+	uhl := &headLimiter{r: upBox, norec: true}
+	x := &exchange{p: p, s: s, t: c.t, cliOut: &countWriter{w: cli}, upOut: &countWriter{w: &cutWriter{w: upBox, n: 10 << 10}},
+		cr: br, ur: bufio.NewReaderSize(uhl, 32<<10), uhl: uhl, upRaw: upBox, cli: cli, up: upBox}
+	x.forward(req, c.overTLS)
+	s.watch.stop()
+	upBox.Close()
+	<-upDone
+	up := captured.Bytes()
+	_, rerr := http.ReadRequest(bufio.NewReader(bytes.NewReader(up)))
+	if len(up) != 10<<10 || bytes.Contains(up, []byte("\r\n")) || !bytes.HasPrefix(reqBytes, up) {
+		t.Fatalf("the upstream got %d bytes, want the first 10 KiB of the request line", len(up))
+	}
+	if !cutOff(up, rerr) {
+		t.Fatalf("10 KiB of a request line (%.80v...) is not counted as a cut-off request", rerr)
+	}
+	if _, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(reqBytes))); cutOff(reqBytes, err) {
+		t.Fatal("a whole request is counted as cut off")
+	}
+}
+
 // FuzzForward drives one request through exchange.forward (the code that swaps secrets in, checks the request and
 // relays the answer) with an in-memory guest and a scripted upstream. Invariants:
 //   - a real secret value reaches the upstream only in its bound header, on a request to a bound host over TLS;
@@ -239,8 +321,8 @@ func FuzzForward(f *testing.F) {
 		if len(up) > 0 {
 			ur := bufio.NewReader(bytes.NewReader(up))
 			ureq, err := http.ReadRequest(ur)
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				// Box cut the request off (the scripted upstream answered before reading it): check the raw lines
+			if cutOff(up, err) {
+				// Box cut the request off (the exchange ended before it was all written): check the raw lines
 				for _, line := range strings.Split(string(up), "\r\n") {
 					for v, name := range vals {
 						for _, sr := range p.secrets {

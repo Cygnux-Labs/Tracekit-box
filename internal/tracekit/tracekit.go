@@ -6,6 +6,7 @@ package tracekit
 
 import (
 	"context"
+	"net"
 	"strings"
 	"time"
 )
@@ -26,6 +27,7 @@ const (
 	SourceSecretLeak = "tkbox.secret.leak" // {name, host, reason}
 	SourceModelCall  = "tkbox.model.call"  // {host, path, status, bytes}
 	SourceEgress     = "tkbox.egress"      // {host, port, decision, reason} for refusals Box made itself
+	SourceChannel    = "tkbox.channel"     // {refusal, method, reason, folded}: frames the agent channel refused
 	SourceApproval   = "tkbox.approval"    // trusted: a Box approval {approval_id, target, decision, approver}
 	SourceContained  = "tkbox.contained"   // {state, incident_id}
 )
@@ -85,6 +87,10 @@ type Options struct {
 	Signer      string
 	Timeout     time.Duration // per call (default 30s); long polls add their own wait
 	TracekitBin string        // the `tracekit` CLI used by Export (default "tracekit" in PATH)
+	// Config is the signer's signer.yaml, which Export passes to the CLI as --config so it reads that signer's store.
+	// "": the system signer's /etc/tracekit/signer.yaml when the system signer is the one, else the CLI's default (the
+	// dev signer's store).
+	Config string
 }
 
 // Status is the signer's status answer.
@@ -109,10 +115,19 @@ type Client interface {
 	Status(ctx context.Context) (Status, error)
 	// NewRun registers a run.
 	NewRun(ctx context.Context, agent Agent) (Run, error)
+	NewBoxRun(ctx context.Context, agent Agent, box BoxLabel) (Run, error)
+	Channel(ctx context.Context, run Run) (net.Conn, error)
 	// Export writes the run's bundle (tracekit export --v2) and the signer's trust config (tracekit signer trust),
 	// waiting until the run is final (the signer finalises a run a few seconds after close_run).
 	Export(ctx context.Context, runID, bundleOut, trustOut string) error
 	Close() error
+}
+
+// BoxLabel is the daemon's trusted description attached to a boxed run.
+type BoxLabel struct {
+	ID, ImageDigest string
+	Allow           []string
+	Channel         string
 }
 
 // Call is one tool call. ID is unique within the run; Attempt is 0 unless a call is retried.

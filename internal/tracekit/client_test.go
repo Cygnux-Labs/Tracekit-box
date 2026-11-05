@@ -60,8 +60,9 @@ func TestDialHelloMismatch(t *testing.T) {
 		proto []any
 		want  []string
 	}{
-		{[]any{20, 22}, []string{"1.5.0", "20..22", "protocol 19", "no longer serves"}},
-		{[]any{15, 18}, []string{"1.5.0", "15..18", "protocol 19", "upgrade it to Tracekit 1.4.2"}},
+		{[]any{22, 24}, []string{"1.5.0", "22..24", "protocol 19", "no longer serves"}},
+		{[]any{10, 18}, []string{"1.5.0", "10..18", "protocol 19", "upgrade it to Tracekit 1.5.3"}},
+		{[]any{20, 21}, []string{"1.5.0", "20..21", "protocol 19"}},
 		{nil, []string{"(none named)"}},
 	} {
 		f := newFakeSigner(t)
@@ -77,6 +78,17 @@ func TestDialHelloMismatch(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestDialAcceptsProtocol19(t *testing.T) {
+	noSystemConfig(t)
+	f := newFakeSigner(t)
+	f.hello = map[string]any{"proto": []any{15, 19}, "version": "1.5.3", "pid": 7}
+	c, err := Dial(context.Background(), Options{Signer: f.path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
 }
 
 func TestDialNoSigner(t *testing.T) {
@@ -507,5 +519,62 @@ func TestRunStringHidesToken(t *testing.T) {
 		if strings.Contains(s, "secret") {
 			t.Fatal(s)
 		}
+	}
+}
+
+func TestChannelOpensAsTheBoxIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		answer any
+		ok     bool
+	}{
+		{"the box identity, as the contract gives it", map[string]any{"identity": "box:uid:501/tkb-1"}, true},
+		{"an object is not the contract's identity", map[string]any{"identity": map[string]any{"scheme": "box"}}, false},
+		{"another identity", map[string]any{"identity": "uid:501"}, false},
+		{"a refusal", map[string]any{"error": map[string]any{"code": "forbidden", "message": "no"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeSigner(t)
+			standard := f.handle
+			f.handle = func(conn int, req map[string]any) any {
+				if req["method"] == "channel_open" {
+					return tc.answer
+				}
+				return standard(conn, req)
+			}
+			c := dialFake(t, f, 5*time.Second)
+			conn, err := c.Channel(context.Background(), newFakeRun(t, c))
+			if (err == nil) != tc.ok {
+				t.Fatalf("Channel: %v", err)
+			}
+			if conn != nil {
+				conn.Close()
+			}
+		})
+	}
+}
+
+// Channel read hello and channel_open's answers under its own connectTimeout whatever its context said, so a stop that
+// began while a box's signer link was being opened waited for it. It now ends when its context does.
+func TestChannelEndsWithItsContext(t *testing.T) {
+	f := newFakeSigner(t)
+	standard := f.handle
+	f.handle = func(conn int, req map[string]any) any {
+		if req["method"] == "channel_open" {
+			time.Sleep(3 * time.Second) // a signer that does not answer within connectTimeout
+			return map[string]any{"identity": "box:1000/tkb-1"}
+		}
+		return standard(conn, req)
+	}
+	c := dialFake(t, f, 5*time.Second)
+	run := newFakeRun(t, c)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := c.Channel(ctx, run); err == nil {
+		t.Fatal("a channel opened after its context ended")
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("Channel returned %v after its context ended at 100ms", took.Round(time.Millisecond))
 	}
 }

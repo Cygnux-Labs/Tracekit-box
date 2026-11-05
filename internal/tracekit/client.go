@@ -1,11 +1,19 @@
 package tracekit
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"maps"
+	"net"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -76,7 +84,7 @@ func Dial(ctx context.Context, opts Options) (Client, error) {
 		return nil, err
 	}
 	c := &client{t: &transport{where: d.path, timeout: timeout}, source: d.source, stream: newID(),
-		bin: opts.TracekitBin}
+		bin: opts.TracekitBin, config: opts.Config}
 	c.t.put(c0)
 	// status.rpc_version is the signer's highest protocol; hello's range already holds ours
 	if _, err := c.Status(ctx); err != nil {
@@ -91,6 +99,7 @@ type client struct {
 	source signerSource
 	stream string // this client's event stream (one per process in the SDK)
 	bin    string
+	config string // Options.Config
 }
 
 func (c *client) Where() string { return c.t.where }
@@ -135,6 +144,14 @@ func badAnswer(method string) error {
 }
 
 func (c *client) NewRun(ctx context.Context, agent Agent) (Run, error) {
+	return c.newRun(ctx, agent, nil)
+}
+
+func (c *client) NewBoxRun(ctx context.Context, agent Agent, box BoxLabel) (Run, error) {
+	return c.newRun(ctx, agent, &box)
+}
+
+func (c *client) newRun(ctx context.Context, agent Agent, box *BoxLabel) (Run, error) {
 	if err := checkLen("agent name", agent.Name, 1, maxAgentName); err != nil {
 		return nil, err
 	}
@@ -145,7 +162,15 @@ func (c *client) NewRun(ctx context.Context, agent Agent) (Run, error) {
 	if agent.Version != "" {
 		a["version"] = agent.Version
 	}
-	m, err := c.call(ctx, "register_run", map[string]any{"request_id": newID(), "agent": a})
+	req := map[string]any{"request_id": newID(), "agent": a}
+	if box != nil {
+		b := map[string]any{"id": box.ID, "image_digest": box.ImageDigest, "allow": box.Allow}
+		if box.Channel != "" {
+			b["channel"] = box.Channel
+		}
+		req["box"] = b
+	}
+	m, err := c.call(ctx, "register_run", req)
 	if err != nil {
 		return nil, err
 	}
@@ -154,8 +179,88 @@ func (c *client) NewRun(ctx context.Context, agent Agent) (Run, error) {
 	if id == "" || token == "" {
 		return nil, badAnswer("register_run")
 	}
-	return &run{c: c, id: id, token: token, turn: make(chan struct{}, 1)}, nil
+	r := &run{c: c, id: id, token: token, turn: make(chan struct{}, 1)}
+	if box != nil {
+		fm, _ := m["fail_modes"].(map[string]any)
+		var refused error
+		if len(fm) == 0 {
+			refused = badAnswer("register_run fail_modes")
+		}
+		for _, mode := range slices.Sorted(maps.Keys(fm)) {
+			if fm[mode] != "closed" {
+				refused = fmt.Errorf("agent channel requires closed fail mode %s", mode)
+				break
+			}
+		}
+		if refused != nil { // the signer registered the run: close it, so none is left open with its token gone
+			if err := r.Close(ctx, "box run refused: "+refused.Error()); err != nil {
+				return nil, fmt.Errorf("%w (and closing the refused run failed: %v)", refused, err)
+			}
+			return nil, refused
+		}
+	}
+	return r, nil
 }
+
+func (c *client) Channel(ctx context.Context, r Run) (net.Conn, error) {
+	run, ok := r.(*run)
+	if !ok || run.c != c {
+		return nil, errors.New("tracekit: channel run belongs to another client")
+	}
+	d := net.Dialer{Timeout: connectTimeout}
+	nc, err := d.DialContext(ctx, "unix", c.t.where)
+	if err != nil {
+		return nil, &Unavailable{Err: err}
+	}
+	stop := context.AfterFunc(ctx, func() { _ = nc.Close() }) // ctx ends the handshake, not only the dial
+	fail := func(err error) (net.Conn, error) {
+		stop()
+		_ = nc.Close()
+		if ctx.Err() != nil {
+			err = &Unavailable{Err: ctx.Err()}
+		}
+		return nil, err
+	}
+	_ = nc.SetDeadline(time.Now().Add(connectTimeout))
+	br := bufio.NewReader(nc)
+	if _, err = io.WriteString(nc, `{"method":"hello"}`+"\n"); err != nil {
+		return fail(err)
+	}
+	if _, err = readFrame(br); err != nil {
+		return fail(err)
+	}
+	b, _ := json.Marshal(map[string]any{"method": "channel_open", "run_id": run.id, "run_token": run.token})
+	if _, err = nc.Write(append(b, '\n')); err != nil {
+		return fail(err)
+	}
+	ans, err := readFrame(br)
+	if err != nil {
+		return fail(err)
+	}
+	m, err := parseFrame(ans)
+	if err != nil {
+		return fail(err)
+	}
+	if e, yes := m["error"]; yes {
+		return fail(fmt.Errorf("tracekit signer refused channel_open: %v", rpcErrorOf(e)))
+	}
+	// the box's identity as the contract's IDENTITY gives it: "scheme:subject", here box:<daemon uid>/<box id>
+	if id, _ := m["identity"].(string); !strings.HasPrefix(id, "box:") {
+		return fail(badAnswer("channel_open"))
+	}
+	if !stop() { // ctx ended as the handshake finished: nc is closed
+		return fail(ctx.Err())
+	}
+	_ = nc.SetDeadline(time.Time{})
+	return &prefixedConn{Conn: nc, r: br}, nil
+}
+
+type prefixedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *prefixedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 
 // Gate runs the decide → (ask: approval_request, approval_wait until ctx ends) → approval_consume sequence of the
 // 1.4.2 integrations (tracekit/integrations/gate.py). The caller runs the action only when Outcome.Allowed, then calls

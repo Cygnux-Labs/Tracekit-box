@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -36,7 +37,7 @@ const eventLogHardCapReason = "events log over its hard cap"
 
 // bulkEventKinds are the event kinds a guest can produce at will; they are the first to go when a cap is reached.
 var bulkEventKinds = map[string]bool{api.EventEgressAllowed: true, api.EventEgressDenied: true,
-	api.EventEgressClosed: true, api.EventSignerProblem: true}
+	api.EventEgressClosed: true, api.EventSignerProblem: true, api.EventChannelRefused: true}
 
 // eventLog is a box's events.ndjson (0600, append only). Every line goes through the box's scrubber, so a secret value
 // or placeholder never lands on disk even if a caller slips one into a summary.
@@ -337,7 +338,7 @@ type observer struct {
 	// guarded by box.mu
 	tokens     float64
 	last       time.Time
-	suppressed int
+	suppressed map[string]int  // bulk observes over bulkRate, by source, until the next summary
 	gaps       map[string]*gap // observes lost, by source
 	gapsTaken  bool            // recordGaps took gaps: a later loss is recorded on its own (recordLoss)
 }
@@ -432,11 +433,12 @@ func (b *box) startObserver(run tracekit.Run) {
 	}
 	summary := func() {
 		b.mu.Lock()
-		n := o.suppressed
-		o.suppressed = 0
+		counts := o.suppressed
+		o.suppressed = nil
 		b.mu.Unlock()
-		if n > 0 {
-			send(observation{tracekit.SourceEgress, untrustedObs, map[string]any{"decision": "deny", "summary": true,
+		for _, source := range slices.Sorted(maps.Keys(counts)) {
+			n := counts[source]
+			send(observation{source, untrustedObs, map[string]any{"decision": "deny", "summary": true,
 				"suppressed": n, "reason": fmt.Sprintf("%d more refusals Box made itself were not recorded one by one (at most %d a second)", n, bulkRate)}}, false, n)
 		}
 	}
@@ -502,7 +504,7 @@ func (b *box) failClosed(source string, err error) {
 func (b *box) observe(source, trust string, value any) {
 	value = b.scrub().value(value)
 	ob := observation{source, trust, value}
-	bulk := source == tracekit.SourceEgress
+	bulk := source == tracekit.SourceEgress || source == tracekit.SourceChannel
 	b.mu.Lock()
 	o := b.obs
 	if o == nil || b.obsClosed {
@@ -529,7 +531,10 @@ func (b *box) observe(source, trust string, value any) {
 			}
 		}
 		if !queued {
-			o.suppressed++
+			if o.suppressed == nil {
+				o.suppressed = map[string]int{}
+			}
+			o.suppressed[source]++
 		}
 		b.mu.Unlock()
 		return

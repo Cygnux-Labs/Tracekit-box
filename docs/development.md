@@ -50,9 +50,12 @@ cd sdk/python && python3 -m pytest -q     # Python SDK, against a fake daemon
 ```
 
 `go test ./...` runs each fuzz target's seeds and saved inputs (`testdata/fuzz/`). `make fuzz` searches for new ones,
-one target at a time (`make fuzz FUZZTIME=10m` for longer; `make -k fuzz` runs the rest after a failure); a failing
-input is saved under that package's `testdata/fuzz/<target>/`, so commit it with the fix. The `fuzz` workflow runs
-`make -k fuzz` nightly and on demand, and uploads any new failing inputs as an artifact.
+one target at a time (`make fuzz FUZZTIME=10m` for longer). Every target runs even after one fails, and the run then
+fails naming them; a failing input is saved under that package's `testdata/fuzz/<target>/`, so commit it with the fix.
+The `fuzz` workflow runs `make -k fuzz` nightly and on demand, and uploads any new failing inputs as an artifact.
+
+`go test -tags image ./images/claude-code` builds the Claude Code image on a Docker engine and runs its Claude Code,
+with no API key, in a hostile project against a fake signer ([its README](../images/claude-code/README.md)).
 
 `make runs` verifies every signed run in [runs/](../runs/README.md) with the Tracekit 1.4.2 CLI
 (`pip install tracekit-ai==1.4.2`) and rewrites the table in its README from the verified records. The `runs` workflow
@@ -171,6 +174,19 @@ On a Linux host with `/dev/kvm`, `mkfs.ext4` and a running Tracekit signer (1.4.
 ```sh
 make e2e        # builds, then go test -tags e2e ./e2e/... with TKBOX_BIN=bin/
 ```
+
+`TestAgentChannel` ([agent-channel.md](agent-channel.md)) also needs `TKBOX_TRACEKIT21`: a `tracekit` CLI that serves
+RPC protocol 21 (Tracekit 1.6.0 or later). It starts a signer of its own from it, since a dev signer can't take
+`box_daemons`, and skips without it. In the colima VM, which has no Go, build the test on the Mac and run it there:
+
+```sh
+make linux && mkdir -p bin/linux && cp bin/tkbox-linux-arm64 bin/linux/tkbox && cp bin/tkbox-guest-linux-arm64 bin/linux/
+GOOS=linux GOARCH=arm64 go test -c -tags e2e -o bin/linux/e2e.test ./e2e
+colima ssh --profile tkbox -- env TKBOX_BIN=$PWD/bin/linux TKBOX_TRACEKIT21=$v/bin/tracekit \
+  bin/linux/e2e.test -test.v -test.count=1 -test.timeout 30m -test.run TestAgentChannel
+```
+
+Here `$v` is a venv in the VM with Tracekit 1.6.0 or later, not the 1.5.3 one above.
 
 They boot real VMs, pull small public images and check every door against the signer's record, so they need outbound
 network access and take a few minutes. CI runs them on `ubuntu-latest` after enabling KVM for the runner user, and
