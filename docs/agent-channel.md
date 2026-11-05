@@ -1,7 +1,7 @@
 # The agent channel: an agent's own hooks inside a box
 
-Status: implemented. The Linux/KVM end-to-end test (`TestAgentChannel`) is pending at the final head; it last
-passed in the colima VM (nested KVM) on 2026-11-05, at 1efb225, before the review fixes.
+Status: implemented. The Linux/KVM end-to-end test (`TestAgentChannel`) passed in the colima VM (nested KVM) on
+2026-11-05 at 6705867, the head after the review fixes.
 The host's per-box vsock listener and scoping proxy, its per-box channel connections and run/approval tables,
 the guest Unix-socket relay, named frame/rate/run/byte limits and Claude Code image are implemented. Tracekit contract v21 is implemented in the reference checkout
 and Box requires Tracekit 1.6.0 or later (RPC protocol 21) when this option is requested; Box's base Tracekit
