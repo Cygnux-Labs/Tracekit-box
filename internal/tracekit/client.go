@@ -10,6 +10,7 @@ import (
 	"net"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -224,7 +225,8 @@ func (c *client) Channel(ctx context.Context, r Run) (net.Conn, error) {
 	if e, yes := m["error"]; yes {
 		return fail(fmt.Errorf("tracekit signer refused channel_open: %v", rpcErrorOf(e)))
 	}
-	if _, ok := m["identity"].(map[string]any); !ok {
+	// the box's identity as the contract's IDENTITY gives it: "scheme:subject", here box:<daemon uid>/<box id>
+	if id, _ := m["identity"].(string); !strings.HasPrefix(id, "box:") {
 		return fail(badAnswer("channel_open"))
 	}
 	_ = nc.SetDeadline(time.Time{})

@@ -39,6 +39,7 @@ const (
 	RefusedRunCap      = "run_cap"     // MaxRuns reached
 	RefusedByteBudget  = "byte_budget" // ByteBudget spent
 	RefusedConnections = "connections" // MaxConnections open
+	RefusedSigner      = "signer"      // the box's signer channel could not be opened for the connection
 )
 
 // Refusal is one channel.refused event. A box gets at most one event of a kind a second: the refusals in between are
@@ -141,7 +142,8 @@ func (s *Server) handle(active *activeConn) {
 	ctx := context.Background()
 	signer, err := s.Dial(ctx)
 	if err != nil {
-		guestWriteError(guest, "unavailable", "signer channel unavailable", 0)
+		s.refuse(guest, &refusal{code: "unavailable", msg: "signer channel unavailable", kind: RefusedSigner,
+			reason: "the signer channel could not be opened: " + err.Error()})
 		return
 	}
 	s.mu.Lock()

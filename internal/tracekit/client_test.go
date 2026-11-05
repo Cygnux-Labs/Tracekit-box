@@ -521,3 +521,35 @@ func TestRunStringHidesToken(t *testing.T) {
 		}
 	}
 }
+
+func TestChannelOpensAsTheBoxIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		answer any
+		ok     bool
+	}{
+		{"the box identity, as the contract gives it", map[string]any{"identity": "box:uid:501/tkb-1"}, true},
+		{"an object is not the contract's identity", map[string]any{"identity": map[string]any{"scheme": "box"}}, false},
+		{"another identity", map[string]any{"identity": "uid:501"}, false},
+		{"a refusal", map[string]any{"error": map[string]any{"code": "forbidden", "message": "no"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeSigner(t)
+			standard := f.handle
+			f.handle = func(conn int, req map[string]any) any {
+				if req["method"] == "channel_open" {
+					return tc.answer
+				}
+				return standard(conn, req)
+			}
+			c := dialFake(t, f, 5*time.Second)
+			conn, err := c.Channel(context.Background(), newFakeRun(t, c))
+			if (err == nil) != tc.ok {
+				t.Fatalf("Channel: %v", err)
+			}
+			if conn != nil {
+				conn.Close()
+			}
+		})
+	}
+}

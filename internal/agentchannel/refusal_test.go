@@ -1,7 +1,11 @@
 package agentchannel
 
 import (
+	"bufio"
+	"context"
+	"errors"
 	"fmt"
+	"net"
 	"reflect"
 	"strings"
 	"sync"
@@ -68,5 +72,25 @@ func TestRefusalsAreReportedFoldedAndWithoutTheFrame(t *testing.T) {
 	}
 	if strings.Contains(fmt.Sprint(got), body) {
 		t.Fatal("a report carries the frame's content")
+	}
+}
+
+// A connection whose signer channel can't be opened is refused to the agent and reported as a signer refusal with the
+// reason, so a channel that never reaches the signer shows in the box's events.
+func TestUnreachableSignerIsReported(t *testing.T) {
+	s := New(func(context.Context) (net.Conn, error) { return nil, errors.New("channel_open refused") }, "box-run", "")
+	var got []Refusal
+	s.OnRefusal = func(e Refusal) { got = append(got, e) }
+	a, b := net.Pipe()
+	done := make(chan struct{})
+	go func() { s.handle(&activeConn{guest: a}); close(done) }()
+	line, err := bufio.NewReader(b).ReadBytes('\n')
+	if err != nil || !strings.Contains(string(line), `"unavailable"`) {
+		t.Fatalf("the agent read %q, %v", line, err)
+	}
+	b.Close()
+	<-done
+	if len(got) != 1 || got[0].Kind != RefusedSigner || !strings.Contains(got[0].Reason, "channel_open refused") {
+		t.Fatalf("reported %+v", got)
 	}
 }
