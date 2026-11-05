@@ -50,9 +50,9 @@ cd sdk/python && python3 -m pytest -q     # Python SDK, against a fake daemon
 ```
 
 `go test ./...` runs each fuzz target's seeds and saved inputs (`testdata/fuzz/`). `make fuzz` searches for new ones,
-one target at a time (`make fuzz FUZZTIME=10m` for longer; `make -k fuzz` runs the rest after a failure); a failing
-input is saved under that package's `testdata/fuzz/<target>/`, so commit it with the fix. The `fuzz` workflow runs
-`make -k fuzz` nightly and on demand, and uploads any new failing inputs as an artifact.
+one target at a time (`make fuzz FUZZTIME=10m` for longer). Every target runs even after one fails, and the run then
+fails naming them; a failing input is saved under that package's `testdata/fuzz/<target>/`, so commit it with the fix.
+The `fuzz` workflow runs `make -k fuzz` nightly and on demand, and uploads any new failing inputs as an artifact.
 
 `make runs` verifies every signed run in [runs/](../runs/README.md) with the Tracekit 1.4.2 CLI
 (`pip install tracekit-ai==1.4.2`) and rewrites the table in its README from the verified records. The `runs` workflow

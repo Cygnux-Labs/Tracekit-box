@@ -41,6 +41,13 @@ const (
 	// model_event per transcript line, tens of thousands; this is about 20 times that, and at RatePerSecond an agent
 	// needs almost six hours of nonstop sending to reach it.
 	MaxForwardedFrames = 1 << 20
+	// DefaultReadRate and DefaultReadBurst pace the bytes a box's channel connections may send the daemon together (a
+	// second, and at once): past them a read waits, and vsock backpressure stalls the guest's writer. A coding agent's
+	// hook and tailer send a few KiB per tool call and model turn; their largest frames (a big Write's arguments, a long
+	// tool result) stay under MaxFrame, and a box sends at most ByteBudget of them in its life, which this rate passes in
+	// about a minute. A box flooding its channel is held to it instead of keeping daemon cores busy.
+	DefaultReadRate  = 1 << 20
+	DefaultReadBurst = 8 << 20
 	// closeRunsAtOnce bounds the close_run calls a stop makes at once for the channel's open runs.
 	closeRunsAtOnce = 8
 )

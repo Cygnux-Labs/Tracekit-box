@@ -54,7 +54,10 @@ func TestConnectionChurnStaysWithinRateLimit(t *testing.T) {
 // decide's args go into the signer's content vault, but only model_event, complete and observe used to be charged.
 func TestDecideIsChargedToByteBudget(t *testing.T) {
 	f := &matrixSigner{seen: make(chan map[string]any, 128)}
-	_, c, r, done := channelHarness(t, f)
+	s, c, r, done := channelHarness(t, f)
+	s.mu.Lock()
+	s.ReadRate, s.ReadBurst = 1<<40, 1<<40 // 70 MiB through the byte budget, not the read pace
+	s.mu.Unlock()
 	pad := strings.Repeat("A", MaxFrame-300)
 	passed := 0
 	for i := 0; i < 70; i++ {

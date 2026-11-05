@@ -76,6 +76,15 @@ over the box's lifetime (`hello` and `status` included: about 20 times a long co
 nonstop sending at the rate limit). Rate and byte limits are per box and are accounted under one shared lock. Across
 the daemon's boxes, the strict checks run on at most half the CPUs at once.
 
+**Read pace.** A box's connections share one read budget: 1 MiB a second, 8 MiB at once (`Server.ReadRate` and
+`ReadBurst`). Every byte the proxy reads from a guest is reserved from it first, refused frames included, and while
+it is spent a read waits: the bytes stay in vsock and the guest's writer stalls, rather than the daemon reading them
+at the guest's speed. A coding agent's hook and tailer send a few KiB per tool call and model turn, their largest
+frames (a big `Write`'s arguments, a long tool result) stay under 1 MiB, and a box forwards at most 64 MiB in its
+life (the byte budget), which this pace passes in about a minute, so real traffic does not meet it. A box flooding
+its channel with 1 MiB frames costs the daemon about 0.01 of a core this way, against about 4.6 cores unpaced, and
+another box's frames are answered as usual meanwhile (`TestAFloodingBoxIsPaced`).
+
 **Which box.** The daemon serves 1027 on a per-box Firecracker vsock listener path, `<box dir>/vsock.sock_1027`, so a
 connection's box is the listener it arrived on, never anything a frame says. Connections per box are capped. When a
 stop begins, the listener and its connections are closed with the egress.

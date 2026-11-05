@@ -78,10 +78,13 @@ type Server struct {
 	BoxToken     string
 	BoxAgent     string // the agent name of the box's own run (the operator's --agent): no agent run may take it
 	FrameTimeout time.Duration
+	ReadRate     int64 // bytes a second this box's connections may send together (DefaultReadRate)
+	ReadBurst    int64 // bytes they may send at once (DefaultReadBurst)
 	OnLimit      func(string)
 	OnRefusal    func(Refusal)
 
 	now          func() time.Time
+	stop         chan struct{} // closed by Close: a paced read stops waiting
 	refused      map[string]*refusalWindow
 	mu           sync.Mutex
 	connections  map[*activeConn]struct{}
@@ -92,6 +95,8 @@ type Server struct {
 	last         time.Time
 	bytes        int64
 	forwarded    int64
+	readTokens   float64   // bytes the box's connections may still read (ReadRate, ReadBurst)
+	readLast     time.Time // when readTokens was last refilled
 	limitsSeen   map[string]bool
 	closed       bool
 	done         sync.WaitGroup
@@ -100,7 +105,8 @@ type Server struct {
 func New(dial Dial, runID, token string) *Server {
 	return &Server{Dial: dial, BoxRun: runID, BoxToken: token, FrameTimeout: FrameStartTimeout,
 		connections: map[*activeConn]struct{}{}, runs: map[string]runEntry{}, approvals: map[string]bool{}, frames: RateBurst, last: time.Now(), limitsSeen: map[string]bool{},
-		now: time.Now, refused: map[string]*refusalWindow{}}
+		now: time.Now, refused: map[string]*refusalWindow{}, ReadRate: DefaultReadRate, ReadBurst: DefaultReadBurst,
+		stop: make(chan struct{})}
 }
 
 func (s *Server) Serve(l net.Listener) error {
@@ -165,7 +171,7 @@ func (s *Server) handle(active *activeConn) {
 		return
 	}
 	defer signer.Close()
-	gr, sr := bufio.NewReaderSize(guest, 64<<10), bufio.NewReaderSize(signer, 64<<10)
+	gr, sr := bufio.NewReaderSize(pacedConn{Conn: guest, s: s}, 64<<10), bufio.NewReaderSize(signer, 64<<10)
 	for {
 		_ = guest.SetReadDeadline(time.Now().Add(IdleTimeout))
 		first, err := gr.ReadByte()
@@ -322,6 +328,60 @@ func (s *Server) limit(reason, kind string) {
 	}
 }
 
+// pacedConn is a guest connection whose reads draw on its box's read budget: while the budget is spent a read waits,
+// so the guest's bytes stay in vsock and its writer stalls, rather than the daemon reading them at the guest's speed.
+// A read reserves its bytes first, from what the budget holds, and gives back what it did not read, so the box's
+// connections together never read past the budget. It waits for a reservation of readChunk (or b, if smaller) rather
+// than taking a few bytes at a time, which would wake the daemon for every scrap of budget.
+type pacedConn struct {
+	net.Conn
+	s *Server
+}
+
+const readChunk = 64 << 10
+
+func (c pacedConn) Read(b []byte) (int, error) {
+	take := 0
+	for {
+		c.s.mu.Lock()
+		c.s.refillRead()
+		need := float64(min(len(b), readChunk, int(c.s.ReadBurst)))
+		if c.s.readTokens >= need {
+			take = min(len(b), int(c.s.readTokens))
+			c.s.readTokens -= float64(take)
+			c.s.mu.Unlock()
+			break
+		}
+		wait := time.Duration((need - c.s.readTokens) / float64(c.s.ReadRate) * float64(time.Second))
+		c.s.mu.Unlock()
+		t := time.NewTimer(wait + time.Millisecond)
+		select {
+		case <-t.C:
+		case <-c.s.stop:
+			t.Stop()
+			return 0, net.ErrClosed
+		}
+	}
+	n, err := c.Conn.Read(b[:take])
+	if n < take {
+		c.s.mu.Lock()
+		c.s.readTokens += float64(take - n)
+		c.s.mu.Unlock()
+	}
+	return n, err
+}
+
+// refillRead adds the read budget earned since its last refill (caller holds mu).
+func (s *Server) refillRead() {
+	now := time.Now()
+	if s.readLast.IsZero() {
+		s.readTokens = float64(s.ReadBurst)
+	} else {
+		s.readTokens = min(float64(s.ReadBurst), s.readTokens+now.Sub(s.readLast).Seconds()*float64(s.ReadRate))
+	}
+	s.readLast = now
+}
+
 func (s *Server) takeToken() (bool, int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -450,6 +510,9 @@ func (s *Server) Close(l net.Listener) {
 		}
 	}
 	s.mu.Lock()
+	if !s.closed {
+		close(s.stop)
+	}
 	s.closed = true
 	s.mu.Unlock()
 	if l != nil {
