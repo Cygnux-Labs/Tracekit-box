@@ -1,6 +1,6 @@
 # The agent channel: an agent's own hooks inside a box
 
-Status: implemented, with the Linux/KVM end-to-end test still to add. The host's per-box vsock listener and scoping proxy, its per-box channel connections and run/approval tables,
+Status: implemented; its Linux/KVM end-to-end test is written and has not yet run on a KVM host. The host's per-box vsock listener and scoping proxy, its per-box channel connections and run/approval tables,
 the guest Unix-socket relay, named frame/rate/run/byte limits and Claude Code image are implemented. Tracekit contract v21 is implemented in the reference checkout
 and Box requires Tracekit 1.6.0 or later (RPC protocol 21) when this option is requested; Box's base Tracekit
 requirement remains protocol 19 (Tracekit 1.5.3).
@@ -182,9 +182,10 @@ An image, built from [images/claude-code/Dockerfile](../images/claude-code/Docke
   keeps Claude Code off other telemetry hosts.
 - The project comes in as the workspace copy, and its changes go out only through `apply`.
 
-Build and run instructions are in [images/claude-code/README.md](../images/claude-code/README.md). The planned
-Linux/KVM end-to-end test should run with `go test -tags e2e ./e2e -run TestAgentChannel` after `make build`, on a
-Linux host with KVM, the Tracekit 1.6.0+ signer and `tracekit` CLI available.
+Build and run instructions are in [images/claude-code/README.md](../images/claude-code/README.md). The end-to-end test,
+`TestAgentChannel` in [e2e/](../e2e/agent_channel_test.go), runs with `make e2e` on a Linux host with KVM when
+`TKBOX_TRACEKIT21` names a `tracekit` CLI that serves protocol 21: it starts its own signer from it, with `box_daemons`
+naming the test's user ([development.md](development.md#end-to-end-tests)).
 
 ## What changes where
 

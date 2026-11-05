@@ -172,6 +172,19 @@ On a Linux host with `/dev/kvm`, `mkfs.ext4` and a running Tracekit signer (1.4.
 make e2e        # builds, then go test -tags e2e ./e2e/... with TKBOX_BIN=bin/
 ```
 
+`TestAgentChannel` ([agent-channel.md](agent-channel.md)) also needs `TKBOX_TRACEKIT21`: a `tracekit` CLI that serves
+RPC protocol 21 (Tracekit 1.6.0 or later). It starts a signer of its own from it, since a dev signer can't take
+`box_daemons`, and skips without it. In the colima VM, which has no Go, build the test on the Mac and run it there:
+
+```sh
+make linux && mkdir -p bin/linux && cp bin/tkbox-linux-arm64 bin/linux/tkbox && cp bin/tkbox-guest-linux-arm64 bin/linux/
+GOOS=linux GOARCH=arm64 go test -c -tags e2e -o bin/linux/e2e.test ./e2e
+colima ssh --profile tkbox -- env TKBOX_BIN=$PWD/bin/linux TKBOX_TRACEKIT21=$v/bin/tracekit \
+  bin/linux/e2e.test -test.v -test.count=1 -test.timeout 30m -test.run TestAgentChannel
+```
+
+Here `$v` is a venv in the VM with Tracekit 1.6.0 or later, not the 1.5.3 one above.
+
 They boot real VMs, pull small public images and check every door against the signer's record, so they need outbound
 network access and take a few minutes. CI runs them on `ubuntu-latest` after enabling KVM for the runner user, and
 also runs the GitHub Action from the checkout (`uses: ./action`) with a trivial command

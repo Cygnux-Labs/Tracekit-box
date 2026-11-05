@@ -30,7 +30,8 @@ type env struct {
 	port     string
 }
 
-func setup(t *testing.T) *env {
+// needKVM skips the test unless $TKBOX_BIN names the binaries and /dev/kvm is usable; -> $TKBOX_BIN.
+func needKVM(t *testing.T) string {
 	t.Helper()
 	bin := os.Getenv("TKBOX_BIN")
 	if bin == "" {
@@ -41,6 +42,13 @@ func setup(t *testing.T) *env {
 	} else {
 		f.Close()
 	}
+	return bin
+}
+
+// setup starts a daemon (with daemonArgs added to its command line) on a state dir of its own.
+func setup(t *testing.T, daemonArgs ...string) *env {
+	t.Helper()
+	bin := needKVM(t)
 	e := &env{bin: bin, state: t.TempDir()}
 	e.sock = filepath.Join(e.state, "run", "tkbox.sock")
 
@@ -71,8 +79,8 @@ func setup(t *testing.T) *env {
 	run(t, e.work, "git", "-c", "user.email=e2e@example.com", "-c", "user.name=e2e", "commit", "-q", "-m", "init")
 
 	ctx, cancel := context.WithCancel(context.Background())
-	d := exec.CommandContext(ctx, filepath.Join(bin, "tkbox"), "daemon", "--state-dir", e.state,
-		"--approval-timeout", "5s", "--egress-allow-private", "127.0.0.1/32", "--upstream-ca", caFile)
+	d := exec.CommandContext(ctx, filepath.Join(bin, "tkbox"), append([]string{"daemon", "--state-dir", e.state,
+		"--approval-timeout", "5s", "--egress-allow-private", "127.0.0.1/32", "--upstream-ca", caFile}, daemonArgs...)...)
 	d.Stdout, d.Stderr = os.Stderr, os.Stderr
 	d.Cancel = func() error { return d.Process.Signal(os.Interrupt) }
 	d.WaitDelay = 30 * time.Second
@@ -105,7 +113,16 @@ func run(t *testing.T, dir string, name string, args ...string) string {
 
 func (e *env) tk(t *testing.T, args ...string) (string, string, int) {
 	t.Helper()
+	return e.tkIn(t, "", args...)
+}
+
+// tkIn runs tkbox with stdin (for `exec -i`).
+func (e *env) tkIn(t *testing.T, stdin string, args ...string) (string, string, int) {
+	t.Helper()
 	c := exec.Command(filepath.Join(e.bin, "tkbox"), args...)
+	if stdin != "" {
+		c.Stdin = strings.NewReader(stdin)
+	}
 	c.Env = append(os.Environ(), "TKBOX_SOCKET="+e.sock, "TK_SECRET="+secretValue)
 	var out, errb bytes.Buffer
 	c.Stdout, c.Stderr = &out, &errb
