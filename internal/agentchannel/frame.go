@@ -19,11 +19,12 @@ const (
 	MaxFrame          = 1 << 20
 	maxDepth          = 128
 	FrameStartTimeout = 10 * time.Second
-	// IdleTimeout is how long a guest connection may sit between frames. The proxy forwards a frame only once it has
-	// all of it, so the signer connection is silent for IdleTimeout + FrameStartTimeout at most; the signer drops one
-	// silent for 30 s. Keeping the sum under that, the proxy, not the signer, ends an idle connection, and the agent's
-	// client reconnects instead of sending a frame into a connection the signer has dropped.
-	IdleTimeout         = 15 * time.Second
+	// IdleTimeout is how long a guest connection may sit between frames.
+	IdleTimeout = 15 * time.Second
+	// SignerQuietLimit is how long a connection's signer link may go without an exchange before the proxy replaces it
+	// for the next frame: the signer drops a connection silent for 30 s, and frames the channel refuses keep the guest
+	// connection alive without reaching the signer.
+	SignerQuietLimit    = 25 * time.Second
 	SignerReplyTimeout  = 330 * time.Second
 	GuestWriteTimeout   = 10 * time.Second
 	RefusalWriteTimeout = time.Second
@@ -209,33 +210,39 @@ func Decode(data []byte) (*Frame, error) {
 			}
 			f.agent = agent.str["name"]
 		}
-		if !plainAgentName(f.agent) {
+		if !plainASCII(f.agent, "._ -") {
 			return refuse(RefusedField, "agent name may hold only letters, digits, '.', '_', ' ' and '-'",
 				"agent name not plain")
 		}
-		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(f.agent)), "tkbox") {
+		if reservedName(f.agent) {
 			return refuse(RefusedField, "agent name is reserved", "agent name tkbox… is Box's own")
 		}
 	}
 	if method == "observe" {
-		if s := f.str["source"]; len(s) >= 6 && s[:6] == "tkbox." {
-			return refuse(RefusedField, "tkbox observe source is reserved", "observe source tkbox.* is Box's own")
+		if src := f.str["source"]; !plainASCII(src, "._ -:/") || reservedName(src) {
+			return refuse(RefusedField, "observe source may hold only letters, digits, '.', '_', ' ', '-', ':' and '/', and tkbox… is Box's own",
+				"observe source not plain, or tkbox… (Box's own)")
 		}
 	}
 	return f, nil
 }
 
-// plainAgentName reports whether an agent run's name holds only ASCII letters, digits, '.', '_', ' ' and '-': no
-// lookalike (a zero-width or fullwidth character, a Cyrillic letter) can then read as a name Box reserves.
-func plainAgentName(name string) bool {
-	for i := 0; i < len(name); i++ {
-		switch c := name[i]; {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == ' ', c == '-':
+// plainASCII reports whether s holds only ASCII letters, digits and the punctuation in punct: no lookalike (a
+// zero-width or fullwidth character, a one-dot leader, a Cyrillic letter) can then read as a name Box reserves.
+func plainASCII(s, punct string) bool {
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', strings.IndexByte(punct, c) >= 0:
 		default:
 			return false
 		}
 	}
 	return true
+}
+
+// reservedName reports whether a plain name reads as Box's own: tkbox… in any case, past leading spaces.
+func reservedName(s string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(s)), "tkbox")
 }
 
 // registerFrame is the register_run the channel forwards: only the agent's request_id and agent, copied as sent (so

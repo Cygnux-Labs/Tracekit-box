@@ -10,7 +10,9 @@
     "LOCPATH": "",
     "NLSPATH": "",
     "TRACEKIT_RUNTIME_DIR": "/home/agent/.tracekit/run",
-    "TRACEKIT_APPROVAL_WAIT": "0"
+    "TRACEKIT_APPROVAL_WAIT": "0",
+    "CLAUDE_CODE_SHELL_PREFIX": "",
+    "CLAUDE_CODE_SHELL": "/bin/bash"
   },
   "hooks": {
     "PreToolUse": [

@@ -1,7 +1,8 @@
 # The agent channel: an agent's own hooks inside a box
 
-Status: implemented. The Linux/KVM end-to-end test (`TestAgentChannel`) passed in the colima VM (nested KVM) on
-2026-11-05, at 1efb225. The host's per-box vsock listener and scoping proxy, its per-box channel connections and run/approval tables,
+Status: implemented. The Linux/KVM end-to-end test (`TestAgentChannel`) is pending at the final head; it last
+passed in the colima VM (nested KVM) on 2026-11-05, at 1efb225, before the review fixes.
+The host's per-box vsock listener and scoping proxy, its per-box channel connections and run/approval tables,
 the guest Unix-socket relay, named frame/rate/run/byte limits and Claude Code image are implemented. Tracekit contract v21 is implemented in the reference checkout
 and Box requires Tracekit 1.6.0 or later (RPC protocol 21) when this option is requested; Box's base Tracekit
 requirement remains protocol 19 (Tracekit 1.5.3).
@@ -66,9 +67,9 @@ So each box's channel gets its own signer connection with its own identity, `box
 ### The daemon: the scoping proxy
 
 The required limits are: 16 open connections per box; 1 MiB maximum frame; 10 seconds for the first byte through
-newline; 15 seconds idle between frames (the signer connection is silent for the idle time plus the frame's 10
-seconds at most, under the signer's 30, so the proxy, not the signer, ends an idle connection and the agent's client
-reconnects); 330 seconds for a signer reply; 10 seconds for guest writes; JSON
+newline; 15 seconds idle between frames; a signer link quiet for 25 seconds (under the signer's 30, as frames the
+channel refuses keep a guest connection alive without reaching the signer) replaced before the next frame goes out;
+330 seconds for a signer reply; 10 seconds for guest writes; JSON
 nesting depth 128; 50 frames/second with burst 200, where each new connection costs a frame (it makes the signer set
 up a connection of its own); 256 runs over the box's lifetime; 64 MiB across every forwarded frame but `hello` and
 `status`, whatever its method, since any of them can reach the signer's content vault; and 1,048,576 forwarded frames
@@ -82,8 +83,10 @@ it is spent a read waits: the bytes stay in vsock and the guest's writer stalls,
 at the guest's speed. A coding agent's hook and tailer send a few KiB per tool call and model turn, their largest
 frames (a big `Write`'s arguments, a long tool result) stay under 1 MiB, and a box forwards at most 64 MiB in its
 life (the byte budget), which this pace passes in about a minute, so real traffic does not meet it. A box flooding
-its channel with 1 MiB frames costs the daemon about 0.01 of a core this way, against about 4.6 cores unpaced, and
-another box's frames are answered as usual meanwhile (`TestAFloodingBoxIsPaced`).
+its channel with 1 MiB frames costs the daemon about 0.05 of a core this way, against about 4.6 cores unpaced, and
+another box's frames are answered as usual meanwhile (`TestAFloodingBoxIsPaced`). The pace is the box's own: a box
+flooding its own channel can hold its own large frames past the 10 seconds a frame may take to arrive, and that
+connection is closed; other boxes are unaffected.
 
 **Which box.** The daemon serves 1027 on a per-box Firecracker vsock listener path, `<box dir>/vsock.sock_1027`, so a
 connection's box is the listener it arrived on, never anything a frame says. Connections per box are capped. When a
@@ -119,17 +122,21 @@ in the VM beside the hook.
   request that carries `parent`, `principal`, `principal_token`, `caller`, `source`, `tenant`, `analyzes`,
   `replay_of`, `investigation`, `ext` or `box`, and drops `run_id`: the signer names the run. An agent name may
   hold only ASCII letters, digits, `.`, `_`, space and `-` (no lookalike of a reserved name passes), and one that
-  starts with `tkbox` (any case) or is the box run's own (the operator's `--agent`) is refused: Box's own runs carry
-  those.
+  starts with `tkbox` (any case) is refused. An agent run may share the box run's name (Tracekit's Claude Code hook
+  registers as `claude-code`, the name the GitHub Action gives a Claude Code box): what tells them apart is
+  signer-written, the agent run's `parent_run` and copied `ext.box` label, never the name.
 - In every method: `caller`, `on_behalf`, `amended` and `tool_results` are refused. These are what a gateway or a
   bridge sends for someone else.
 - `approval_get`: exempt from the run-id check because its schema has no `run_id`; only for approval ids this
   channel's own `approval_request` returned.
-- `observe`: a `tkbox.*` source is refused (Box's own records are Box's). `trust` is left as the hook sent it: the
+- `observe`: a source must be plain ASCII (letters, digits, `.`, `_`, space, `-`, `:` and `/`), and one that starts
+  with `tkbox` in any case is refused (Box's own records are Box's). `trust` is left as the hook sent it: the
   hook marks the person's own prompt `trusted`, and forcing it would hold legitimate calls. What the agent's run says
   about trust is the agent's account, under its own run and label, never Box's.
 - A byte budget per box covers what can go into the signer's content vault: every forwarded frame but `hello` and
-  `status` (a `decide`'s arguments are kept as a `complete`'s result is). Past it, or past the lifetime frame cap, the
+  `status` (a `decide`'s arguments are kept as a `complete`'s result is). These lifetime limits answer without
+  `retry_after_ms`, as waiting frees nothing (the run cap sends it only while a registration in flight may yet fail
+  and free its place). Past the byte budget, or past the lifetime frame cap, the
   channel refuses with `quota_exceeded`, and the box's events say so.
 
 **Runs.**
@@ -208,7 +215,9 @@ An image, built from [images/claude-code/Dockerfile](../images/claude-code/Docke
   `TRACEKIT_SIGNER=/run/tkbox/signer.sock` pinned in their `env` and `allowManagedHooksOnly: true`. The hooks run
   `/opt/tracekit/bin/python3` and `/bin/grep` by path, and the managed `env` pins `PATH`, `TRACEKIT_RUNTIME_DIR` and
   `TRACEKIT_APPROVAL_WAIT` and empties `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `GCONV_PATH`, `LOCPATH` and
-  `NLSPATH`, so a project's or the user's settings can't put a stub in their place, load code into them or move the
+  `NLSPATH`, sets `CLAUDE_CODE_SHELL_PREFIX` to none and `CLAUDE_CODE_SHELL` to the image's `/bin/bash`, so a
+  project's or the user's settings (which come before managed settings in Claude Code's order) can't put a stub in
+  their place, wrap them in a prefix, load code into them or move the
   hook's state.
 - The model key is a Box secret bound to the header the Anthropic API reads, not the default `Authorization`:
   `--secret ANTHROPIC_API_KEY=env:ANTHROPIC_API_KEY@api.anthropic.com#X-Api-Key`. The VM sees only its placeholder.

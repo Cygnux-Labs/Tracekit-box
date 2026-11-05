@@ -525,7 +525,6 @@ func (b *box) boot(ctx context.Context, s *spec) error {
 		}
 		b.addListener(cl)
 		ch := agentchannel.New(func(ctx context.Context) (net.Conn, error) { return d.opts.Tracekit.Channel(ctx, b.run) }, b.run.ID(), "")
-		ch.BoxAgent = s.agent
 		ch.OnLimit = func(reason string) {
 			b.event(api.EventBoxLimit, "agent_channel", "agent channel limit reached: "+reason, nil)
 		}

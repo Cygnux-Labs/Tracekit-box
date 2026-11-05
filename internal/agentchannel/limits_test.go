@@ -256,13 +256,12 @@ func BenchmarkDecode1MiB(b *testing.B) {
 	}
 }
 
-// The proxy forwards a frame only once it has all of it, so the signer's connection is silent for the guest's idle
-// time plus the frame's own read time; the signer drops a connection silent for 30 s (its read timeout is per recv).
-func TestSignerConnectionSilenceIsUnderTheSigners(t *testing.T) {
-	const signerIdle = 30 * time.Second
-	if IdleTimeout+FrameStartTimeout >= signerIdle {
-		t.Errorf("the signer connection can be silent %s (IdleTimeout %s + FrameStartTimeout %s), past the signer's %s",
-			IdleTimeout+FrameStartTimeout, IdleTimeout, FrameStartTimeout, signerIdle)
+// A signer connection is replaced before it has been quiet as long as the signer allows (TestAQuietSignerConnectionIsReplaced
+// shows it working).
+func TestSignerQuietLimitIsUnderTheSigners(t *testing.T) {
+	const signerIdle = 30 * time.Second // the signer drops a connection silent this long (its read timeout is per recv)
+	if SignerQuietLimit >= signerIdle {
+		t.Errorf("SignerQuietLimit %s, want under the signer's %s", SignerQuietLimit, signerIdle)
 	}
 }
 
@@ -365,21 +364,25 @@ func FuzzRegisterFrame(f *testing.F) {
 	})
 }
 
-// The box's own run carries the operator's --agent name (tkbox by default): an agent run may not take it.
-func TestTheBoxsAgentNameIsRefused(t *testing.T) {
+// The byte budget and the run cap never free up (the run cap only as a registration in flight ends), but they sent
+// retry_after_ms: 1000, so Tracekit's hook client waited them out for about 30 s on every call before blocking it.
+func TestSpentLifetimeLimitsSendNoRetry(t *testing.T) {
 	s := New(nil, "box-run", "")
-	s.BoxAgent = "nightly-review"
-	for _, name := range []string{"nightly-review", "Nightly-Review", " nightly-review "} {
-		f, err := Decode([]byte(`{"method":"register_run","request_id":"r","agent":{"name":"` + name + `"}}`))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if r := s.check("register_run", f, nil); r == nil || r.kind != RefusedField {
-			t.Errorf("agent name %q: %+v", name, r)
-		}
+	s.runs["owned"] = runEntry{token: "t"}
+	s.bytes = ByteBudget
+	if r := s.check("decide", fieldsOf(t, `{"run_id":"owned"}`), []byte(`{}`)); r == nil || r.kind != RefusedByteBudget || r.retryMS != 0 {
+		t.Fatalf("spent byte budget: %+v", r)
 	}
-	f, _ := Decode([]byte(`{"method":"register_run","request_id":"r","agent":{"name":"claude-code"}}`))
-	if r := s.check("register_run", f, nil); r != nil {
-		t.Fatal(r)
+	s.bytes = 0
+	for i := 0; i < MaxRuns; i++ {
+		s.runs[fmt.Sprintf("r%d", i)] = runEntry{closed: true}
+	}
+	if r := s.check("register_run", fieldsOf(t, `{}`), nil); r == nil || r.kind != RefusedRunCap || r.retryMS != 0 {
+		t.Fatalf("run cap, nothing in flight: %+v", r)
+	}
+	delete(s.runs, "r0")
+	s.reservations = 1 // a registration in flight may yet fail and free its place
+	if r := s.check("register_run", fieldsOf(t, `{}`), nil); r == nil || r.kind != RefusedRunCap || r.retryMS == 0 {
+		t.Fatalf("run cap, a registration in flight: %+v", r)
 	}
 }

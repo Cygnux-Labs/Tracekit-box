@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -174,5 +175,41 @@ func TestKillIsNotHeldByALongPoll(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("VM not killed in 10 s")
+	}
+}
+
+// Tracekit's Claude Code hook registers as claude-code, and the GitHub Action names a Claude Code box's run
+// --agent claude-code: a rule refusing agent runs the box run's name refused every register_run the hook sent, so every
+// tool call was blocked. What tells the box run's records from the agent's is signer-written (the agent run's
+// parent_run and copied ext.box label, the box run's none), not the self-asserted name.
+func TestTheHooksRegisterRunPassesInAClaudeCodeBox(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.tk.RPCVersion = 21
+	e.tk.ChannelDial = func() (net.Conn, error) {
+		a, z := net.Pipe()
+		go func() {
+			r := bufio.NewReader(z)
+			for {
+				if _, err := r.ReadBytes('\n'); err != nil {
+					return
+				}
+				if _, err := z.Write([]byte(`{"run_id":"child-1","run_token":"tok","fail_modes":{"default":"closed"}}` + "\n")); err != nil {
+					return
+				}
+			}
+		}()
+		return a, nil
+	}
+	e.create(api.CreateBoxRequest{Name: "cc", Image: "x", Agent: "claude-code", AgentChannel: true})
+	c, err := e.machine(0).GuestDial(context.Background(), proto.PortAgentChannel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	// the frame Tracekit 1.5.3's HookClient sends (claude_code.py _register: AGENT "claude-code", CLAUDE_CODE_VERSION)
+	fmt.Fprint(c, `{"method":"register_run","agent":{"name":"claude-code","version":"2.1.307"},"request_id":"6a1f0c2e9b8d4f3a"}`+"\n")
+	ans, err := bufio.NewReader(c).ReadBytes('\n')
+	if err != nil || !strings.Contains(string(ans), `"run_id":"child-1"`) {
+		t.Fatalf("the hook's register_run in a box run named claude-code: %q %v", ans, err)
 	}
 }

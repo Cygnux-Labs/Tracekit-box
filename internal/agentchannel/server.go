@@ -76,7 +76,6 @@ type Server struct {
 	Dial         Dial
 	BoxRun       string
 	BoxToken     string
-	BoxAgent     string // the agent name of the box's own run (the operator's --agent): no agent run may take it
 	FrameTimeout time.Duration
 	ReadRate     int64 // bytes a second this box's connections may send together (DefaultReadRate)
 	ReadBurst    int64 // bytes they may send at once (DefaultReadBurst)
@@ -170,7 +169,8 @@ func (s *Server) handle(active *activeConn) {
 		_ = signer.Close()
 		return
 	}
-	defer signer.Close()
+	defer func() { _ = signer.Close() }()
+	lastSigner := time.Now() // the last exchange with the signer (channel_open, then each frame's reply)
 	gr, sr := bufio.NewReaderSize(pacedConn{Conn: guest, s: s}, 64<<10), bufio.NewReaderSize(signer, 64<<10)
 	for {
 		_ = guest.SetReadDeadline(time.Now().Add(IdleTimeout))
@@ -218,6 +218,23 @@ func (s *Server) handle(active *activeConn) {
 			s.refuse(guest, r)
 			continue
 		}
+		if time.Since(lastSigner) >= SignerQuietLimit { // the signer may have dropped the quiet link: a fresh one
+			fresh, err := s.Dial(ctx)
+			if err != nil {
+				s.refuse(guest, &refusal{code: "unavailable", msg: "signer channel unavailable", kind: RefusedSigner,
+					reason: "the signer channel could not be opened again: " + err.Error(), method: method})
+				return
+			}
+			s.mu.Lock()
+			closing := s.closed
+			active.signer = fresh
+			s.mu.Unlock()
+			_ = signer.Close()
+			signer, sr, lastSigner = fresh, bufio.NewReaderSize(fresh, 64<<10), time.Now()
+			if closing {
+				return
+			}
+		}
 		if method == "register_run" {
 			reserved = true
 			frame = registerFrame(obj) // never longer than the frame it came in (FuzzRegisterFrame)
@@ -238,6 +255,7 @@ func (s *Server) handle(active *activeConn) {
 		if err != nil {
 			return
 		}
+		lastSigner = time.Now()
 		err = s.record(method, ans, obj)
 		if method == "register_run" {
 			reserved = false
@@ -403,9 +421,6 @@ func (s *Server) takeToken() (bool, int64) {
 // answers record nothing) towards ByteBudget, as each may reach the signer's content vault.
 func (s *Server) check(method string, f *Frame, frame []byte) *refusal {
 	forbidden := func(kind, msg string) *refusal { return &refusal{code: "forbidden", msg: msg, kind: kind, reason: msg} }
-	if method == "register_run" && s.BoxAgent != "" && strings.EqualFold(strings.TrimSpace(f.agent), s.BoxAgent) {
-		return forbidden(RefusedField, "agent name is the box's own")
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch method {
@@ -425,14 +440,18 @@ func (s *Server) check(method string, f *Frame, frame []byte) *refusal {
 			kind: RefusedFrameCap, reason: fmt.Sprintf("%d frames forwarded", MaxForwardedFrames)}
 	}
 	charged := method != "hello" && method != "status"
-	if size := int64(len(frame)); charged && s.bytes+size > ByteBudget {
-		return &refusal{code: "quota_exceeded", msg: "agent channel byte budget exceeded", retryMS: 1000,
+	if size := int64(len(frame)); charged && s.bytes+size > ByteBudget { // a lifetime budget: no retry_after_ms
+		return &refusal{code: "quota_exceeded", msg: "agent channel byte budget exceeded",
 			kind: RefusedByteBudget, reason: fmt.Sprintf("%d MiB of frames sent", ByteBudget>>20)}
 	}
 	if method == "register_run" {
 		if len(s.runs)+s.reservations >= MaxRuns {
-			return &refusal{code: "quota_exceeded", msg: "run limit reached", retryMS: 1000, kind: RefusedRunCap,
+			r := &refusal{code: "quota_exceeded", msg: "run limit reached", kind: RefusedRunCap,
 				reason: fmt.Sprintf("%d runs registered", MaxRuns)}
+			if s.reservations > 0 { // a registration in flight may fail and free its place; else none ever frees
+				r.retryMS = 1000
+			}
+			return r
 		}
 		s.reservations++
 	}

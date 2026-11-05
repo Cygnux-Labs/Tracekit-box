@@ -32,11 +32,14 @@ func TestHooksRunWhatTheImageInstalled(t *testing.T) {
 	}
 	// what the hooks, sh and the dynamic loader read from the environment: a project's or the user's settings could
 	// otherwise load code into them (LD_*, GCONV_PATH), point them at other files (LOCPATH, NLSPATH), move the hook's
-	// state (TRACEKIT_RUNTIME_DIR) or make it wait (TRACEKIT_APPROVAL_WAIT)
+	// state (TRACEKIT_RUNTIME_DIR) or make it wait (TRACEKIT_APPROVAL_WAIT); and what Claude Code runs every hook and
+	// command through (CLAUDE_CODE_SHELL_PREFIX: empty is none; CLAUDE_CODE_SHELL: the image's bash, so no stub is picked
+	// up from SHELL either)
 	want := map[string]string{"TRACEKIT_SIGNER": "/run/tkbox/signer.sock",
 		"PATH":       "/opt/tracekit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 		"LD_PRELOAD": "", "LD_LIBRARY_PATH": "", "LD_AUDIT": "", "GCONV_PATH": "", "LOCPATH": "", "NLSPATH": "",
-		"TRACEKIT_RUNTIME_DIR": "/home/agent/.tracekit/run", "TRACEKIT_APPROVAL_WAIT": "0"}
+		"TRACEKIT_RUNTIME_DIR": "/home/agent/.tracekit/run", "TRACEKIT_APPROVAL_WAIT": "0",
+		"CLAUDE_CODE_SHELL_PREFIX": "", "CLAUDE_CODE_SHELL": "/bin/bash"}
 	for k, v := range want {
 		if got, ok := s.Env[k]; !ok || got != v {
 			t.Errorf("managed env %s = %q, want %q", k, got, v)

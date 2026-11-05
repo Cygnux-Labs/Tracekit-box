@@ -25,7 +25,8 @@ registered Claude Code hook events, the `*` matcher for tool events, event-speci
 isolated Python module invocation and Tracekit's fail-closed shell wrappers. The signer path is fixed in the settings environment.
 `allowManagedHooksOnly` prevents user and project hooks. The hooks call `/opt/tracekit/bin/python3` and `/bin/grep` by
 path, and the managed `env` pins `PATH`, `TRACEKIT_RUNTIME_DIR` and `TRACEKIT_APPROVAL_WAIT` and empties `LD_PRELOAD`,
-`LD_LIBRARY_PATH`, `LD_AUDIT`, `GCONV_PATH`, `LOCPATH` and `NLSPATH`, so a project's or the user's settings can't swap
+`LD_LIBRARY_PATH`, `LD_AUDIT`, `GCONV_PATH`, `LOCPATH` and `NLSPATH`, sets `CLAUDE_CODE_SHELL_PREFIX` to none and
+`CLAUDE_CODE_SHELL` to `/bin/bash`, so a project's or the user's settings can't swap
 what they run (`go test ./images/claude-code` checks it).
 
 What the image installs is pinned: Claude Code and its platform binaries by `package-lock.json` (`npm ci` checks each

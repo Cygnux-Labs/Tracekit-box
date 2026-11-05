@@ -39,7 +39,7 @@ lint:
 	GOOS=linux $(GO) vet ./...
 
 # every fuzz target (package:Target) for FUZZTIME each, one after another: each runs even when one before it fails,
-# and the recipe fails if any did, naming them. A failing input is saved under its package's testdata/fuzz (`go test
+# and the recipe fails if any did, or does not exist, naming them. A failing input is saved under its package's testdata/fuzz (`go test
 # ./...` runs the saved inputs and seeds, so add it there once fixed). FuzzParsePatchVsGit needs git.
 FUZZ_TARGETS := proto:FuzzReadFrame proto:FuzzChunkWriter agentrpc:FuzzClientReplies agentchannel:FuzzReadAgentFrame \
 	agentchannel:FuzzAgentFields agentchannel:FuzzRegisterFrame tracekit:FuzzShellQuote image:FuzzDebugfsQuote \
@@ -48,6 +48,8 @@ FUZZ_TARGETS := proto:FuzzReadFrame proto:FuzzChunkWriter agentrpc:FuzzClientRep
 fuzz:
 	@failed=; for t in $(FUZZ_TARGETS); do \
 		echo "$(GO) test -run='^$$' -fuzz='^$${t#*:}$$' -fuzztime=$(FUZZTIME) ./internal/$${t%%:*}"; \
+		if ! $(GO) test -list "^$${t#*:}\$$" ./internal/$${t%%:*} | grep -qx "$${t#*:}"; then \
+			echo "no fuzz target $${t#*:} in ./internal/$${t%%:*}"; failed="$$failed $$t"; continue; fi; \
 		$(GO) test -run='^$$' -fuzz="^$${t#*:}\$$" -fuzztime=$(FUZZTIME) ./internal/$${t%%:*} || failed="$$failed $$t"; \
 	done; if [ -n "$$failed" ]; then echo "fuzz failed:$$failed"; exit 1; fi
 
