@@ -119,9 +119,29 @@ The design, protocols and disks are in [docs/architecture.md](docs/architecture.
 
 ## Install
 
-There is no release yet. Build both binaries from source with Go (the version in `go.mod`) and put `tkbox` and the
-guest agent side by side: `tkbox` looks for `tkbox-guest-linux-<arch>` next to its own binary (or in
-`tkbox daemon --guest-dir DIR`).
+`tkbox` looks for `tkbox-guest-linux-<arch>` next to its own binary (or in `tkbox daemon --guest-dir DIR`), so install
+the two side by side.
+
+From a [release](https://github.com/Cygnux-Labs/Tracekit-box/releases) (from the first tagged one on): each has the
+Linux binaries for amd64 and arm64, their `SHA256SUMS`, and a build provenance attestation per binary, made by this
+repository's [release workflow](.github/workflows/release.yml) from the tag. Check both before installing:
+
+```sh
+tag=v0.1.0                     # the release you install
+arch=$(uname -m); case "$arch" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; esac
+gh release download "$tag" --repo Cygnux-Labs/Tracekit-box \
+  -p "tkbox-linux-$arch" -p "tkbox-guest-linux-$arch" -p SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+for f in "tkbox-linux-$arch" "tkbox-guest-linux-$arch"; do   # made by the release workflow, from this tag
+  gh attestation verify "$f" --repo Cygnux-Labs/Tracekit-box \
+    --signer-workflow Cygnux-Labs/Tracekit-box/.github/workflows/release.yml \
+    --source-ref "refs/tags/$tag" --deny-self-hosted-runners
+done
+sudo install -m 0755 "tkbox-linux-$arch" /usr/local/bin/tkbox
+sudo install -m 0755 "tkbox-guest-linux-$arch" /usr/local/bin/
+```
+
+From source, with Go (the version in `go.mod`):
 
 ```sh
 git clone https://github.com/Cygnux-Labs/tracekit-box && cd tracekit-box
