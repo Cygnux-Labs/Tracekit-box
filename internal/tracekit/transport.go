@@ -20,7 +20,8 @@ import (
 // so a plain write is enough). The signer answers a connection's frames in order and drops a connection idle for 30 s.
 
 const (
-	rpcVersion     = 19      // the protocol Box speaks (Tracekit 1.4.2)
+	rpcVersion     = 21 // highest protocol Box supports
+	rpcMin         = 19
 	maxLine        = 1 << 20 // signer quotas.MAX_LINE: bytes of one frame, without its newline, both ways
 	connectTimeout = 2 * time.Second
 	defaultTimeout = 30 * time.Second
@@ -30,7 +31,7 @@ const (
 	maxIdleConns   = 4
 )
 
-// Incompatible means the signer answered but its protocol range does not hold Box's (19).
+// Incompatible means the signer answered but its protocol range does not include Box's base protocol 19.
 type Incompatible struct {
 	Where         string
 	SignerVersion string
@@ -38,17 +39,17 @@ type Incompatible struct {
 }
 
 func (e *Incompatible) Error() string {
-	fix := "run a Tracekit 1.4.2 signer (pip install tracekit-ai==1.4.2, then `tracekit up --replace` for a dev " +
+	fix := "run Tracekit 1.5.3 or later (pip install tracekit-ai==1.5.3, then `tracekit up --replace` for a dev " +
 		"signer, or restart the signer service)"
-	if len(e.Proto) == 2 && e.Proto[1] < rpcVersion {
-		fix = "the signer is older than Box's protocol: upgrade it to Tracekit 1.4.2 (pip install " +
-			"tracekit-ai==1.4.2, then `tracekit up --replace` for a dev signer, or restart the signer service)"
-	} else if len(e.Proto) == 2 && e.Proto[0] > rpcVersion {
-		fix = "the signer no longer serves Box's protocol: run a Tracekit 1.4.2 signer for Box, or a Box release " +
+	if len(e.Proto) == 2 && e.Proto[1] < rpcMin {
+		fix = "the signer is older than Box's minimum protocol: upgrade it to Tracekit 1.5.3 (pip install " +
+			"tracekit-ai==1.5.3, then `tracekit up --replace` for a dev signer, or restart the signer service)"
+	} else if len(e.Proto) == 2 && e.Proto[0] > rpcMin {
+		fix = "the signer no longer serves Box's protocols: run Tracekit 1.5.3 or later for Box, or a Box release " +
 			"built for this signer"
 	}
 	return fmt.Sprintf("tracekit signer at %s is Tracekit %s speaking protocol %s; Tracekit Box needs protocol %d "+
-		"(Tracekit 1.4.2): %s", e.Where, orUnknown(e.SignerVersion), protoText(e.Proto), rpcVersion, fix)
+		"(Tracekit 1.5.3): %s", e.Where, orUnknown(e.SignerVersion), protoText(e.Proto), rpcMin, fix)
 }
 
 func orUnknown(s string) string {
@@ -156,7 +157,7 @@ func dialSigner(ctx context.Context, path string) (*conn, hello, error) {
 			h.Proto = []int{int(lo), int(hi)}
 		}
 	}
-	if len(h.Proto) != 2 || h.Proto[0] > rpcVersion || rpcVersion > h.Proto[1] {
+	if len(h.Proto) != 2 || h.Proto[0] > rpcMin || rpcMin > h.Proto[1] {
 		c.close()
 		return nil, h, &Incompatible{Where: path, SignerVersion: h.Version, Proto: h.Proto}
 	}

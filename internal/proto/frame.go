@@ -32,9 +32,10 @@ const MaxFrame = 1 << 20
 // vsock ports. The host dials the guest on PortAgent (Firecracker's "CONNECT <port>\n" handshake on the vsock UDS);
 // the guest dials the host (CID 2) on PortEgress and PortConfig, which Firecracker forwards to "<uds>_<port>".
 const (
-	PortAgent  uint32 = 1024
-	PortEgress uint32 = 1025
-	PortConfig uint32 = 1026
+	PortAgent        uint32 = 1024
+	PortEgress       uint32 = 1025
+	PortConfig       uint32 = 1026
+	PortAgentChannel uint32 = 1027
 )
 
 // ErrFrameTooLarge is returned for a frame whose declared length exceeds MaxFrame.

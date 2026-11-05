@@ -1,8 +1,13 @@
-# The agent channel: an agent's own hooks inside a box (design, not built)
+# The agent channel: an agent's own hooks inside a box
 
-Status: proposal, revised after its design security review. Nothing here exists yet; the pull requests that build it
-update this page. Points marked **(Tracekit contract)** need a change in Tracekit's signer RPC contract, made in one
-Tracekit pull request with its own contract version; Box's side waits for it.
+Status: implemented, with the Linux/KVM end-to-end test still to add. The host's per-box vsock listener and scoping proxy, its per-box channel connections and run/approval tables,
+the guest Unix-socket relay, named frame/rate/run/byte limits and Claude Code image are implemented. Tracekit contract v21 is implemented in the reference checkout
+and Box requires Tracekit 1.6.0 or later (RPC protocol 21) when this option is requested; Box's base Tracekit
+requirement remains protocol 19 (Tracekit 1.5.3).
+
+Implementation note: `register_run` is rebuilt from only `request_id` and `agent`; strict JSON and the channel limits
+are enforced by the host proxy. The proxy uses the signer response's top-level `run_id`, `run_token`, and
+`approval_id` fields to maintain its per-box ownership tables.
 
 ## The problem
 
@@ -59,6 +64,12 @@ So each box's channel gets its own signer connection with its own identity, `box
 
 ### The daemon: the scoping proxy
 
+The required limits are: 16 open connections per box; 1 MiB maximum frame; 10 seconds for the first byte through
+newline; 300 seconds idle between frames; 330 seconds for a signer reply; 10 seconds for guest writes; JSON nesting
+depth 128; 50 frames/second with burst 200; 256 runs over the box's lifetime; and 64 MiB across the full frames for
+`model_event`, `complete` and `observe`. Rate and byte limits are per box and
+are accounted under one shared lock.
+
 **Which box.** The daemon serves 1027 on a per-box Firecracker vsock listener path, `<box dir>/vsock.sock_1027`, so a
 connection's box is the listener it arrived on, never anything a frame says. Connections per box are capped. When a
 stop begins, the listener and its connections are closed with the egress.
@@ -85,7 +96,8 @@ in the VM beside the hook.
   `replay_of`, `investigation` or `ext`, and drops `run_id`: the signer names the run.
 - In every method: `caller`, `on_behalf`, `amended` and `tool_results` are refused. These are what a gateway or a
   bridge sends for someone else.
-- `approval_get`: only for approval ids this channel's own `approval_request` returned.
+- `approval_get`: exempt from the run-id check because its schema has no `run_id`; only for approval ids this
+  channel's own `approval_request` returned.
 - `observe`: a `tkbox.*` source is refused (Box's own records are Box's). `trust` is left as the hook sent it: the
   hook marks the person's own prompt `trusted`, and forcing it would hold legitimate calls. What the agent's run says
   about trust is the agent's account, under its own run and label, never Box's.
@@ -97,7 +109,10 @@ in the VM beside the hook.
   box run itself is never in it.
 - Every other frame must name a run in that table; the signer checks the run token as well.
 - Total runs per box are capped, not only open ones.
-- At stop, every run the channel opened is closed before the box's own run.
+- At stop, every run the channel opened is closed before the box's own run; a channel-enabled box closes its own run
+  after recording the stop.
+- A successful agent `close_run` marks the run closed. It remains counted against the lifetime cap and is not closed
+  a second time at stop.
 
 ### Fail closed, as far as it can be
 
@@ -154,7 +169,7 @@ engine named.
 
 ## The Claude Code image
 
-An image, built from a Dockerfile in this repository and not published by it:
+An image, built from [images/claude-code/Dockerfile](../images/claude-code/Dockerfile) and not published by this repository:
 
 - Debian, Node and Python, Claude Code pinned to a version at least two weeks old, and Tracekit's hook client.
 - Claude Code runs as a non-root user, with `IS_SANDBOX=1` set as well.
@@ -166,6 +181,10 @@ An image, built from a Dockerfile in this repository and not published by it:
   Box records each model call (`tkbox.model.call`) on that inspected connection. `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
   keeps Claude Code off other telemetry hosts.
 - The project comes in as the workspace copy, and its changes go out only through `apply`.
+
+Build and run instructions are in [images/claude-code/README.md](../images/claude-code/README.md). The planned
+Linux/KVM end-to-end test should run with `go test -tags e2e ./e2e -run TestAgentChannel` after `make build`, on a
+Linux host with KVM, the Tracekit 1.6.0+ signer and `tracekit` CLI available.
 
 ## What changes where
 

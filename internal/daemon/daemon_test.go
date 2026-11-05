@@ -1,18 +1,22 @@
 package daemon
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/Cygnux-Labs/tracekit-box/internal/agentchannel"
 	"github.com/Cygnux-Labs/tracekit-box/internal/agentrpc"
 	"github.com/Cygnux-Labs/tracekit-box/internal/api"
 	"github.com/Cygnux-Labs/tracekit-box/internal/egress"
@@ -34,6 +38,150 @@ func TestCreateAbandonedByClient(t *testing.T) {
 	}
 	if b, _ := e.d.Get("gone"); b.State != api.StateFailed || e.machine(0).State != "stopped" || !e.run(0).Closed {
 		t.Fatalf("box %+v machine %s", b, e.machine(0).State)
+	}
+}
+
+func TestAgentChannelRequiresProtocol21(t *testing.T) {
+	e := newTestEnv(t, nil)
+	_, err := e.d.Create(context.Background(), api.CreateBoxRequest{Image: "x", AgentChannel: true})
+	if err == nil || !strings.Contains(err.Error(), "Tracekit 1.6.0") || !strings.Contains(err.Error(), "RPC protocol 21") {
+		t.Fatalf("protocol 19 signer accepted for --agent-channel: %v", err)
+	}
+	if len(e.launcher.Machines) != 0 {
+		t.Fatal("box launched before protocol 21 check")
+	}
+}
+
+func TestAgentChannelAllowLabelValidation(t *testing.T) {
+	valid := []string{"example.com", "*.example.com:8443", "[2001:db8::1]", strings.Repeat("a", 261)}
+	if err := validateBoxLabelAllow(valid); err != nil {
+		t.Fatalf("valid label allow entries rejected: %v", err)
+	}
+	for _, name := range []string{"bad/name", strings.Repeat("a", 262)} {
+		if err := validateBoxLabelAllow([]string{name}); err == nil {
+			t.Errorf("invalid label entry accepted: %q", name)
+		}
+	}
+	if err := validateBoxLabelAllow(make([]string, 257)); err == nil {
+		t.Fatal("accepted more than 256 label entries")
+	}
+}
+
+type stopOrderLog struct {
+	mu      sync.Mutex
+	entries []string
+}
+
+func (l *stopOrderLog) add(s string) { l.mu.Lock(); l.entries = append(l.entries, s); l.mu.Unlock() }
+func (l *stopOrderLog) got() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.entries...)
+}
+
+type stopOrderConn struct {
+	net.Conn
+	log   *stopOrderLog
+	label string
+	once  sync.Once
+}
+
+func (c *stopOrderConn) Close() error {
+	if c.label != "" {
+		c.once.Do(func() { c.log.add(c.label) })
+	}
+	return c.Conn.Close()
+}
+
+type stopOrderListener struct {
+	net.Listener
+	log *stopOrderLog
+}
+
+func (l stopOrderListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &stopOrderConn{Conn: c, log: l.log, label: "guest_connection"}, nil
+}
+func (l stopOrderListener) Close() error { l.log.add("listener"); return l.Listener.Close() }
+
+type stopOrderRun struct {
+	tracekit.Run
+	log *stopOrderLog
+}
+
+func (r stopOrderRun) Close(ctx context.Context, reason string) error {
+	r.log.add("box_run")
+	return r.Run.Close(ctx, reason)
+}
+
+func TestStopOrderListenerConnectionsChannelRunBoxRun(t *testing.T) {
+	e := newTestEnv(t, nil)
+	v := e.create(api.CreateBoxRequest{Name: "channel-order", Image: "x"})
+	e.d.mu.Lock()
+	b := e.d.boxes[v.ID]
+	e.d.mu.Unlock()
+	order := &stopOrderLog{}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dialMu sync.Mutex
+	dials := 0
+	ch := agentchannel.New(func(context.Context) (net.Conn, error) {
+		dialMu.Lock()
+		dials++
+		call := dials
+		dialMu.Unlock()
+		a, z := net.Pipe()
+		go func() {
+			line, err := bufio.NewReader(z).ReadBytes('\n')
+			if err != nil {
+				_ = z.Close()
+				return
+			}
+			var req map[string]any
+			_ = json.Unmarshal(line, &req)
+			if call == 1 {
+				answer := `{"run_id":"channel-run","run_token":"channel-token"}`
+				_, _ = z.Write([]byte(answer + "\n"))
+				_, _ = bufio.NewReader(z).ReadBytes('\n')
+			} else {
+				order.add("channel_run")
+				_, _ = z.Write([]byte(`{"ok":true}` + "\n"))
+			}
+			_ = z.Close()
+		}()
+		label := "signer_connection"
+		if call > 1 {
+			label = ""
+		}
+		return &stopOrderConn{Conn: a, log: order, label: label}, nil
+	}, "box-run", "")
+	serverL := stopOrderListener{Listener: l, log: order}
+	go ch.Serve(serverL)
+	run := stopOrderRun{Run: e.run(0), log: order}
+	b.mu.Lock()
+	b.info.AgentChannel = true
+	b.channel = ch
+	b.channelL = serverL
+	b.run = run
+	b.mu.Unlock()
+	c, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = c.Write([]byte(`{"method":"register_run","request_id":"id","agent":{"name":"agent"}}` + "\n"))
+	if _, err = bufio.NewReader(c).ReadBytes('\n'); err != nil {
+		t.Fatal(err)
+	}
+	b.teardown(context.Background(), "test stop", "", false, false)
+	_ = c.Close()
+	want := []string{"listener", "guest_connection", "signer_connection", "channel_run", "box_run"}
+	if got := order.got(); !slices.Equal(got, want) {
+		t.Fatalf("stop order %v, want %v", got, want)
 	}
 }
 

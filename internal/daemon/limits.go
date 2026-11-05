@@ -21,6 +21,7 @@ var (
 	secretNameRE = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
 	envNameRE    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 	headerRE     = regexp.MustCompile("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+	boxAllowRE   = regexp.MustCompile(`^[A-Za-z0-9.*:\[\]_-]+$`)
 )
 
 // Env names the box sets itself; a request may not override them.
@@ -28,6 +29,18 @@ var reservedEnv = map[string]bool{
 	"HTTP_PROXY": true, "HTTPS_PROXY": true, "http_proxy": true, "https_proxy": true, "NO_PROXY": true, "no_proxy": true,
 	"SSL_CERT_FILE": true, "NODE_EXTRA_CA_CERTS": true, "REQUESTS_CA_BUNDLE": true, "GIT_SSL_CAINFO": true,
 	"CURL_CA_BUNDLE": true, "ALL_PROXY": true, "all_proxy": true,
+}
+
+func validateBoxLabelAllow(allow []string) error {
+	if len(allow) > 256 {
+		return fmt.Errorf("--agent-channel cannot label %d allow entries (maximum 256)", len(allow))
+	}
+	for _, name := range allow {
+		if len(name) > 261 || !boxAllowRE.MatchString(name) {
+			return fmt.Errorf("--agent-channel cannot label allow entry %q (must match the Tracekit box label pattern and be at most 261 characters)", name)
+		}
+	}
+	return nil
 }
 
 func limitErr(format string, hint string, a ...any) *api.ErrorDetail {

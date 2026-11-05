@@ -3,7 +3,9 @@ package tracekitfake
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"sync"
 	"time"
@@ -49,6 +51,13 @@ func (c *Client) NewRun(ctx context.Context, agent tracekit.Agent) (tracekit.Run
 	r := &Run{client: c, id: fmt.Sprintf("run%04d", len(c.Runs)+1), Agent: agent}
 	c.Runs = append(c.Runs, r)
 	return r, nil
+}
+
+func (c *Client) NewBoxRun(ctx context.Context, agent tracekit.Agent, box tracekit.BoxLabel) (tracekit.Run, error) {
+	return c.NewRun(ctx, agent)
+}
+func (c *Client) Channel(context.Context, tracekit.Run) (net.Conn, error) {
+	return nil, errors.New("fake channel unavailable")
 }
 
 func (c *Client) Export(ctx context.Context, runID, bundleOut, trustOut string) error {

@@ -6,6 +6,7 @@ package tracekit
 
 import (
 	"context"
+	"net"
 	"strings"
 	"time"
 )
@@ -109,10 +110,19 @@ type Client interface {
 	Status(ctx context.Context) (Status, error)
 	// NewRun registers a run.
 	NewRun(ctx context.Context, agent Agent) (Run, error)
+	NewBoxRun(ctx context.Context, agent Agent, box BoxLabel) (Run, error)
+	Channel(ctx context.Context, run Run) (net.Conn, error)
 	// Export writes the run's bundle (tracekit export --v2) and the signer's trust config (tracekit signer trust),
 	// waiting until the run is final (the signer finalises a run a few seconds after close_run).
 	Export(ctx context.Context, runID, bundleOut, trustOut string) error
 	Close() error
+}
+
+// BoxLabel is the daemon's trusted description attached to a boxed run.
+type BoxLabel struct {
+	ID, ImageDigest string
+	Allow           []string
+	Channel         string
 }
 
 // Call is one tool call. ID is unique within the run; Attempt is 0 unless a call is retried.

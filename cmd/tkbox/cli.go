@@ -45,6 +45,8 @@ func buildRunRequest(args []string, env *cliEnv) (api.CreateBoxRequest, string, 
 	fs.StringVar(&fl.Inspect, "inspect", "", `"bound" (default) or "all"`)
 	fs.StringVar(&fl.Task, "task", "", "the task, recorded in the Tracekit run")
 	fs.StringVar(&fl.Agent, "agent", "", `agent name recorded in the run (default "tkbox")`)
+	var agentChannel bool
+	fs.BoolVar(&agentChannel, "agent-channel", false, "enable the agent-to-Tracekit channel")
 	cfgPath := fs.String("config", "", "tkbox.yaml (default ./tkbox.yaml if present)")
 	noConfig := fs.Bool("no-config", false, "don't read ./tkbox.yaml")
 	jsonOut := fs.Bool("json", false, "print the box as JSON")
@@ -86,6 +88,7 @@ func buildRunRequest(args []string, env *cliEnv) (api.CreateBoxRequest, string, 
 		fl.Secrets[name] = sec
 	}
 	req, err := config.Request(file, fl, config.Resolver{})
+	req.AgentChannel = agentChannel
 	return req, *sock, *jsonOut, err
 }
 

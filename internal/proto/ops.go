@@ -152,9 +152,10 @@ type BootConfigRequest struct {
 // BootConfig is everything box-specific the guest needs; it is never baked into the image so images stay cacheable by
 // digest. Secret values never appear here, only their placeholders.
 type BootConfig struct {
-	Version  int    `json:"version"`
-	BoxID    string `json:"box_id"`
-	Hostname string `json:"hostname"`
+	Version      int    `json:"version"`
+	BoxID        string `json:"box_id"`
+	AgentChannel bool   `json:"agent_channel,omitempty"`
+	Hostname     string `json:"hostname"`
 	// Env is the base environment of every exec: the image's env, the box's env, secret placeholders, the proxy
 	// variables (HTTP_PROXY, HTTPS_PROXY, http_proxy, https_proxy, NO_PROXY=""), and the CA variables (SSL_CERT_FILE,
 	// NODE_EXTRA_CA_CERTS, REQUESTS_CA_BUNDLE, GIT_SSL_CAINFO, CURL_CA_BUNDLE) all pointing at CABundlePath.

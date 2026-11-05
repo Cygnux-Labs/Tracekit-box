@@ -168,16 +168,17 @@ type SecretSpec struct {
 const AgentMCP = "mcp"
 
 type CreateBoxRequest struct {
-	Name      string                `json:"name,omitempty"`      // unique among boxes; default the id
-	Image     string                `json:"image"`               // OCI reference, e.g. "python:3.12-slim"
-	Allow     []string              `json:"allow,omitempty"`     // presets ("pypi") and hosts ("api.example.com", "h:8443")
-	Secrets   map[string]SecretSpec `json:"secrets,omitempty"`   // env var name → secret
-	Env       map[string]string     `json:"env,omitempty"`       // plain env for every exec
-	Workspace string                `json:"workspace,omitempty"` // absolute host dir copied into /workspace; "" = none
-	Limits    Limits                `json:"limits,omitempty"`
-	Inspect   string                `json:"inspect,omitempty"` // "bound" (default: MITM only hosts with a bound secret) or "all"
-	Agent     string                `json:"agent,omitempty"`   // agent name recorded in the Tracekit run (default "tkbox"; AgentMCP)
-	Task      string                `json:"task,omitempty"`    // the task, recorded as trusted observe content
+	Name         string                `json:"name,omitempty"`      // unique among boxes; default the id
+	Image        string                `json:"image"`               // OCI reference, e.g. "python:3.12-slim"
+	Allow        []string              `json:"allow,omitempty"`     // presets ("pypi") and hosts ("api.example.com", "h:8443")
+	Secrets      map[string]SecretSpec `json:"secrets,omitempty"`   // env var name → secret
+	Env          map[string]string     `json:"env,omitempty"`       // plain env for every exec
+	Workspace    string                `json:"workspace,omitempty"` // absolute host dir copied into /workspace; "" = none
+	Limits       Limits                `json:"limits,omitempty"`
+	Inspect      string                `json:"inspect,omitempty"` // "bound" (default: MITM only hosts with a bound secret) or "all"
+	Agent        string                `json:"agent,omitempty"`   // agent name recorded in the Tracekit run (default "tkbox"; AgentMCP)
+	AgentChannel bool                  `json:"agent_channel,omitempty"`
+	Task         string                `json:"task,omitempty"` // the task, recorded as trusted observe content
 	// ValidateOnly checks the request (limits, allowlist, secrets, workspace) and answers 200 with the box it would
 	// create, without creating anything.
 	ValidateOnly bool `json:"validate_only,omitempty"`
@@ -197,6 +198,7 @@ type Box struct {
 	Workspace     string            `json:"workspace,omitempty"`
 	Limits        Limits            `json:"limits"`
 	Inspect       string            `json:"inspect"`
+	AgentChannel  bool              `json:"agent_channel,omitempty"`
 	RunID         string            `json:"run_id,omitempty"` // the Tracekit run; "" when unrecorded
 	Unrecorded    bool              `json:"unrecorded,omitempty"`
 	CreatedAt     time.Time         `json:"created_at"`
@@ -334,6 +336,7 @@ const (
 	EventBoxStarted    = "box.started"
 	EventBoxStopped    = "box.stopped"
 	EventBoxFailed     = "box.failed"
+	EventBoxLimit      = "box.limit"
 	EventExecDecided   = "exec.decided"
 	EventExecExited    = "exec.exited"
 	EventEgressAllowed = "egress.allowed"

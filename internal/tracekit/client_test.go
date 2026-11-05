@@ -60,8 +60,9 @@ func TestDialHelloMismatch(t *testing.T) {
 		proto []any
 		want  []string
 	}{
-		{[]any{20, 22}, []string{"1.5.0", "20..22", "protocol 19", "no longer serves"}},
-		{[]any{15, 18}, []string{"1.5.0", "15..18", "protocol 19", "upgrade it to Tracekit 1.4.2"}},
+		{[]any{22, 24}, []string{"1.5.0", "22..24", "protocol 19", "no longer serves"}},
+		{[]any{10, 18}, []string{"1.5.0", "10..18", "protocol 19", "upgrade it to Tracekit 1.5.3"}},
+		{[]any{20, 21}, []string{"1.5.0", "20..21", "protocol 19"}},
 		{nil, []string{"(none named)"}},
 	} {
 		f := newFakeSigner(t)
@@ -77,6 +78,17 @@ func TestDialHelloMismatch(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestDialAcceptsProtocol19(t *testing.T) {
+	noSystemConfig(t)
+	f := newFakeSigner(t)
+	f.hello = map[string]any{"proto": []any{15, 19}, "version": "1.5.3", "pid": 7}
+	c, err := Dial(context.Background(), Options{Signer: f.path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
 }
 
 func TestDialNoSigner(t *testing.T) {

@@ -91,8 +91,70 @@ func Main(version string) {
 		failClosed("apply boot config: %v", err)
 	}
 	g.srv.SetReady(*cfg, ws)
+	if cfg.AgentChannel {
+		if err := serveAgentChannel(); err != nil {
+			failClosed("agent channel: %v", err)
+		}
+	}
 	logf("ready (box %s)", cfg.BoxID)
 	select {}
+}
+
+func serveAgentChannel() error {
+	// earlyMounts mounts a fresh tmpfs on /run before this socket is created.
+	const dir, path = "/run/tkbox", "/run/tkbox/signer.sock"
+	if err := prepareAgentChannelDir(dir); err != nil {
+		return err
+	}
+	if fi, err := os.Lstat(path); err == nil {
+		if fi.Mode()&os.ModeSocket == 0 {
+			return fmt.Errorf("%s exists and is not a socket", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		return err
+	}
+	if err := os.Chmod(path, 0o666); err != nil {
+		l.Close()
+		return err
+	}
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go Relay(c, func() (net.Conn, error) {
+				return DialVsock(context.Background(), unix.VMADDR_CID_HOST, proto.PortAgentChannel)
+			})
+		}
+	}()
+	return nil
+}
+
+func prepareAgentChannelDir(dir string) error {
+	if fi, err := os.Lstat(dir); err == nil {
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok || !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 || st.Uid != 0 {
+			return fmt.Errorf("%s must be a real directory owned by root", dir)
+		}
+	} else if errors.Is(err, os.ErrNotExist) {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			return err
+		}
+		if err := os.Chmod(dir, 0o755); err != nil {
+			return err
+		}
+	} else {
+		return err
+	}
+	return nil
 }
 
 type guestVM struct {
